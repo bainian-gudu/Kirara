@@ -1,0 +1,194 @@
+name: Build
+
+# 上游 kachina-installer 的 build.yml 快照，按本项目适配：
+#   - 构建入口改成仓库根目录的 build.ps1（产物 tools/kirara-builder.exe）
+#   - 去掉上游的 Sentry 上传（本项目已物理移除遥测，见 LOCAL_PATCHES.md 第 7 节）
+#   - action 版本不低于 README.md 登记的下限，MSVC 注入 / 长路径 / Ninja 与
+#     下游 HoYoEnhance 的构建保持一致（理由见 README.md「workflow 里那些看着多余的设置」）
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+# release job 需要写权限；其余 job 只需要读
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # 上游固定用 nightly + -Z build-std
+  RUST_TOOLCHAIN: nightly
+  NODE_VERSION: "22"
+  # 压掉第三方 action 自己的告警
+  NODE_NO_WARNINGS: "1"
+
+jobs:
+  build:
+    name: Build builder
+    runs-on: windows-latest
+    timeout-minutes: 90
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      # 长路径 + 下面的 CMAKE_GENERATOR: Ninja 是同一件事的两道防线（FTK1011）
+      - name: Enable Windows long paths
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $key = "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem"
+          New-ItemProperty -Path $key -Name LongPathsEnabled -Value 1 -PropertyType DWORD -Force |
+            Out-Null
+          "LongPathsEnabled = " + (Get-ItemProperty -Path $key).LongPathsEnabled
+
+      - name: Cache cargo / target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri"
+          cache-targets: true
+          key: kirara-src
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      # Ninja 不会像 MSBuild 那样自己去 VS 安装目录找 cl.exe，
+      # 必须先把 MSVC 开发环境注入 PATH / INCLUDE / LIB。
+      - name: Add MSVC Developer environment
+        shell: pwsh
+        run: tools/ci/Import-DevCmd.ps1 -Arch x64
+
+      - name: Build kirara-builder from source
+        env:
+          CMAKE_GENERATOR: Ninja
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          "CMAKE_GENERATOR = $env:CMAKE_GENERATOR"
+          & cmake --version | Select-Object -First 1
+          & ninja --version
+          & .\build.ps1 -Toolchain $env:RUST_TOOLCHAIN
+          if (-not (Test-Path "tools\kirara-builder.exe")) {
+            throw "kirara-builder.exe 未生成"
+          }
+          Get-Item tools\kirara-builder.exe |
+            Select-Object FullName, @{n = "MB"; e = { [math]::Round($_.Length / 1MB, 2) }} |
+            Format-List
+
+      # 版本号只用于 Release 说明与产物命名，不写回 Cargo.toml：
+      # 二进制内容由源码决定，CI 改版本号只会让缓存与产物对不上。
+      - name: Read version
+        id: meta
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = git describe --tags --abbrev=0 2>$null
+          if (-not $tag) { $tag = "0.0.0" }
+          $version = $tag -replace '^v', ''
+          $rev = "r$(git rev-list --count HEAD).$(git rev-parse --short HEAD)"
+          "version=$version+$rev" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "version = $version+$rev"
+
+      - name: Upload kirara-builder
+        uses: actions/upload-artifact@v6
+        with:
+          name: kirara-builder
+          path: tools/kirara-builder.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  # 上游的安装 / 更新行为测试：拿刚构建出的 builder 在 runner 上真装一次、真升一次
+  test:
+    name: ${{ matrix.test }}
+    needs: [build]
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        test: [offline-install, online-install, offline-update, online-update]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Download kirara-builder
+        uses: actions/download-artifact@v7
+        with:
+          name: kirara-builder
+          path: artifacts
+
+      # 测试脚本按上游布局在 target 目录下找 builder
+      - name: Place builder for tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($d in @("src-tauri/target/release", "src-tauri/target/x86_64-win7-windows-msvc/release")) {
+            New-Item -ItemType Directory -Force -Path $d | Out-Null
+            Copy-Item "artifacts/kirara-builder.exe" (Join-Path $d "kachina-builder.exe") -Force
+          }
+
+      - name: Prepare test fixtures
+        run: npm run test:prepare
+        continue-on-error: true
+
+      - name: Run ${{ matrix.test }}
+        run: npm run test:${{ matrix.test }}
+        timeout-minutes: 10
+
+  # tag 触发时把 builder 挂到 Release（上游同款，去掉 Sentry 上传）
+  release:
+    name: Release
+    needs: [build, test]
+    runs-on: windows-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download kirara-builder
+        uses: actions/download-artifact@v7
+        with:
+          name: kirara-builder
+          path: artifacts
+
+      - name: Stage release asset
+        shell: pwsh
+        run: Copy-Item "artifacts/kirara-builder.exe" "kirara-builder.exe" -Force
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: kirara-builder.exe
+          make_latest: true
+          body: |
+            ${{ needs.build.outputs.version }}

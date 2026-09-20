@@ -1,0 +1,3 @@
+# windows-latest 的 git 默认 core.autocrlf=true：检出成 CRLF 后 prettier --check 必挂。
+# 换行统一由这里决定（见 README.md「workflow 里那些看着多余的设置」）。
+* text=auto eol=lf

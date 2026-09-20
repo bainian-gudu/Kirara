@@ -1,0 +1,89 @@
+name: Devcheck
+
+# 自动执行：push 到 main、任何 PR、以及手动触发。
+# 这套检查（tools/devcheck）是「不跑完整构建的快速体检」：上游完整构建要 nightly +
+# 自定义 target + build-std，几分钟起步，日常改一行 Rust / Vue 靠它兜底。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: devcheck-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22"
+  CARGO_TERM_COLOR: always
+  # 压掉第三方 action 自己的弃用告警
+  NODE_NO_WARNINGS: "1"
+
+jobs:
+  devcheck:
+    name: devcheck (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu 验证脚本的跨平台分支；windows 验证用户实际会跑的那条路径
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      # 压掉 actions/checkout 里 git init 的 8 行 master hint
+      - name: Silence git default-branch hint
+        if: runner.os == 'Linux'
+        run: git config --global init.defaultBranch main
+
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: tools/devcheck/front/package-lock.json
+
+      # windows-latest 的 MSVC 工具链自带该 target；ubuntu 需要显式安装
+      - name: Install windows-msvc rust target
+        if: runner.os == 'Linux'
+        shell: pwsh
+        run: rustup target add x86_64-pc-windows-msvc
+
+      # native 层要用 cl.exe 真编 vendored rcedit-sys 的 C++（rescle.cc / librcedit.cpp）。
+      # 不注入 MSVC 开发环境时该层会自动 SKIP，不算失败。
+      - name: Add MSVC Developer environment
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: tools/ci/Import-DevCmd.ps1 -Arch x64
+
+      - name: Cache cargo (devcheck crates)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            tools/devcheck/rust/typecheck
+            tools/devcheck/rust/logic
+          cache-targets: true
+          key: devcheck
+
+      # vendor 层断言：源码快照完整、不是 submodule、工作流与脚本里没有任何从
+      # 上游仓库拉源码 / 下二进制的动作（详见 tools/devcheck/README.md）。
+      # 单独跑一次，让这条约束在日志里有独立、显眼的结论。
+      # 注意：本文件的注释里不要写上游仓库名，vendor 层会扫工作流文件。
+      - name: Vendored source guard
+        shell: pwsh
+        run: pwsh -NoProfile -File ./tools/devcheck/devcheck.ps1 -Layer vendor
+
+      - name: devcheck (all layers)
+        shell: pwsh
+        run: pwsh -NoProfile -File ./tools/devcheck/devcheck.ps1
+
+      # 自检：注入错误，确认每一层真的会报错（防止「检查跑通了但其实什么都没查」）。
+      # 自检会临时改写仓库文件，因此自带仓库改动锁。
+      - name: devcheck -SelfTest
+        shell: pwsh
+        run: pwsh -NoProfile -File ./tools/devcheck/devcheck.ps1 -SelfTest
