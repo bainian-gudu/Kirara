@@ -356,7 +356,7 @@ function Test-RustTypecheck {
     if ($r.ExitCode -ne 0) { throw 'cargo check（x86_64-pc-windows-msvc）失败，见上方输出' }
     $warn = ([regex]::Matches($r.Output, 'warning:')).Count
     $what = if ($warn) { "（$warn 条 warning）" } else { '，0 warning' }
-    return "uninstall.rs + lnk.rs + utils/{error,dir}.rs 在 $target 上类型检查通过$what"
+    return "uninstall.rs + lnk.rs + utils/{error,dir,os_version}.rs 在 $target 上类型检查通过$what"
 }
 
 function Test-RustLogic {

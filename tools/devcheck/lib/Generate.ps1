@@ -87,6 +87,7 @@ function New-TypecheckGen {
     $error = Read-RustSource -Path (Join-Path $kachina 'utils/error.rs')
     $lnk = Read-RustSource -Path (Join-Path $kachina 'installer/lnk.rs')
     $dir = Read-RustSource -Path (Join-Path $kachina 'utils/dir.rs')
+    $osVersion = Read-RustSource -Path (Join-Path $kachina 'utils/os_version.rs')
 
     $header = @'
 // 生成物，勿手改：由 tools/devcheck/devcheck.ps1 从 src-tauri/src 复制。
@@ -103,12 +104,15 @@ function New-TypecheckGen {
         -Content ($header + "`n" + (Remove-TauriCommandAttr -Text $lnk.Text) + "`n")
     Write-GeneratedFile -Path (Join-Path $genDir 'utils_dir.rs') `
         -Content ($header + "`n" + $dir.Text)
+    Write-GeneratedFile -Path (Join-Path $genDir 'utils_os_version.rs') `
+        -Content ($header + "`n" + $osVersion.Text)
 
     return @(
         (Join-Path $genDir 'uninstall.rs')
         (Join-Path $genDir 'utils_error.rs')
         (Join-Path $genDir 'lnk.rs')
         (Join-Path $genDir 'utils_dir.rs')
+        (Join-Path $genDir 'utils_os_version.rs')
     )
 }
 

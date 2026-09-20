@@ -7,6 +7,7 @@
 //! - `gen/utils_error.rs` —— `utils/error.rs` 原样复制
 //! - `gen/lnk.rs` —— `installer/lnk.rs` 原样复制，只去掉 `#[tauri::command]`
 //! - `gen/utils_dir.rs` —— `utils/dir.rs` 原样复制
+//! - `gen/utils_os_version.rs` —— `utils/os_version.rs` 原样复制
 //!
 //! 本文件负责把这些文件挂到与上游相同的模块路径上（`crate::utils::error`、
 //! `crate::utils::dir`、`crate::installer::uninstall`、`crate::installer::lnk`），
@@ -17,6 +18,8 @@
 //! `lnk.rs` 是「用系统 API 换掉 mslnk」那次重构的落点（`IShellLinkW` + `IPersistFile`），
 //! 那段代码只在 Windows 上跑，本地无从执行 —— 挂进来至少保证 COM 接口名、参数类型与
 //! 调用顺序在 `x86_64-pc-windows-msvc` 上编得过，改错 API 时 devcheck 当场就响。
+//! `utils/os_version.rs` 同理：它是换掉 `nt_version` 的 `ntdll` 声明，
+//! `unsafe extern` 那几行写错同样只有 Windows 构建才会发现。
 //!
 //! 桩与上游不一致时会直接编译失败，所以这个 crate 顺便也盯着上游签名变化。
 #![allow(
@@ -52,15 +55,19 @@ pub mod gen_utils_error;
 #[path = "gen/utils_dir.rs"]
 pub mod gen_utils_dir;
 
+#[path = "gen/utils_os_version.rs"]
+pub mod gen_utils_os_version;
+
 // 上游这里有个 `pub mod sentry { capture_anyhow }` 桩：`utils/error.rs` 序列化时会顺手
 // 把错误上报到 Sentry，`super::sentry` 指向 crate 根。本项目已把 Sentry 连依赖一起拔掉
 // （LOCAL_PATCHES.md 第 7 节），error.rs 里那句调用也没了，所以桩不需要。
 
-/// 让 `use crate::utils::error::{return_ta_result, TAResult}` 与
-/// `use crate::utils::dir::get_dir` 能解析到真实文件。
+/// 让 `use crate::utils::error::{return_ta_result, TAResult}`、
+/// `use crate::utils::dir::get_dir` 与 `crate::utils::os_version::get()` 能解析到真实文件。
 pub mod utils {
     pub use crate::gen_utils_error as error;
     pub use crate::gen_utils_dir as dir;
+    pub use crate::gen_utils_os_version as os_version;
 }
 
 /// 对应上游 `src/local.rs`：真实实现要 mmap 自身并解析内嵌索引，

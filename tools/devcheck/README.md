@@ -28,7 +28,7 @@ pwsh tools/devcheck/devcheck.ps1 -Fix            # 只对我们维护的 .rs 跑
 | `vendor` | **kachina 只用仓库内源码**：不是 submodule、快照完整、工作流与打包脚本里没有任何从上游拉源码/下二进制的动作、CI 确实走源码构建、git 依赖锁到 commit、npm 依赖全来自 registry、**遥测（Sentry / cocogoat 统计）没被加回来** | pwsh 7 | ~0.8s |
 | `ps1` | 仓库里全部 `.ps1` 的语法（PowerShell Parser） | pwsh 7 | <0.1s |
 | `gen` | 从 `src-tauri/`、`src/` 源码生成检查用的 Rust / TS 文件 | pwsh 7 | ~0.3s |
-| `rust` | **整份** `installer/uninstall.rs` + `installer/lnk.rs` + `utils/error.rs` + `utils/dir.rs` 的类型检查：塞进一个只有 11 个依赖的 crate，`cargo check --target x86_64-pc-windows-msvc`。不需要 tauri、不需要 Windows 机器 | cargo + `rustup target add x86_64-pc-windows-msvc` | 首次 ~30s，之后 ~0.6s |
+| `rust` | **整份** `installer/uninstall.rs` + `installer/lnk.rs` + `utils/{error,dir,os_version}.rs` 的类型检查：塞进一个只有 11 个依赖的 crate，`cargo check --target x86_64-pc-windows-msvc`。不需要 tauri、不需要 Windows 机器 | cargo + `rustup target add x86_64-pc-windows-msvc` | 首次 ~30s，之后 ~0.6s |
 | `native` | vendored `rcedit-sys` 的 C++（`rescle.cc` / `librcedit.cpp`）真用 MSVC 编一遍。没有 `cl.exe` 的机器（Linux / 未进 VS 开发环境的 Windows）自动 SKIP | cargo + MSVC（`cl.exe` 在 PATH） | 首次 ~30s，之后 ~2s |
 | `logic` | 同一批函数的**行为断言**（208 条，含循环用例）：注册表 / 快捷方式 / 计划任务名 / 用户数据目录 / 安装目录内文件清单 / 旧版本残留清单安全阀、路径归一化与比较、微软签名判定、zip 条目名解码（替代 zip fork 的那条语义）、H3 证书固定值与 SPKI 哈希（用 openssl 算出的样例证书交叉验证），以及用**临时配置文件 + 临时协议正文**跑 `resolve_agreement`（下游应用侧的配置不在本仓库，所以这里不依赖它） | cargo | 首次 ~15s，之后 ~0.4s |
 | `front` | `utils/agreement.ts` + `types.ts` 的 `tsc --strict`；`src` 下**全部** `.vue` 的 `@vue/compiler-sfc` 编译；`agreement.ts` 的 prettier 风格 | node + npm | 首次 ~10s，之后 ~2s |
@@ -163,12 +163,15 @@ tools/devcheck/
 └── rust/native/target/     native 层的 CARGO_TARGET_DIR（运行时生成，已 gitignore）
 ```
 
-- **`typecheck`**：`gen/` 下的四个文件都是上游文件的**逐字节复制**，唯一改动是把
+- **`typecheck`**：`gen/` 下的五个文件都是上游文件的**逐字节复制**，唯一改动是把
   `#[tauri::command]` 那一行换成注释（本 crate 不依赖 tauri）：`uninstall.rs`、
-  `utils/error.rs`、`installer/lnk.rs`、`utils/dir.rs`。`lnk.rs` 是「用系统 API 换掉
-  `mslnk`」那次重构的落点（`IShellLinkW` + `IPersistFile`，见 `LOCAL_PATCHES.md` 第 16 节），
-  那段代码只在 Windows 上跑，本地无从执行 —— 挂进来至少保证 COM 接口名、参数类型与
-  调用顺序在 `x86_64-pc-windows-msvc` 上编得过。`lib.rs` 只提供两个桩：
+  `utils/error.rs`、`installer/lnk.rs`、`utils/dir.rs`、`utils/os_version.rs`。
+  `lnk.rs` 是「用系统 API 换掉 `mslnk`」那次重构的落点（`IShellLinkW` + `IPersistFile`，
+  见 `LOCAL_PATCHES.md` 第 16 节），`utils/os_version.rs` 是换掉 `nt_version` 的
+  `ntdll` 声明；这段代码只在 Windows 上跑，本地无从执行 —— 挂进来至少保证 COM 接口名、
+  参数类型、调用顺序与 `unsafe extern` 声明在 `x86_64-pc-windows-msvc` 上编得过
+  （`os_version.rs` 那条 `unsafe extern` 块上的文档注释就是这么发现是无效的）。
+  `lib.rs` 只提供两个桩：
   `dfs::InsightItem`（字段与上游一致）、`local::get_base_with_config`（返回一个
   `AsyncRead`）。**桩与上游签名不一致时会直接编译失败**，所以上游改了这些接口
   devcheck 会立刻报警。
@@ -207,7 +210,8 @@ Rust 类型/借用/生命周期错误（含 `std::os::windows`、`windows`、
   `x86_64-pc-windows-msvc` 上编得过；快捷方式真的写出来没有、指向对不对，
   仍然要实机装一次才知道
 - 完整构建的链接与 LTO 阶段（这里只对 `uninstall.rs` / `lnk.rs` /
-  `utils/{error,dir}.rs` 做类型检查，target 现在与 CI 一致，但真实产物仍然只有 CI 会跑）
+  `utils/{error,dir,os_version}.rs` 做类型检查，target 现在与 CI 一致，但真实产物仍然只有
+  CI 会跑）
 - 宿主应用本体（Web UI / Stub / Host）的代码与打包接线 —— 那些在
   [HoYoEnhance](https://github.com/bainian-gudu/HoYoEnhance) 仓库的 `tools/devcheck` 里；
   这里只覆盖安装器工具链。`native` 层也只编 vendored `rcedit-sys` 的 C++，
@@ -285,9 +289,10 @@ Rust 类型/借用/生命周期错误（含 `std::os::windows`、`windows`、
   的 [20] 组断言（那条 SPKI 路径是安全阀本身，改错就等于固定值形同虚设）。
 - kachina 升级依赖版本（`Cargo.toml`）→ 同步 `rust/typecheck/Cargo.toml`，
   否则类型检查结论不可信。
-- 改 `installer/lnk.rs` 的 COM 调用（`IShellLinkW` / `IPersistFile`）或
-  `utils/dir.rs` 的已知目录 API → 直接跑 `-Layer rust`；新增的 `windows` feature
-  要同步 `rust/typecheck/Cargo.toml`，否则生成文件会以「找不到符号」失败。
+- 改 `installer/lnk.rs` 的 COM 调用（`IShellLinkW` / `IPersistFile`）、
+  `utils/dir.rs` 的已知目录 API 或 `utils/os_version.rs` 的 `ntdll` 声明 →
+  直接跑 `-Layer rust`；新增的 `windows` feature 要同步
+  `rust/typecheck/Cargo.toml`，否则生成文件会以「找不到符号」失败。
 - 上游改了 `dfs::InsightItem` / `local::get_base_with_config` 的签名 → `rust` 层会
   编译失败，按报错改 `rust/typecheck/src/lib.rs` 里的桩即可。
 - kachina 的 `Cargo.toml` / `package.json` 改了依赖 → **必须重新生成对应的 lock**

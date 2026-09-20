@@ -6,12 +6,12 @@
 //!
 //! 只做这一件事，所以不引入任何新依赖，也不需要 windows crate 的额外 feature。
 
-/// ntdll 的 `RtlGetNtVersionNumbers`：填 major / minor / build。
-///
-/// 注意 `build` 的高位带着未文档化的标志位（历史上是 `0xF0000000`），
-/// 低 16 位才是真正的构建号，调用方要用 `build & 0xffff`。
 #[link(name = "ntdll")]
 unsafe extern "system" {
+    /// ntdll 的 `RtlGetNtVersionNumbers`：填 major / minor / build。
+    ///
+    /// 注意 `build` 的高位带着未文档化的标志位（历史上是 `0xF0000000`），
+    /// 低 16 位才是真正的构建号；`get()` 已经把高位裁掉了。
     fn RtlGetNtVersionNumbers(major: *mut u32, minor: *mut u32, build: *mut u32);
 }
 

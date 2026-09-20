@@ -940,10 +940,11 @@ IDList、相对路径、图标这些格式细节都得自己维护。现在改�
 
 ### 复核方式
 
-`pwsh tools/devcheck/devcheck.ps1`：`rust` 层现在把 `installer/lnk.rs` 与
-`utils/dir.rs` 一起放进 msvc target 的类型检查（COM 接口名、参数类型、调用顺序写错
-当场就响，本地没有 Windows 也能守），`vendor` 层第 10 项盯着这四个依赖不许回来、
-`libs` 的许可证不许丢。
+`pwsh tools/devcheck/devcheck.ps1`：`rust` 层现在把 `installer/lnk.rs`、
+`utils/dir.rs` 与 `utils/os_version.rs` 一起放进 msvc target 的类型检查（COM 接口名、
+参数类型、调用顺序、`unsafe extern` 声明写错当场就响，本地没有 Windows 也能守；
+`os_version.rs` 里那条「文档注释挂在 `extern` 块上」的无效写法就是这么发现的），
+`vendor` 层第 10 项盯着这四个依赖不许回来、`libs` 的许可证不许丢。
 
 快捷方式的**行为**仍然只能实机验证：装一次，看桌面 / 开始菜单里的快捷方式能正常启动、
 工作目录正确，再跑一次卸载确认它们被清干净（卸载侧的判定在第 1b 节，没有改动）。
@@ -1004,7 +1005,7 @@ IDList、相对路径、图标这些格式细节都得自己维护。现在改�
    `RtlGetNtVersionNumbers`（去掉 `nt_version`）、`Cargo.toml` 的 `windows` features
    补 `Win32_System_Com`、`libs/{hdiff-sys,hpatch-sys}/LICENSE` 与 `libs/THIRDPARTY.md`
    保持存在，`tools/devcheck/lib/Generate.ps1` 的 typecheck 生成清单要带上
-   `installer/lnk.rs` 与 `utils/dir.rs`；
+   `installer/lnk.rs`、`utils/dir.rs` 与 `utils/os_version.rs`；
 4. `npx tsc --noEmit -p tsconfig.json`（上游本身有 3 个 `noUnusedLocals` 报错，
    只要没有新增报错即可）+ 用 `@vue/compiler-sfc` 编译 `src/App.vue` 自检；
 5. Windows 上 `pnpm build` 出 `kachina-builder.exe`，跑一次
