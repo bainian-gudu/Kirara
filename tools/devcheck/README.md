@@ -1,7 +1,7 @@
 # tools/devcheck — 不跑完整构建的本地体检
 
 本仓库是一个 **Tauri + Windows 专用** 的项目：完整构建要 nightly Rust、
-`x86_64-win7-windows-msvc` 自定义 target、`-Z build-std`、pnpm 全家桶，本地跑一次
+标准 `x86_64-pc-windows-msvc` target（不再有 `-Z build-std`）、pnpm 全家桶，本地跑一次
 好几分钟，CI 更久。结果是「改一行 Rust / Vue，只能靠一次完整构建来发现写错了」。
 
 `devcheck` 解决这个问题：把**我们真正改过的那部分代码**放进最小依赖的检查环境里，
@@ -192,8 +192,8 @@ Rust 类型/借用/生命周期错误（含 `std::os::windows`、`windows`、
 - `utils/acl.rs` 的 SDDL 改动是否真的还能让提权流程连上管道 —— 只有实机安装能验证
 - kachina 其余 Rust 模块（`installer/lnk.rs`、`dfs.rs`、`local.rs`、`module/wv2.rs`、
   `cli/mod.rs`、`main.rs` …）
-- CI 用的 `x86_64-win7-windows-msvc` 自定义 target + `-Z build-std`（这里用标准
-  `x86_64-pc-windows-msvc`，能覆盖绝大多数编译错误，但不是同一个 target）
+- 完整构建的链接与 LTO 阶段（这里只对 `uninstall.rs` + `utils/error.rs` 做类型检查，
+  target 现在与 CI 一致，但真实产物仍然只有 CI 会跑）
 - 宿主应用本体（Web UI / Stub / Host）的代码与打包接线 —— 那些在
   [HoYoEnhance](https://github.com/bainian-gudu/HoYoEnhance) 仓库的 `tools/devcheck` 里；
   这里只覆盖安装器工具链。`native` 层也只编 vendored `rcedit-sys` 的 C++，

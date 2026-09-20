@@ -22,8 +22,12 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # 上游固定用 nightly + -Z build-std
+  # 目标已改为标准 x86_64-pc-windows-msvc（不再有 -Z build-std），但 nightly 仍然需要：
+  # Cargo.toml 里的 trim-paths 与 profile.rustflags 目前还是 nightly 专属特性。
   RUST_TOOLCHAIN: nightly
+  # 产物不带调试信息：CI 编出来的 PDB 既不进 Release 也不上传 artifact，白编一份。
+  # 本地构建不受影响，profile 里仍然保留 debug = true。
+  CARGO_PROFILE_RELEASE_DEBUG: "false"
   NODE_VERSION: "22"
   # 压掉第三方 action 自己的告警
   NODE_NO_WARNINGS: "1"
@@ -152,7 +156,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          foreach ($d in @("src-tauri/target/release", "src-tauri/target/x86_64-win7-windows-msvc/release")) {
+          foreach ($d in @("src-tauri/target/release", "src-tauri/target/x86_64-pc-windows-msvc/release")) {
             New-Item -ItemType Directory -Force -Path $d | Out-Null
             Copy-Item "artifacts/kirara-builder.exe" (Join-Path $d "kachina-builder.exe") -Force
           }

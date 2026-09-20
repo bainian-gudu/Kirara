@@ -1,8 +1,8 @@
 name: Devcheck
 
 # 自动执行：push 到 main、任何 PR、以及手动触发。
-# 这套检查（tools/devcheck）是「不跑完整构建的快速体检」：上游完整构建要 nightly +
-# 自定义 target + build-std，几分钟起步，日常改一行 Rust / Vue 靠它兜底。
+# 这套检查（tools/devcheck）是「不跑完整构建的快速体检」：完整构建要 nightly +
+# pnpm 全家桶与 LTO，几分钟起步，日常改一行 Rust / Vue 靠它兜底。
 on:
   push:
     branches: [main]

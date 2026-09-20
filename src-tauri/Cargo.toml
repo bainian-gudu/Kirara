@@ -121,7 +121,7 @@ path = "src/builder/main.rs"
 
 [profile.dev]
 incremental = true # 将编译拆成更小的步骤。
-rustflags = ["-Zthreads=16"] # 提高编译性能。
+rustflags = ["-Zthreads=8"] # 提高编译性能（Tauri 官方建议值；4 核 runner 上 16 会超订）。
 
 [profile.release]
 debug = true
@@ -131,8 +131,10 @@ lto = true # 启用链接时优化。
 opt-level = "s" # 优先减小二进制体积；更重视速度时可改为 `3`。
 panic = "abort" # 禁用 panic 处理器以提高性能。
 trim-paths = "all" # 从二进制文件中移除可能包含特权信息的路径。
-rustflags = ["-Zthreads=16"] # 提高编译性能。
+rustflags = ["-Zthreads=8"] # 提高编译性能（Tauri 官方建议值；4 核 runner 上 16 会超订）。
 
 [patch.crates-io]
 msquic-async = { git = "https://github.com/xytoki/msquic-async-rs.git", branch = "main" }
-ctor = { git = "https://github.com/xytoki/rust-ctor.git", branch = "master" }
+# 这里不再需要 xytoki/rust-ctor 的 fork：那份补丁只补了 target_vendor = "win7"
+# 分支，本项目改用标准 x86_64-pc-windows-msvc 目标后走的是上游原有的
+# target_vendor = "pc" 分支，crates.io 的 ctor 0.6.3 即可。

@@ -26,6 +26,7 @@
 - [9. 下载与提权链路加固](#9-第三轮安全加固把下载后执行和提权管道两条链路一次收干净)
 - [10. 前端模块拆分与注释中文化](#10-前端模块拆分与注释语言统一)
 - [11. 构建日志告警收敛](#11-构建日志告警收敛)
+- [13. 构建目标改为 Windows 10/11](#13-构建目标改为-windows-1011)
 - [升级上游时的套用顺序](#升级上游时的套用顺序)
 
 | # | 需求 | 涉及文件 |
@@ -43,6 +44,7 @@
 | 9 | 下载文件验签、临时文件、提权管道及后续复查修复 | `src-tauri/src/utils/secure_temp.rs`、`src-tauri/src/utils/acl.rs` 及相关调用点，详见第 9 节 |
 | 10 | DFS 会话模块拆分与注释中文化 | `src/dfs.ts`、`src/dfs/session.ts`；注释调整覆盖本目录项目源码和仓库内副本的功能注释 |
 | 12 | 品牌改名后的旧主程序 / 安装目录识别、旧组件清理与快捷方式修复 | `src-tauri/src/installer/config.rs`、`src-tauri/src/installer/mod.rs`、`src/App.vue` |
+| 13 | 目标改回标准 `x86_64-pc-windows-msvc`，去掉 `-Z build-std` 与 `rust-ctor` fork | `package.json`、`build.ps1`、`.github/workflows/build.yml`、`src-tauri/Cargo.toml` |
 
 ---
 
@@ -749,7 +751,7 @@ AppContainer 进程、远程会话，并把完整性级别压到 Low。于是别
 
 ## 11. 构建日志告警收敛
 
-`pnpm build` 在 `-Z build-std` 下会带出两类与产物无关的告警，逐条从源头上消掉：
+`pnpm build` 会带出两类与产物无关的告警（自 rustc 1.9x 起），逐条从源头上消掉：
 
 ### `libs/hdiff-sys/src/lib.rs`、`libs/hpatch-sys/src/lib.rs`
 
@@ -799,6 +801,35 @@ Other(Vec<String>),
 
 ---
 
+## 13. 构建目标改为 Windows 10/11
+
+本仓库只服务 HoYoEnhance，兼容范围与宿主一致（64 位 Windows 10 1607+ / Windows 11），
+因此不再需要上游的 Windows 7 目标：
+
+- `package.json`、`build.ps1`、`.github/workflows/build.yml` 的目标三元组从
+  `x86_64-win7-windows-msvc` 换成标准 `x86_64-pc-windows-msvc`；
+- 随之删掉 `-Z build-std=std,panic_abort` 与 `rust-src` 组件：win7 是 tier-3 目标，
+  rustup 没有预编译标准库才需要从源码编标准库，标准目标是 tier-1；
+- `[patch.crates-io] ctor` 删除：`xytoki/rust-ctor` 那份 fork 只补了
+  `target_vendor = "win7"` 分支，标准目标走的是上游原有的 `target_vendor = "pc"`
+  分支，用 crates.io 的 `ctor 0.6.3` 即可；
+- `build.ps1` 在构建前按本机核数设置 `CMAKE_BUILD_PARALLEL_LEVEL`：`seera-msquic`
+  的构建脚本在 Windows 上会移除 `NUM_JOBS`，而 cmake-rs 只在 `NUM_JOBS` 存在时才给
+  cmake 传 `--parallel`，导致 msquic 的 C 源码被串行编译；cmake 自己认这个环境变量，
+  不必改上游 crate；
+- CI 增加 `CARGO_PROFILE_RELEASE_DEBUG: "false"`：PDB 既不进 Release 也不上传 artifact，
+  省掉一份没有去处的调试信息（本地构建不受影响）。
+
+nightly 工具链保留：`Cargo.toml` 里的 `trim-paths` 与 `profile.rustflags`
+（`-Zthreads=8`）目前仍是 nightly 专属特性，stable 会直接报
+`feature trim-paths is required`。
+
+复核方式：`pwsh build.ps1` 能产出 `tools\kirara-builder.exe`，CI 的四组安装 / 更新
+测试全绿；`tools/devcheck` 的 `vendor` 层仍会断言每个 git 依赖都锁到 commit
+（此时只剩 `zip` 与 `msquic-async`）。
+
+---
+
 
 ## 升级上游时的套用顺序
 
@@ -836,6 +867,10 @@ Other(Vec<String>),
 3f. **重做第 12 节的改名兼容**：`installer/config.rs` 增加旧 exe / 旧安装目录探测，
    `installer/mod.rs` 的 `select_dir` 增加 `legacy_exe_names`，`App.vue` 同步结束旧进程
    并在更新时重建快捷方式；
+3g. **重做第 13 节的构建目标**：`package.json`、`build.ps1`、
+   `.github/workflows/build.yml` 换成标准 `x86_64-pc-windows-msvc` 并去掉
+   `-Z build-std`，`src-tauri/Cargo.toml` 去掉 `ctor` 的 `[patch.crates-io]`
+   （上游升级后如果又带回 win7 目标，同样换掉）；
 4. `npx tsc --noEmit -p tsconfig.json`（上游本身有 3 个 `noUnusedLocals` 报错，
    只要没有新增报错即可）+ 用 `@vue/compiler-sfc` 编译 `src/App.vue` 自检；
 5. Windows 上 `pnpm build` 出 `kachina-builder.exe`，跑一次
