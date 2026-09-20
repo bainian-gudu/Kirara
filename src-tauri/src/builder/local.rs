@@ -227,3 +227,43 @@ pub async fn get_reader_for_bundle() -> Result<AsyncMmapFileReader<'static>, Str
     let reader = file.reader(exe_offset).map_err(|e| e.to_string())?;
     Ok(reader)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{is_pe_at, pe_image_starts};
+
+    /// 最小 PE 映像：DOS 头 + `e_lfanew` 指向的 `PE\0\0`。
+    fn mini_pe(tag: u8) -> Vec<u8> {
+        let e_lfanew = 0x80usize;
+        let mut bytes = vec![0u8; 0x200];
+        bytes[0] = b'M';
+        bytes[1] = b'Z';
+        bytes[2] = 0x90;
+        bytes[3] = 0x00;
+        bytes[0x3C..0x40].copy_from_slice(&(e_lfanew as u32).to_le_bytes());
+        bytes[e_lfanew..e_lfanew + 4].copy_from_slice(b"PE\0\0");
+        bytes[e_lfanew + 4] = tag;
+        bytes
+    }
+
+    #[test]
+    fn pe_at_requires_pe_signature() {
+        let pe = mini_pe(1);
+        assert!(is_pe_at(&pe, 0));
+        let mut false_mz = vec![0x4D, 0x5A, 0x90, 0x00];
+        false_mz.extend_from_slice(&[0u8; 60]);
+        assert!(!is_pe_at(&false_mz, 0));
+    }
+
+    #[test]
+    fn bundle_uses_last_real_pe_not_last_mz90() {
+        let builder = mini_pe(1);
+        let installer = mini_pe(2);
+        let mut bundle = builder.clone();
+        bundle.extend_from_slice(&installer);
+        // 安装器体内再放一个 DOS 魔数：旧扫描会把它当成映像起点，rcedit 加载失败。
+        let planted = builder.len() + 0x40;
+        bundle[planted..planted + 4].copy_from_slice(&[0x4D, 0x5A, 0x90, 0x00]);
+        assert_eq!(pe_image_starts(&bundle), vec![0, builder.len()]);
+    }
+}

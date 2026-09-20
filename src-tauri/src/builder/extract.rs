@@ -526,3 +526,35 @@ pub async fn extract_cli(args: ExtractArgs) {
         eprintln!("Extraction failed: {}", err);
     }
 }
+
+// 这些用例跑在 Windows 上（CI 的 unit-test job，`cargo test --bin kachina-builder`）：
+// 反斜杠与盘符在 Linux 上只是普通字符，只有在 Windows 上才能验到
+// 「`..\x` / `C:\x` / UNC 一律拒绝」这条语义。跨平台那部分在 tools/devcheck 的
+// logic 层 [21] 组断言里。
+#[cfg(test)]
+mod tests {
+    use super::relative_under_root;
+    use std::path::Path;
+
+    #[test]
+    fn relative_paths_stay_under_root() {
+        let root = Path::new("out");
+        assert!(relative_under_root(root, "app.exe").is_ok());
+        assert!(relative_under_root(root, "User/settings.json").is_ok());
+
+        for evil in [
+            "../outside.txt",
+            "a/../../outside.txt",
+            "..\\outside.txt",
+            "C:\\Windows\\evil.exe",
+            "\\\\server\\share\\evil.exe",
+            "/abs/path.txt",
+            "",
+        ] {
+            assert!(
+                relative_under_root(root, evil).is_err(),
+                "must reject {evil:?}"
+            );
+        }
+    }
+}

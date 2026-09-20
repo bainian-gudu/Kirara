@@ -64,3 +64,66 @@ pub async fn run_hash(hash_algorithm: &str, path: &str) -> Result<String> {
         .context("HASH_THREAD_ERR")?
         .context("HASH_COMPLETE_ERR")
 }
+
+// 这些用例跑在 Windows 上（CI 的 unit-test job，`cargo test --bin kachina-builder`）：
+// 它们要的正是 Linux 上验不了的东西 —— 真实文件打开、只读文件、
+// FILE_FLAG_SEQUENTIAL_SCAN 这条 Windows 专有路径。跨平台的摘要一致性在
+// tools/devcheck 的 logic 层 [22] 组断言里。
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_file(bytes: &[u8]) -> (std::path::PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!(
+            "kachina-hash-{}-{}",
+            std::process::id(),
+            TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sample.bin");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(bytes).unwrap();
+        file.flush().unwrap();
+        (dir, path.to_string_lossy().to_string())
+    }
+
+    fn cleanup(dir: std::path::PathBuf, path: &str) {
+        // 只读文件在 Windows 上删不掉，先摘掉只读位
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_readonly(false);
+        let _ = std::fs::set_permissions(path, perms);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn md5_matches_known_digest() {
+        let (dir, path) = temp_file(b"hello");
+        let hash = hash_file("md5", &path).unwrap();
+        cleanup(dir, &path);
+        assert_eq!(hash, "5d41402abc4b2a76b9719d911017c592");
+    }
+
+    #[test]
+    fn hashes_read_only_file() {
+        let (dir, path) = temp_file(b"readonly-hash");
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).unwrap();
+        let hash = hash_file("md5", &path).unwrap();
+        let expected = chksum_md5::hash(b"readonly-hash").to_hex_lowercase();
+        cleanup(dir, &path);
+        assert_eq!(hash, expected);
+    }
+
+    #[test]
+    fn rejects_unknown_algorithm() {
+        let (dir, path) = temp_file(b"x");
+        let err = hash_file("sha1", &path).is_err();
+        cleanup(dir, &path);
+        assert!(err);
+    }
+}

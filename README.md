@@ -66,10 +66,13 @@ pwsh tools/devcheck/devcheck.ps1 -Fix         # 只对我们维护的两个 .rs 
 | 工作流 | 触发 | 做什么 |
 | --- | --- | --- |
 | **Devcheck**（`.github/workflows/devcheck.yml`） | push 到 main、任何 PR、手动 | `vendor` 层 → `all` → `-SelfTest`（ubuntu + windows 双 runner） |
-| **Build**（`.github/workflows/build.yml`） | push / PR / 手动；tag 触发 Release | 从源码构建 `kirara-builder.exe` → 跑安装 / 更新行为测试 → tag 时把产物挂到 Release |
+| **Build**（`.github/workflows/build.yml`） | push / PR / 手动；tag 触发 Release | 从源码构建 `kirara-builder.exe` → 跑安装 / 更新 / 卸载行为测试与 Rust 单元测试 → tag 时把产物挂到 Release |
 
 `Build` 的 `test` job 会拿刚构建出的 builder 在 runner 上真装一次、真升一次
-（`offline-install` / `online-install` / `offline-update` / `online-update` 四组）。
+（`offline-install` / `online-install` / `offline-update` / `online-update` /
+`already-latest` / `uninstall` / `userdata-ignore` / `occupied-process` /
+`builder-extract-replace` 九组）；`unit-test` job 另跑
+`cargo test --bin kachina-builder --locked`（哈希、PE 识别、抽取路径安全阀）。
 上游同款流程里有一处 Sentry 上传步骤，本仓库没有（遥测已移除）。
 
 ## 日志里哪些告警是正常的

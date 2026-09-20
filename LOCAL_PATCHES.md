@@ -32,6 +32,7 @@
 - [15. H3 传输层改用 quinn + rustls](#15-h3-传输层改用-quinn--rustls)
 - [16. 停更依赖换成系统 API](#16-停更依赖换成系统-api)
 - [17. 同步上游 0.5.1 之后的打包器修复](#17-同步上游-051-之后的打包器修复)
+- [18. 同步上游最新的安装行为测试与 unit-test job](#18-同步上游最新的安装行为测试与-unit-test-job)
 - [升级上游时的套用顺序](#升级上游时的套用顺序)
 
 | # | 需求 | 涉及文件 |
@@ -1014,6 +1015,53 @@ md5 / xxh 的已知摘要与跨 1 MB 分块一致性。打包器本身只在 Win
 
 ---
 
+## 18. 同步上游最新的安装行为测试与 unit-test job
+
+上游 `main`（`a52a4c66`）在 0.5.1 之后把测试矩阵扩到了十几组，其中一半依赖
+Tauri → 原生 Win32 的重写（`dfs2`、`updater-survival`、`plugin-stub`、
+`dump-offline-install`），本仓库没有那套架构，没有跟着搬。可独立复用的部分已经
+移植过来。
+
+### 18a. 安装行为测试（`test` job）
+
+新增 5 组测试，`test` job 的矩阵从 4 组扩到 9 组：
+
+- `already-latest`：同版本重复安装不覆盖已装文件；
+- `uninstall`：静默卸载删掉包内文件与 `extraUninstallPath`，默认保留 `userDataPath`；
+- `userdata-ignore`：升级时 `userDataPath` 保留用户改过的文件、`ignoreFolderPath`
+  整目录不动；
+- `occupied-process`：主程序占用 `app.exe` 时更新流程先结束进程再替换；
+- `builder-extract-replace`：`extract --list` / `--all` / `--name` 与
+  `replace-bin` 的端到端覆盖。
+
+`tests/prepare.mjs` 为这些用例补了 `User/settings.json`、`cache/keep.dat` 与
+`userDataPath` / `ignoreFolderPath` / `extraUninstallPath` 配置。夹具打包命令去掉了
+`--icon`（本仓库拆分后没有 `resources/icons/icon.ico`，该参数可选），并且 `main()`
+失败时恢复 `process.exitCode = 1`，避免夹具构建失败被 CI 当成成功。
+
+### 18b. Rust 单元测试（`unit-test` job）
+
+新增 job 在 `windows-latest` 上跑 `cargo test --bin kachina-builder --locked`，
+与 Build 分开缓存、互不覆盖 `target`。用例覆盖：
+
+- `utils/hash.rs`：md5 已知摘要、只读文件、未知算法报错；
+- `builder/local.rs`：PE 映像识别（含「安装器体内埋 `MZ\x90\x00`」反例）；
+- `builder/extract.rs`：`..\x`、盘符、UNC 等包内路径必须被 `relative_under_root` 拒绝。
+
+### 有意未移植
+
+- `dfs2`、`plugin-stub`、`updater-survival`、`dump-offline-install`：依赖上游新架构的
+  DFS 会话 / 插件系统 / staging 提交，当前快照没有对应落点；
+- Sentry 上传：本仓库继续物理移除遥测，Release 只挂产物。
+
+### 复核方式
+
+`pwsh tools/devcheck/devcheck.ps1`（含 `-SelfTest`）与 CI 的 `Build` 全绿：
+`test` job 九组行为测试与 `unit-test` job 均通过。本机没有 MSVC 时，Rust 单元测试
+只能在 Windows runner 上执行。
+
+---
+
 
 ## 升级上游时的套用顺序
 
@@ -1074,6 +1122,13 @@ md5 / xxh 的已知摘要与跨 1 MB 分块一致性。打包器本身只在 Win
    `builder/pack.rs` 的临时文件名与退出码、`utils/hash.rs` 的顺序读摘要），
    `tools/devcheck/lib/Generate.ps1` 补回 `LogicBuilderItems` / `LogicExtractItems` /
    `LogicHashItems` 三张清单与 `rust/logic/src/main.rs` 的 [21]/[22] 组断言；
+3l. **重做第 18 节的工作流与测试同步**：从上游最新 `main` 挑出 5 组不依赖新架构的
+   行为测试（`already-latest` / `uninstall` / `userdata-ignore` /
+   `occupied-process` / `builder-extract-replace`），依赖 DFS / 插件 / staging 的
+   测试不搬；`tests/prepare.mjs` 的 builder 路径按本仓库布局
+   （`src-tauri/target/...`）改，夹具打包去掉 `--icon`，失败要
+   `process.exitCode = 1`；`.github/workflows/build.yml` 的 `test` 矩阵与
+   `unit-test` job 同步更新；
 4. `npx tsc --noEmit -p tsconfig.json`（上游本身有 3 个 `noUnusedLocals` 报错，
    只要没有新增报错即可）+ 用 `@vue/compiler-sfc` 编译 `src/App.vue` 自检；
 5. Windows 上 `pnpm build` 出 `kachina-builder.exe`，跑一次

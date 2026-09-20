@@ -127,7 +127,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        test: [offline-install, online-install, offline-update, online-update]
+        test:
+          - offline-install
+          - online-install
+          - offline-update
+          - online-update
+          - already-latest
+          - uninstall
+          - userdata-ignore
+          - occupied-process
+          - builder-extract-replace
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -163,16 +172,47 @@ jobs:
 
       - name: Prepare test fixtures
         run: npm run test:prepare
-        continue-on-error: true
 
       - name: Run ${{ matrix.test }}
         run: npm run test:${{ matrix.test }}
         timeout-minutes: 10
 
+  # 与安装行为无关的纯 Rust 单元测试：哈希 / PE 识别 / 路径校验等。
+  # 单独成 job，避免和 build 抢 target 目录，也便于在 PR 上快速看到失败点。
+  unit-test:
+    name: Rust unit tests
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # Cargo.toml 的 trim-paths / profile-rustflags 还是 nightly 专属特性，
+      # src-tauri/rust-toolchain.toml 指定 nightly；显式装一次，别赌 rustup 自动安装。
+      - name: Install Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install nightly --profile minimal
+
+      - name: Cache cargo / target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri"
+          cache-targets: true
+          key: kirara-src
+
+      - name: Add MSVC Developer environment
+        shell: pwsh
+        run: tools/ci/Import-DevCmd.ps1 -Arch x64
+
+      - name: Rust unit tests
+        working-directory: src-tauri
+        shell: pwsh
+        run: cargo test --bin kachina-builder --locked
+
   # tag 触发时把 builder 挂到 Release（上游同款，去掉 Sentry 上传）
   release:
     name: Release
-    needs: [build, test]
+    needs: [build, test, unit-test]
     runs-on: windows-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
