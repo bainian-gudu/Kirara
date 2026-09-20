@@ -191,4 +191,10 @@ jobs:
           files: kirara-builder.exe
           make_latest: true
           body: |
-            ${{ needs.build.outputs.version }}
+            Kirara 安装器构建工具 ${{ needs.build.outputs.version }}
+
+            - 产物 `kirara-builder.exe` 由本仓库源码构建，供下游按 `pack` / `gen` 子命令调用
+            - 源码为上游 kachina-installer 快照（tag 0.5.1）加本地补丁，逐处改动见 `LOCAL_PATCHES.md`
+            - 已物理移除上游的 Sentry 错误上报与前端使用统计
+            - 版本号只用于本说明与产物命名，不写回 Cargo.toml，二进制内容完全由源码决定
+            - 下游 HoYoEnhance 的打包脚本按固定 ref 调用本仓库，用法见 `README.md`
