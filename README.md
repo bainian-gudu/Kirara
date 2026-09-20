@@ -22,7 +22,8 @@ Kirara/                        仓库根目录就是安装器源码
 
 下游项目 [HoYoEnhance](https://github.com/bainian-gudu/HoYoEnhance) 只保留
 `packaging/packaging.config.json`（安装目录、ARP 名称、卸载清理范围、协议文件）与
-`packaging/pack.ps1`（暂存载荷 → 调本仓库的 builder），构建时按固定 ref 检出本仓库。
+`packaging/pack.ps1`（暂存载荷 → 调本仓库的 builder）；它的 CI 直接下载本仓库最新
+Release 的 `kirara-builder.exe`，本地开发才按需调用本仓库的 `build.ps1`。
 
 ## 构建
 
