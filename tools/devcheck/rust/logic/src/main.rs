@@ -10,6 +10,7 @@
 //!
 //! 其余全是上游/本项目的真实代码。断言失败 → 进程退出码 1。
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use std::sync::Mutex;
@@ -1210,6 +1211,172 @@ fn h3_pin_cases() {
     );
 }
 
+/// 造一个最小 PE 映像：DOS 头 + `e_lfanew` 指向的 `PE\0\0`。
+fn mini_pe(tag: u8) -> Vec<u8> {
+    let e_lfanew = 0x80usize;
+    let mut bytes = vec![0u8; 0x200];
+    bytes[0] = b'M';
+    bytes[1] = b'Z';
+    bytes[2] = 0x90;
+    bytes[3] = 0x00;
+    bytes[0x3C..0x40].copy_from_slice(&(e_lfanew as u32).to_le_bytes());
+    bytes[e_lfanew..e_lfanew + 4].copy_from_slice(b"PE\0\0");
+    bytes[e_lfanew + 4] = tag;
+    bytes
+}
+
+fn builder_pack_cases() {
+    println!("[21] 打包器：包体 PE 识别 / 嵌入名规则 / 抽取路径安全阀");
+
+    let pe = mini_pe(1);
+    check(
+        "PE：合法映像起点被识别",
+        is_pe_at(&pe, 0),
+        "e_lfanew=0x80 且带 PE 签名".to_string(),
+    );
+    let mut false_mz = vec![0x4D, 0x5A, 0x90, 0x00];
+    false_mz.extend_from_slice(&[0u8; 60]);
+    check(
+        "PE：只有 MZ\\x90\\x00 不算映像",
+        !is_pe_at(&false_mz, 0),
+        "缺 PE 签名".to_string(),
+    );
+    check(
+        "PE：截断输入不 panic",
+        !is_pe_at(&[0x4D, 0x5A], 0),
+        "长度不足 0x40".to_string(),
+    );
+    let mut far = pe.clone();
+    far[0x3C..0x40].copy_from_slice(&0x2000u32.to_le_bytes());
+    check(
+        "PE：e_lfanew 超出窗口被拒",
+        !is_pe_at(&far, 0),
+        "0x2000 > 0x1000".to_string(),
+    );
+    let mut low = pe.clone();
+    low[0x3C..0x40].copy_from_slice(&0x20u32.to_le_bytes());
+    check(
+        "PE：e_lfanew 过小被拒",
+        !is_pe_at(&low, 0),
+        "0x20 < 0x40".to_string(),
+    );
+
+    // 打包产物 = builder 字节 + installer 字节；安装器体内再埋一个 DOS 魔数。
+    // 旧实现按 MZ\x90\x00 扫，会把埋在体内的那个当成映像起点，于是 rcedit 加载半截文件。
+    let builder = mini_pe(1);
+    let installer = mini_pe(2);
+    let mut bundle = builder.clone();
+    bundle.extend_from_slice(&installer);
+    let planted = builder.len() + 0x40;
+    bundle[planted..planted + 4].copy_from_slice(&[0x4D, 0x5A, 0x90, 0x00]);
+    check(
+        "包体：只认真正的 PE 起点（忽略体内埋的 MZ）",
+        pe_image_starts(&bundle) == vec![0, builder.len()],
+        format!("got {:?}", pe_image_starts(&bundle)),
+    );
+
+    for ok in ["\0CONFIG", "changes.json", "abc-DEF_1.2", "a"] {
+        check(
+            &format!("嵌入名：{ok:?} 放行"),
+            is_embedded_name(ok),
+            "应放行".to_string(),
+        );
+    }
+    for bad in ["", "中文", "a b", "../x", "a/b", "\0NOPE"] {
+        check(
+            &format!("嵌入名：{bad:?} 拒绝"),
+            !is_embedded_name(bad),
+            "应拒绝".to_string(),
+        );
+    }
+
+    let (md5, xxh) = (Some("m".to_string()), Some("x".to_string()));
+    check(
+        "哈希取值：md5 优先",
+        preferred_file_hash(&md5, &xxh).map(String::as_str) == Some("m"),
+        "两个都有时取 md5".to_string(),
+    );
+    check(
+        "哈希取值：只有 xxh 时用它",
+        preferred_file_hash(&None, &xxh).map(String::as_str) == Some("x"),
+        "md5 缺失时取 xxh".to_string(),
+    );
+    check(
+        "哈希取值：都没有则 None",
+        preferred_file_hash(&None, &None).is_none(),
+        "两个都没有时应为 None".to_string(),
+    );
+
+    // 抽取路径安全阀：包内路径来自归档 metadata，越界必须整体拒绝。
+    // 只断言跨平台语义一致的部分；`..\x` / `C:\x` 这类反斜杠形式在 Linux 上
+    // 是普通文件名，由 Windows 上的 cargo test 覆盖（见 utils/hash.rs 同批改动）。
+    let root = Path::new("out");
+    check(
+        "抽取路径：单层文件名放行",
+        relative_under_root(root, "app.exe").is_ok(),
+        "app.exe".to_string(),
+    );
+    check(
+        "抽取路径：子目录放行",
+        relative_under_root(root, "User/settings.json").is_ok(),
+        "User/settings.json".to_string(),
+    );
+    for evil in ["../outside.txt", "a/../../outside.txt", "/etc/passwd", ""] {
+        check(
+            &format!("抽取路径：{evil:?} 被拒"),
+            relative_under_root(root, evil).is_err(),
+            "应拒绝".to_string(),
+        );
+    }
+}
+
+fn hash_reader_cases() {
+    println!("[22] 文件哈希：md5 / xxh 摘要与分块边界");
+
+    let hello = hash_reader("md5", &b"hello"[..]).expect("md5 hello");
+    check(
+        "md5：已知摘要",
+        hello == "5d41402abc4b2a76b9719d911017c592",
+        format!("got {hello}"),
+    );
+    let empty = hash_reader("md5", &b""[..]).expect("md5 empty");
+    check(
+        "md5：空输入",
+        empty == "d41d8cd98f00b204e9800998ecf8427e",
+        format!("got {empty}"),
+    );
+
+    // 跨过 1 MB 读缓冲：分块读不能改变摘要（换缓冲大小、改成一次性读都要一致）
+    let mut big = vec![0u8; 3 * 1024 * 1024 + 7];
+    for (i, b) in big.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    let expected_md5 = chksum_md5::hash(&big).to_hex_lowercase();
+    let got_md5 = hash_reader("md5", &big[..]).expect("md5 big");
+    check(
+        "md5：跨 1 MB 分块与一次性哈希一致",
+        got_md5 == expected_md5,
+        format!("got {got_md5} want {expected_md5}"),
+    );
+
+    let mut hasher = twox_hash::XxHash3_128::new();
+    // XxHash3_128 有自己的 `write(&[u8])`，不走 std::hash::Hasher（后者只到 64 位）
+    hasher.write(&big);
+    let expected_xxh = format!("{:x}", hasher.finish_128());
+    let got_xxh = hash_reader("xxh", &big[..]).expect("xxh big");
+    check(
+        "xxh：与直接哈希一致",
+        got_xxh == expected_xxh,
+        format!("got {got_xxh} want {expected_xxh}"),
+    );
+
+    check(
+        "未知算法报错",
+        hash_reader("sha1", &b"x"[..]).is_err(),
+        "NO_HASH_ALGO_ERR".to_string(),
+    );
+}
+
 #[tokio::main]
 async fn main() {
     reg_target_cases();
@@ -1231,6 +1398,8 @@ async fn main() {
     scheduled_task_wiring_case();
     zip_entry_name_cases();
     h3_pin_cases();
+    builder_pack_cases();
+    hash_reader_cases();
     let (pass, fail) = (PASS.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed));
     println!("\n==== PASS {pass} / FAIL {fail} ====");
     if fail > 0 {

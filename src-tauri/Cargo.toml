@@ -29,7 +29,9 @@ tokio = { version = "1", features = [
     "macros",
     "net",
 ] }
-chksum-md5 = { version = "0.1", features = ["async-runtime-tokio"] }
+# 只用 chksum_md5::MD5 的流式接口自己读文件（utils/hash.rs）：上游那个
+# async-runtime-tokio feature 会把 chksum-reader / chksum-writer 也拉进来。
+chksum-md5 = "0.1"
 sha2 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = [
     "http2",

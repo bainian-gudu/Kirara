@@ -68,6 +68,30 @@ $script:LogicH3Items = @(
     @{ Kind = 'fn';     Name = 'parse_pin_from_fragment' }
 )
 
+# builder/local.rs 里抽包体识别与嵌入名规则这几段纯函数：PE 识别错了会把安装器
+# 当成 builder（打包出坏包），嵌入名规则两边不一致会静默丢数据，都必须在任意平台可断言。
+$script:LogicBuilderItems = @(
+    @{ Kind = 'const'; Name = 'PE_LFANEW_MIN' }
+    @{ Kind = 'const'; Name = 'PE_LFANEW_MAX' }
+    @{ Kind = 'fn'; Name = 'preferred_file_hash' }
+    @{ Kind = 'fn'; Name = 'is_embedded_name' }
+    @{ Kind = 'fn'; Name = 'pe_image_starts' }
+    @{ Kind = 'fn'; Name = 'is_pe_at' }
+)
+
+# builder/extract.rs 里抽「相对路径必须落在输出根内」这条安全阀：包内路径来自
+# 归档 metadata，`..` / 绝对路径 / 盘符必须被拒，否则解包能写到输出目录之外。
+$script:LogicExtractItems = @(
+    @{ Kind = 'fn'; Name = 'relative_under_root' }
+)
+
+# utils/hash.rs 里抽摘要核心：文件 IO 是 Windows 专有（FILE_FLAG_SEQUENTIAL_SCAN），
+# 但「同一份字节算出的摘要」必须能在任意平台断言。
+$script:LogicHashItems = @(
+    @{ Kind = 'const'; Name = 'HASH_BUFFER_SIZE' }
+    @{ Kind = 'fn'; Name = 'hash_reader' }
+)
+
 function Get-DevCheckRepoRoot {
     param([Parameter(Mandatory)][string]$ScriptRoot)
     # tools/devcheck/lib -> 仓库根
@@ -130,12 +154,16 @@ function New-LogicGen {
     $secureTemp = Read-RustSource -Path (Join-Path $kachina 'utils/secure_temp.rs')
     $mirrorc = Read-RustSource -Path (Join-Path $kachina 'thirdparty/mirrorc.rs')
     $h3 = Read-RustSource -Path (Join-Path $kachina 'capabilities/h3.rs')
+    $builderLocal = Read-RustSource -Path (Join-Path $kachina 'builder/local.rs')
+    $builderExtract = Read-RustSource -Path (Join-Path $kachina 'builder/extract.rs')
+    $hashRs = Read-RustSource -Path (Join-Path $kachina 'utils/hash.rs')
 
     $parts = [System.Collections.Generic.List[string]]::new()
     $parts.Add(@'
 // 生成物，勿手改：由 tools/devcheck/devcheck.ps1 按名字从
 // src-tauri/src/{installer/uninstall.rs, builder/pack.rs,
-// utils/secure_temp.rs, thirdparty/mirrorc.rs, capabilities/h3.rs} 抽取。
+// utils/secure_temp.rs, thirdparty/mirrorc.rs, capabilities/h3.rs,
+// builder/local.rs, builder/extract.rs, utils/hash.rs} 抽取。
 // 抽取规则见 tools/devcheck/lib/RustSource.ps1；找不到清单里的 item 会直接报错。
 // 本文件被 src/main.rs 用 include! 展开到 crate 根，Path/PathBuf 由 main.rs 引入。
 
@@ -175,6 +203,18 @@ fn is_under_system_root(path: &Path) -> bool {
     foreach ($item in $script:LogicH3Items) {
         $parts.Add((Get-RustItem -Text $h3.Text -Masked $h3.Masked `
                     -Kind $item.Kind -Name $item.Name -SourceName 'capabilities/h3.rs'))
+    }
+    foreach ($item in $script:LogicBuilderItems) {
+        $parts.Add((Get-RustItem -Text $builderLocal.Text -Masked $builderLocal.Masked `
+                    -Kind $item.Kind -Name $item.Name -SourceName 'builder/local.rs'))
+    }
+    foreach ($item in $script:LogicExtractItems) {
+        $parts.Add((Get-RustItem -Text $builderExtract.Text -Masked $builderExtract.Masked `
+                    -Kind $item.Kind -Name $item.Name -SourceName 'builder/extract.rs'))
+    }
+    foreach ($item in $script:LogicHashItems) {
+        $parts.Add((Get-RustItem -Text $hashRs.Text -Masked $hashRs.Masked `
+                    -Kind $item.Kind -Name $item.Name -SourceName 'utils/hash.rs'))
     }
 
     $out = Join-Path $genDir 'extracted.rs'

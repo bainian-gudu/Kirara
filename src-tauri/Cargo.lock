@@ -643,10 +643,8 @@ version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0475dc9fa905fe8feca5c4a48a97f65503ebd257a7566df1367d080083e160c6"
 dependencies = [
- "async-trait",
  "chksum-hash-core",
  "thiserror 1.0.69",
- "tokio",
 ]
 
 [[package]]
@@ -673,29 +671,6 @@ checksum = "dda0016624d188e791afdf491de89d0157411dafedb0a46dbcd3f1a13ef0a611"
 dependencies = [
  "chksum-core",
  "chksum-hash-md5",
- "chksum-reader",
- "chksum-writer",
- "tokio",
-]
-
-[[package]]
-name = "chksum-reader"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af7d69fcedbfade7ccc72ea1e234690e142a7d0f1bdd1b4b927752508d493ca6"
-dependencies = [
- "chksum-core",
- "tokio",
-]
-
-[[package]]
-name = "chksum-writer"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "282623704dd76ee0adbe1276a6ccfcd6d3021566fefcf8e677371283a723f0d0"
-dependencies = [
- "chksum-core",
- "tokio",
 ]
 
 [[package]]

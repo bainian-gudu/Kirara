@@ -31,6 +31,7 @@
 - [14. zip 依赖去掉 fork](#14-zip-依赖去掉-fork)
 - [15. H3 传输层改用 quinn + rustls](#15-h3-传输层改用-quinn--rustls)
 - [16. 停更依赖换成系统 API](#16-停更依赖换成系统-api)
+- [17. 同步上游 0.5.1 之后的打包器修复](#17-同步上游-051-之后的打包器修复)
 - [升级上游时的套用顺序](#升级上游时的套用顺序)
 
 | # | 需求 | 涉及文件 |
@@ -53,6 +54,7 @@
 | 14 | zip 去掉 `xytoki/zip2` fork，改用 crates.io 8.6 并在调用侧复刻强制 UTF-8 | `src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`、`src-tauri/src/thirdparty/mirrorc.rs`、`tools/devcheck/` |
 | 15 | H3 传输层改用 `quinn` + `rustls`，去掉 `h3-msquic-async` / `msquic-async` fork | `src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`、`src-tauri/src/capabilities/h3.rs`、`src-tauri/src/capabilities/mod.rs`、`tools/devcheck/` |
 | 16 | 停更依赖换成系统 API（`mslnk` → Shell Link、`nt_version` → ntdll），补齐 vendored 源码许可证 | `src-tauri/src/installer/lnk.rs`、`src-tauri/src/utils/os_version.rs`（新增）、`src-tauri/src/utils/mod.rs`、`src-tauri/src/capabilities/mod.rs`、`src-tauri/src/main.rs`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`、`src-tauri/libs/`、`tools/devcheck/` |
+| 17 | 同步上游 0.5.1 之后的打包器修复（包体 PE 识别、嵌入名规则、抽取路径越界、临时文件与摘要） | `src-tauri/src/builder/local.rs`、`builder/append.rs`、`builder/extract.rs`、`builder/pack.rs`、`src-tauri/src/utils/hash.rs`、`tools/devcheck/` |
 
 ---
 
@@ -949,6 +951,67 @@ IDList、相对路径、图标这些格式细节都得自己维护。现在改�
 快捷方式的**行为**仍然只能实机验证：装一次，看桌面 / 开始菜单里的快捷方式能正常启动、
 工作目录正确，再跑一次卸载确认它们被清干净（卸载侧的判定在第 1b 节，没有改动）。
 
+## 17. 同步上游 0.5.1 之后的打包器修复
+
+上游在本快照（tag `0.5.1`）之后又走了几十个提交，其中一次大重构把整个项目从
+Tauri + Vue 换成「原生 Win32 + WebView2 宿主 + Preact」，目录也从 `src-tauri/`
+挪到了仓库根（见 `UPSTREAM.md`）。那套重构没法按提交挑拣，本仓库也不打算跟着换架构 ——
+但重构前后**打包器（builder）里那几个真问题**是通用的，这一节把它们单独搬了过来。
+
+移植时对照的是上游 `main`（`a52a4c66`），逐条如下：
+
+### 17a. 包体识别：`MZ\x90\x00` → 真正的 PE 映像
+
+打包产物是「builder 字节 + installer 字节」拼出来的，读的时候要找出后半段安装器的起点。
+上游原来按 `MZ\x90\x00` 四个字节扫，安装器体内（压缩数据、图标、资源段）一旦出现这串
+字节就会被当成映像起点，rcedit 随后加载到半截文件直接失败。现在改成只认真正的 PE 映像：
+`MZ` + DOS 头里的 `e_lfanew` 落在 `0x40..0x1000` 且指向 `PE\0\0`。
+
+### 17b. 嵌入名规则：写入端与读取端必须一致
+
+读取器只接受内置 `\0` 名称与 ASCII 字母/数字/`.`/`_`/`-`，而 `append` 原来不校验：
+名字不合规时数据照样写进包里，但 `--list` / `--name` 永远看不到它 —— 一个静默丢数据的口子。
+现在写入端用同一个 `is_embedded_name` 校验并直接报错。顺带把读取端补齐：
+名称长度（`0 < len <= 512`）、名称 UTF-8、内容长度越界都先判再读，畸形包不再 panic。
+空名字额外拒绝（`chars().all(..)` 对空串恒真，两端都放行就是同一个丢数据问题）。
+
+### 17c. 抽取路径：包内路径不许写到输出根之外
+
+`--extract` 的输出路径来自归档 metadata 里的文件名，上游原来直接 `output_dir.join(name)`：
+`..\..\x` 这类名字能把文件写到输出目录外面。现在先过 `relative_under_root`
+（只允许 Normal 组件）与 `verify_within_root`（逐组件 canonicalize，确认解析 symlink /
+junction 之后仍在输出根内），并且**先规划完所有路径再落盘** —— 任何一条越界即整体失败，
+不会留下半次提取。
+
+### 17d. 打包临时文件与摘要
+
+- `pack` 原来把基础内容写到固定的 `%TEMP%\kachina_installer_tmp.exe`：同机并发打包会
+  互相踩，上一次崩溃留下的半截文件会被这次直接读走。现在文件名带进程号 + UUID，
+  并且在交给 rcedit 之前先 `sync_all()`；rcedit 加载失败时打印文件大小再 panic。
+- `get_reader_for_bundle` 失败时改为 `exit(1)`（原来只是 `return`，脚本靠退出码判断
+  产物时会误判成功）。
+- `utils/hash.rs` 的 md5 与 xxh 走同一条 1 MB 顺序读循环，并加
+  `FILE_FLAG_SEQUENTIAL_SCAN`；文件 IO 整段丢进 `spawn_blocking`，不再占住 async 线程。
+  顺带去掉 `chksum-md5` 的 `async-runtime-tokio` feature（不再用 `async_chksum`），
+  `chksum-reader` / `chksum-writer` 两个 crate 从依赖树里消失。
+
+### 没有跟着搬的部分（有意为之）
+
+- **架构重构**：Tauri + Vue → 原生 Win32 + WebView2 + Preact。那会连带作废本文件
+  第 1～16 节的全部改动，属于「重写」而不是「同步」，不在本分支范围。
+- **两阶段提交（staging 目录）与安装会话**：上游把安装流程重写成
+  `session/` + `fs/staging.rs` + `fs/commit.rs`，并配了 `updater-survival` 测试。
+  它是新架构的一部分，单独搬过来没有落点。
+- **插件系统 / DFS 会话**：同上，`plugin-stub`、`dfs2` 两个测试依赖新架构。
+- **Sentry**：上游仍然保留（甚至换成了自研最小客户端），本项目继续物理移除。
+
+### 复核方式
+
+`pwsh tools/devcheck/devcheck.ps1`：`logic` 层第 [21] 组断言覆盖 PE 识别（含「体内埋
+`MZ\x90\x00`」这条反例）、嵌入名规则、哈希取值与抽取路径安全阀；第 [22] 组覆盖
+md5 / xxh 的已知摘要与跨 1 MB 分块一致性。打包器本身只在 Windows 上编译，
+完整链路由 CI 的 Build 与 `builder-extract-replace` 等行为测试兜底。
+
 ---
 
 
@@ -1006,6 +1069,11 @@ IDList、相对路径、图标这些格式细节都得自己维护。现在改�
    补 `Win32_System_Com`、`libs/{hdiff-sys,hpatch-sys}/LICENSE` 与 `libs/THIRDPARTY.md`
    保持存在，`tools/devcheck/lib/Generate.ps1` 的 typecheck 生成清单要带上
    `installer/lnk.rs`、`utils/dir.rs` 与 `utils/os_version.rs`；
+3k. **重做第 17 节的打包器修复**：新快照若还带旧写法，按 17a～17d 重打一遍
+   （`builder/local.rs` 的 PE 识别与嵌入名校验、`builder/extract.rs` 的路径安全阀、
+   `builder/pack.rs` 的临时文件名与退出码、`utils/hash.rs` 的顺序读摘要），
+   `tools/devcheck/lib/Generate.ps1` 补回 `LogicBuilderItems` / `LogicExtractItems` /
+   `LogicHashItems` 三张清单与 `rust/logic/src/main.rs` 的 [21]/[22] 组断言；
 4. `npx tsc --noEmit -p tsconfig.json`（上游本身有 3 个 `noUnusedLocals` 报错，
    只要没有新增报错即可）+ 用 `@vue/compiler-sfc` 编译 `src/App.vue` 自检；
 5. Windows 上 `pnpm build` 出 `kachina-builder.exe`，跑一次

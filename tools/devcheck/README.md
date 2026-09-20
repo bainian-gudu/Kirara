@@ -30,7 +30,7 @@ pwsh tools/devcheck/devcheck.ps1 -Fix            # 只对我们维护的 .rs 跑
 | `gen` | 从 `src-tauri/`、`src/` 源码生成检查用的 Rust / TS 文件 | pwsh 7 | ~0.3s |
 | `rust` | **整份** `installer/uninstall.rs` + `installer/lnk.rs` + `utils/{error,dir,os_version}.rs` 的类型检查：塞进一个只有 11 个依赖的 crate，`cargo check --target x86_64-pc-windows-msvc`。不需要 tauri、不需要 Windows 机器 | cargo + `rustup target add x86_64-pc-windows-msvc` | 首次 ~30s，之后 ~0.6s |
 | `native` | vendored `rcedit-sys` 的 C++（`rescle.cc` / `librcedit.cpp`）真用 MSVC 编一遍。没有 `cl.exe` 的机器（Linux / 未进 VS 开发环境的 Windows）自动 SKIP | cargo + MSVC（`cl.exe` 在 PATH） | 首次 ~30s，之后 ~2s |
-| `logic` | 同一批函数的**行为断言**（208 条，含循环用例）：注册表 / 快捷方式 / 计划任务名 / 用户数据目录 / 安装目录内文件清单 / 旧版本残留清单安全阀、路径归一化与比较、微软签名判定、zip 条目名解码（替代 zip fork 的那条语义）、H3 证书固定值与 SPKI 哈希（用 openssl 算出的样例证书交叉验证），以及用**临时配置文件 + 临时协议正文**跑 `resolve_agreement`（下游应用侧的配置不在本仓库，所以这里不依赖它） | cargo | 首次 ~15s，之后 ~0.4s |
+| `logic` | 同一批函数的**行为断言**（238 条，含循环用例）：注册表 / 快捷方式 / 计划任务名 / 用户数据目录 / 安装目录内文件清单 / 旧版本残留清单安全阀、路径归一化与比较、微软签名判定、zip 条目名解码（替代 zip fork 的那条语义）、H3 证书固定值与 SPKI 哈希（用 openssl 算出的样例证书交叉验证）、打包器的包体 PE 识别 / 嵌入名规则 / 抽取路径越界防护、md5 与 xxh 的分块摘要，以及用**临时配置文件 + 临时协议正文**跑 `resolve_agreement`（下游应用侧的配置不在本仓库，所以这里不依赖它） | cargo | 首次 ~15s，之后 ~0.4s |
 | `front` | `utils/agreement.ts` + `types.ts` 的 `tsc --strict`；`src` 下**全部** `.vue` 的 `@vue/compiler-sfc` 编译；`agreement.ts` 的 prettier 风格 | node + npm | 首次 ~10s，之后 ~2s |
 | `ci` | `tools/ci/Import-DevCmd.ps1` 的行为：用假 vcvarsall 输出跑一遍「生成 .cmd → 解析输出 → 注入环境 → 写 `GITHUB_ENV`」，并断言工作流里的 action 版本不低于 `README.md` 登记的下限 | pwsh 7 | ~1s |
 
@@ -158,7 +158,7 @@ tools/devcheck/
 │   ├── Cargo.toml          依赖版本与 kachina src-tauri/Cargo.toml 对齐
 │   └── src/lib.rs          把生成文件挂到上游的模块路径上 + 2 个最小桩
 ├── rust/logic/             行为断言 crate（mock windows-registry，跨平台）
-│   └── src/main.rs         208 条断言 + mock
+│   └── src/main.rs         238 条断言 + mock
 ├── front/                  package.json / tsconfig.json / sfccheck.mjs
 └── rust/native/target/     native 层的 CARGO_TARGET_DIR（运行时生成，已 gitignore）
 ```
@@ -287,6 +287,13 @@ Rust 类型/借用/生命周期错误（含 `std::os::windows`、`windows`、
 - 改 `capabilities/h3.rs` 的证书固定逻辑（`parse_pin_from_fragment` / `extract_spki_der`
   / `compute_*_hash`）→ 同步 `$script:LogicH3Items` 清单与 `rust/logic/src/main.rs`
   的 [20] 组断言（那条 SPKI 路径是安全阀本身，改错就等于固定值形同虚设）。
+- 改打包器的包体识别（`pe_image_starts` / `is_pe_at`）、嵌入名规则
+  （`is_embedded_name` / `preferred_file_hash`）或抽取路径安全阀
+  （`relative_under_root`）→ 同步 `$script:LogicBuilderItems` /
+  `$script:LogicExtractItems` 清单与 `rust/logic/src/main.rs` 的 [21] 组断言
+  （PE 识别错了会拿安装器当 builder 用，打包出坏包）。
+- 改 `utils/hash.rs` 的摘要核心（`hash_reader`）→ 同步 `$script:LogicHashItems`
+  清单与 [22] 组断言：分块边界算错等于所有更新校验一起失效。
 - kachina 升级依赖版本（`Cargo.toml`）→ 同步 `rust/typecheck/Cargo.toml`，
   否则类型检查结论不可信。
 - 改 `installer/lnk.rs` 的 COM 调用（`IShellLinkW` / `IPersistFile`）、
