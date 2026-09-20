@@ -186,7 +186,7 @@ jobs:
         run: Copy-Item "artifacts/kirara-builder.exe" "kirara-builder.exe" -Force
 
       - name: Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: kirara-builder.exe
           make_latest: true

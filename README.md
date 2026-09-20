@@ -89,7 +89,7 @@ pwsh tools/devcheck/devcheck.ps1 -Fix         # 只对我们维护的两个 .rs 
 | `.gitattributes`（`* text=auto eol=lf`） | windows-latest 的 git 默认 `core.autocrlf=true`，检出成 CRLF 后 `prettier --check` 在 Windows 上必挂 |
 | `git config --global init.defaultBranch main`（放在 checkout 之前） | `actions/checkout` 会先 `git init`，ubuntu 镜像上默认分支名还是 `master`，每次打 8 行 hint |
 
-工作流里 action 的版本下限（低于它的版本会在 runner 上打 Node 20 弃用告警）：`actions/checkout` ≥ v5、`actions/cache` ≥ v5、`actions/upload-artifact` ≥ v6、`actions/download-artifact` ≥ v7、`pnpm/action-setup` ≥ v6、`actions/setup-node` ≥ v5。
+工作流里 action 的版本下限（低于它的版本会在 runner 上打 Node 20 弃用告警）：`actions/checkout` ≥ v5、`actions/cache` ≥ v5、`actions/upload-artifact` ≥ v6、`actions/download-artifact` ≥ v7、`pnpm/action-setup` ≥ v6、`actions/setup-node` ≥ v5、`softprops/action-gh-release` ≥ v3。
 
 `ci` 层会解析上面这一行并与 `.github/workflows/*.yml` 里实际用到的版本比对：
 升工作流时忘了同步这里（或反过来）都会失败。
