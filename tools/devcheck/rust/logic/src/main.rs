@@ -1079,6 +1079,29 @@ fn scheduled_task_wiring_case() {
     );
 }
 
+fn zip_entry_name_cases() {
+    println!("[19] zip 条目名解码（替代 zip fork 的强制 UTF-8）");
+    // 打包工具写中文名却不置 UTF-8 标志位时，zip 自己会按 CP437 解出乱码
+    // （「中文」→「Σ╕¡µûç」）；decode_entry_name 必须按原始字节还原。
+    let utf8_raw = "中文/文件.txt".as_bytes();
+    let got = decode_entry_name(utf8_raw);
+    check(
+        "未置位的中文名按 UTF-8 还原",
+        got == "中文/文件.txt",
+        format!("got {got}"),
+    );
+    // 非 UTF-8 字节：与 fork 一样走 lossy 解码，不 panic、也不丢条目。
+    let lossy = decode_entry_name(&[0xff, 0xfe, b'a']);
+    check(
+        "非 UTF-8 字节走 lossy 解码",
+        lossy == "\u{fffd}\u{fffd}a",
+        format!("got {lossy:?}"),
+    );
+    // ASCII 名（changes.json / .metadata.json 这类）不受影响。
+    let ascii = decode_entry_name(b"changes.json");
+    check("ASCII 名不受影响", ascii == "changes.json", format!("got {ascii}"));
+}
+
 #[tokio::main]
 async fn main() {
     reg_target_cases();
@@ -1098,6 +1121,7 @@ async fn main() {
     rm_list_cases();
     scheduled_task_name_cases();
     scheduled_task_wiring_case();
+    zip_entry_name_cases();
     let (pass, fail) = (PASS.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed));
     println!("\n==== PASS {pass} / FAIL {fail} ====");
     if fail > 0 {

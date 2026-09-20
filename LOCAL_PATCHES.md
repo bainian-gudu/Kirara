@@ -27,6 +27,7 @@
 - [10. 前端模块拆分与注释中文化](#10-前端模块拆分与注释语言统一)
 - [11. 构建日志告警收敛](#11-构建日志告警收敛)
 - [13. 构建目标改为 Windows 10/11](#13-构建目标改为-windows-1011)
+- [14. zip 依赖去掉 fork](#14-zip-依赖去掉-fork)
 - [升级上游时的套用顺序](#升级上游时的套用顺序)
 
 | # | 需求 | 涉及文件 |
@@ -45,6 +46,7 @@
 | 10 | DFS 会话模块拆分与注释中文化 | `src/dfs.ts`、`src/dfs/session.ts`；注释调整覆盖本目录项目源码和仓库内副本的功能注释 |
 | 12 | 品牌改名后的旧主程序 / 安装目录识别、旧组件清理与快捷方式修复 | `src-tauri/src/installer/config.rs`、`src-tauri/src/installer/mod.rs`、`src/App.vue` |
 | 13 | 目标改回标准 `x86_64-pc-windows-msvc`，去掉 `-Z build-std` 与 `rust-ctor` fork | `package.json`、`build.ps1`、`.github/workflows/build.yml`、`src-tauri/Cargo.toml` |
+| 14 | zip 去掉 `xytoki/zip2` fork，改用 crates.io 8.6 并在调用侧复刻强制 UTF-8 | `src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`、`src-tauri/src/thirdparty/mirrorc.rs`、`tools/devcheck/` |
 
 ---
 
@@ -826,7 +828,31 @@ nightly 工具链保留：`Cargo.toml` 里的 `trim-paths` 与 `profile.rustflag
 
 复核方式：`pwsh build.ps1` 能产出 `tools\kirara-builder.exe`，CI 的四组安装 / 更新
 测试全绿；`tools/devcheck` 的 `vendor` 层仍会断言每个 git 依赖都锁到 commit
-（此时只剩 `zip` 与 `msquic-async`）。
+（此时只剩 `msquic-async`，见第 14 节）。
+
+---
+
+## 14. zip 依赖去掉 fork
+
+上游用 `xytoki/zip2`（2.6.1）这个 fork，它相对上游 zip 只改了一处：`read.rs` 里把
+`is_utf8` 写死成 `true`，也就是不看 zip 的 UTF-8 标志位、一律按 UTF-8 解条目名。
+原因是部分打包工具写中文文件名时不置该标志位，zip 会退回 CP437 解出乱码
+（「中文」解成「Σ╕¡µûç」），MirrorChyan 下发的包正好属于这一类。
+
+现在改用 crates.io 的 `zip 8.6`，并在 `src-tauri/src/thirdparty/mirrorc.rs` 里复刻同一语义：
+
+- 新增 `decode_entry_name(&[u8]) -> String`，内部是 `String::from_utf8_lossy`，
+  与 fork 的分支逐字一致；
+- 文件清单不再用 `ZipArchive::file_names()`（它按标志位解码），改为逐个 `by_index(i)`
+  取 `name_raw()` 再解码，前缀计算与后续的路径安全判定都建立在这份名字上；
+- `by_name()` 可以继续用：zip 8.x 的名字索引按**原始字节**建表，用 UTF-8 名字查得到；
+- feature 保持与 fork 时相同的解压能力（`deflate-flate2-zlib-rs` / `deflate64` / `zstd`），
+  其中 flate2 走纯 Rust 的 zlib-rs 后端，不引入新的 C 依赖。
+
+复核方式：`pwsh tools/devcheck/devcheck.ps1 -Layer logic` 的 [19] 组断言覆盖
+「未置位的中文名按 UTF-8 还原 / 非 UTF-8 字节走 lossy 解码 / ASCII 名不受影响」。
+MirrorChyan 的完整解包链路没有自动化用例（CI 的四组测试走 GitHub Release），
+首次在 Windows 上用到镜像安装时建议对着一个真实包复核一遍。
 
 ---
 
@@ -871,6 +897,9 @@ nightly 工具链保留：`Cargo.toml` 里的 `trim-paths` 与 `profile.rustflag
    `.github/workflows/build.yml` 换成标准 `x86_64-pc-windows-msvc` 并去掉
    `-Z build-std`，`src-tauri/Cargo.toml` 去掉 `ctor` 的 `[patch.crates-io]`
    （上游升级后如果又带回 win7 目标，同样换掉）；
+3h. **重做第 14 节的 zip 替换**：`Cargo.toml` 的 `zip` 改回 crates.io 版本，
+   `thirdparty/mirrorc.rs` 恢复 `decode_entry_name` 与按索引取名字的写法，
+   `tools/devcheck/lib/Generate.ps1` 与 `rust/logic/src/main.rs` 补回 [19] 组断言；
 4. `npx tsc --noEmit -p tsconfig.json`（上游本身有 3 个 `noUnusedLocals` 报错，
    只要没有新增报错即可）+ 用 `@vue/compiler-sfc` 编译 `src/App.vue` 自检；
 5. Windows 上 `pnpm build` 出 `kachina-builder.exe`，跑一次

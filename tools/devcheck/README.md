@@ -30,7 +30,7 @@ pwsh tools/devcheck/devcheck.ps1 -Fix            # 只对我们维护的 .rs 跑
 | `gen` | 从 `src-tauri/`、`src/` 源码生成检查用的 Rust / TS 文件 | pwsh 7 | ~0.3s |
 | `rust` | **整份** `installer/uninstall.rs` + `utils/error.rs` 的类型检查：塞进一个只有 11 个依赖的 crate，`cargo check --target x86_64-pc-windows-msvc`。不需要 tauri、不需要 Windows 机器 | cargo + `rustup target add x86_64-pc-windows-msvc` | 首次 ~30s，之后 ~0.2s |
 | `native` | vendored `rcedit-sys` 的 C++（`rescle.cc` / `librcedit.cpp`）真用 MSVC 编一遍。没有 `cl.exe` 的机器（Linux / 未进 VS 开发环境的 Windows）自动 SKIP | cargo + MSVC（`cl.exe` 在 PATH） | 首次 ~30s，之后 ~2s |
-| `logic` | 同一批函数的**行为断言**（192 条，含循环用例）：注册表 / 快捷方式 / 计划任务名 / 用户数据目录 / 安装目录内文件清单 / 旧版本残留清单安全阀、路径归一化与比较、微软签名判定，以及用**临时配置文件 + 临时协议正文**跑 `resolve_agreement`（下游应用侧的配置不在本仓库，所以这里不依赖它） | cargo | 首次 ~15s，之后 ~0.4s |
+| `logic` | 同一批函数的**行为断言**（195 条，含循环用例）：注册表 / 快捷方式 / 计划任务名 / 用户数据目录 / 安装目录内文件清单 / 旧版本残留清单安全阀、路径归一化与比较、微软签名判定、zip 条目名解码（替代 zip fork 的那条语义），以及用**临时配置文件 + 临时协议正文**跑 `resolve_agreement`（下游应用侧的配置不在本仓库，所以这里不依赖它） | cargo | 首次 ~15s，之后 ~0.4s |
 | `front` | `utils/agreement.ts` + `types.ts` 的 `tsc --strict`；`src` 下**全部** `.vue` 的 `@vue/compiler-sfc` 编译；`agreement.ts` 的 prettier 风格 | node + npm | 首次 ~10s，之后 ~2s |
 | `ci` | `tools/ci/Import-DevCmd.ps1` 的行为：用假 vcvarsall 输出跑一遍「生成 .cmd → 解析输出 → 注入环境 → 写 `GITHUB_ENV`」，并断言工作流里的 action 版本不低于 `README.md` 登记的下限 | pwsh 7 | ~1s |
 
@@ -151,7 +151,7 @@ tools/devcheck/
 │   ├── Cargo.toml          依赖版本与 kachina src-tauri/Cargo.toml 对齐
 │   └── src/lib.rs          把生成文件挂到上游的模块路径上 + 2 个最小桩
 ├── rust/logic/             行为断言 crate（mock windows-registry，跨平台）
-│   └── src/main.rs         192 条断言 + mock
+│   └── src/main.rs         195 条断言 + mock
 ├── front/                  package.json / tsconfig.json / sfccheck.mjs
 └── rust/native/target/     native 层的 CARGO_TARGET_DIR（运行时生成，已 gitignore）
 ```
@@ -264,6 +264,8 @@ Rust 类型/借用/生命周期错误（含 `std::os::windows`、`windows`、
 
 - 在 `uninstall.rs` 里新增/重命名安全阀函数 → 同步 `lib/Generate.ps1` 的
   `$script:LogicItems` 清单，并在 `rust/logic/src/main.rs` 里补断言。
+- 改 `thirdparty/mirrorc.rs` 的 `decode_entry_name`（它是 zip fork 的替代）→ 同步
+  `$script:LogicMirrorcItems` 清单与 `rust/logic/src/main.rs` 的 [19] 组断言。
 - kachina 升级依赖版本（`Cargo.toml`）→ 同步 `rust/typecheck/Cargo.toml`，
   否则类型检查结论不可信。
 - 上游改了 `dfs::InsightItem` / `local::get_base_with_config` 的签名 → `rust` 层会

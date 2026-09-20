@@ -14,6 +14,16 @@ use crate::{
 
 pub static MIRRORC_CRED_PREFIX: &str = "KachinaInstaller_MirrorChyanCDK_";
 
+/// 按原始字节解出 zip 条目的名字。
+///
+/// zip 的 UTF-8 标志位不可信：部分打包工具写中文名时不置位，此时 zip 会按 CP437
+/// 解出乱码（「中文」会变成「Σ╕¡µûç」）。这里统一按 UTF-8 解原始字节，语义与之前
+/// 依赖的 zip fork 完全一致（见 LOCAL_PATCHES.md 第 14 节），因此不要改回
+/// `ZipFile::name()` 或 `ZipArchive::file_names()`。
+fn decode_entry_name(raw: &[u8]) -> String {
+    String::from_utf8_lossy(raw).into_owned()
+}
+
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
 pub struct MirrorcChangeset {
     pub added: Option<Vec<String>>,
@@ -49,11 +59,16 @@ pub fn run_mirrorc_install_sync(
         );
     }
 
-    let file_lists = archive
-        .file_names()
-        .map(|s| s.to_string())
-        .filter(|s| s != "changes.json" && s != ".metadata.json")
-        .collect::<Vec<String>>();
+    // 逐个按索引取名字，而不是用 archive.file_names()：后者按标志位解码，
+    // 没置位的中文名会变成乱码，前缀计算和后续的路径安全判定都会跟着错。
+    let mut file_lists = Vec::with_capacity(total_len);
+    for i in 0..total_len {
+        let file = archive.by_index(i).into_ta_result()?;
+        let name = decode_entry_name(file.name_raw());
+        if name != "changes.json" && name != ".metadata.json" {
+            file_lists.push(name);
+        }
+    }
     let prefix = longest_common_prefix(file_lists);
     // 拆分最后一个“/”，获取前缀
     let mut prefix = prefix.split('/').collect::<Vec<&str>>();
@@ -100,10 +115,10 @@ pub fn run_mirrorc_install_sync(
 
     for i in 0..total_len {
         let mut file = archive.by_index(i).into_ta_result()?;
-        let file_name = file
-            .name()
+        let raw_name = decode_entry_name(file.name_raw());
+        let file_name = raw_name
             .strip_prefix(&prefix)
-            .unwrap_or(file.name())
+            .unwrap_or(&raw_name)
             .to_string();
         if file_name == "changes.json"
             || file_name == ".metadata.json"

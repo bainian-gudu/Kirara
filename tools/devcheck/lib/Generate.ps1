@@ -48,6 +48,12 @@ $script:LogicRuntimeItems = @(
     @{ Kind = 'fn'; Name = 'is_trusted_microsoft_signature' }
 )
 
+# mirrorc.rs 里只抽 decode_entry_name：它替代了 zip fork「不看标志位、强制按 UTF-8
+# 解条目名」的行为，必须在任意平台上可断言（完整构建只在 Windows 上跑）。
+$script:LogicMirrorcItems = @(
+    @{ Kind = 'fn'; Name = 'decode_entry_name' }
+)
+
 function Get-DevCheckRepoRoot {
     param([Parameter(Mandatory)][string]$ScriptRoot)
     # tools/devcheck/lib -> 仓库根
@@ -94,12 +100,13 @@ function New-LogicGen {
     $uninstall = Read-RustSource -Path (Join-Path $kachina 'installer/uninstall.rs')
     $pack = Read-RustSource -Path (Join-Path $kachina 'builder/pack.rs')
     $secureTemp = Read-RustSource -Path (Join-Path $kachina 'utils/secure_temp.rs')
+    $mirrorc = Read-RustSource -Path (Join-Path $kachina 'thirdparty/mirrorc.rs')
 
     $parts = [System.Collections.Generic.List[string]]::new()
     $parts.Add(@'
 // 生成物，勿手改：由 tools/devcheck/devcheck.ps1 按名字从
 // src-tauri/src/{installer/uninstall.rs, builder/pack.rs,
-// utils/secure_temp.rs} 抽取。
+// utils/secure_temp.rs, thirdparty/mirrorc.rs} 抽取。
 // 抽取规则见 tools/devcheck/lib/RustSource.ps1；找不到清单里的 item 会直接报错。
 // 本文件被 src/main.rs 用 include! 展开到 crate 根，Path/PathBuf 由 main.rs 引入。
 
@@ -131,6 +138,10 @@ fn is_under_system_root(path: &Path) -> bool {
     foreach ($item in $script:LogicRuntimeItems) {
         $parts.Add((Get-RustItem -Text $secureTemp.Text -Masked $secureTemp.Masked `
                     -Kind $item.Kind -Name $item.Name -SourceName 'utils/secure_temp.rs'))
+    }
+    foreach ($item in $script:LogicMirrorcItems) {
+        $parts.Add((Get-RustItem -Text $mirrorc.Text -Masked $mirrorc.Masked `
+                    -Kind $item.Kind -Name $item.Name -SourceName 'thirdparty/mirrorc.rs'))
     }
 
     $out = Join-Path $genDir 'extracted.rs'
