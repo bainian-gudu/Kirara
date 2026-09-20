@@ -1048,6 +1048,27 @@ Tauri → 原生 Win32 的重写（`dfs2`、`updater-survival`、`plugin-stub`�
 - `builder/local.rs`：PE 映像识别（含「安装器体内埋 `MZ\x90\x00`」反例）；
 - `builder/extract.rs`：`..\x`、盘符、UNC 等包内路径必须被 `relative_under_root` 拒绝。
 
+### 18c. `replace-bin` 的包格式修复
+
+新测试暴露了 `builder/replace_bin.rs` 的旧实现与 `builder/pack.rs` 的写入格式不一致：
+索引头里 `base_end` 是绝对偏移，后面 4 个字段是各段**长度**，旧实现却全部按
+「段结束偏移」解析，`config_end - base_end` 算出的长度直接越界，`replace-bin`
+在 Windows 上 panic。现在整份换成上游新版实现：
+
+- 按真实格式解析 `PackLayout`（base 绝对偏移 + 4 个长度）；
+- payload 起点兼容两种包：优先用 `base_end` 指向的 `!IN\0`，旧包回退到
+  `get_embedded` 的第一个条目；
+- 输出先写同目录临时文件，成功后替换，输入输出是同一路径时不会先截断输入；
+- 复制区间带边界检查，新增 5 组单元测试（格式往返、长度语义、payload 保留、
+  in-place 安全、TLV 头长度）。
+
+### 18d. 升级时保留 `userDataPath` 下的用户文件
+
+`userDataPath` 配置是绝对路径（`${INSTALL_PATH}/User`），而元数据里的 `file_name`
+是相对安装目录的路径，旧比较逻辑拿两者直接 `startsWith`，永远匹配不上，升级会
+覆盖用户改过的 `User/settings.json`。现在比较前先去掉安装目录前缀、统一分隔符
+和大小写，`userdata-ignore` 测试覆盖这条行为。
+
 ### 有意未移植
 
 - `dfs2`、`plugin-stub`、`updater-survival`、`dump-offline-install`：依赖上游新架构的
@@ -1128,7 +1149,8 @@ Tauri → 原生 Win32 的重写（`dfs2`、`updater-survival`、`plugin-stub`�
    测试不搬；`tests/prepare.mjs` 的 builder 路径按本仓库布局
    （`src-tauri/target/...`）改，夹具打包去掉 `--icon`，失败要
    `process.exitCode = 1`；`.github/workflows/build.yml` 的 `test` 矩阵与
-   `unit-test` job 同步更新；
+   `unit-test` job 同步更新；新测试若暴露 `replace-bin` 解析或 `userDataPath`
+   匹配问题，按 18c / 18d 修掉；
 4. `npx tsc --noEmit -p tsconfig.json`（上游本身有 3 个 `noUnusedLocals` 报错，
    只要没有新增报错即可）+ 用 `@vue/compiler-sfc` 编译 `src/App.vue` 自检；
 5. Windows 上 `pnpm build` 出 `kachina-builder.exe`，跑一次

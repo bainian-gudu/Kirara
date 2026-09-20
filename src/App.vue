@@ -1187,7 +1187,20 @@ async function runInstall(): Promise<void> {
     if (ss.startsWith('/')) return ss.slice(1);
     return ss;
   };
-  const userDataPath = PROJECT_CONFIG.userDataPath.map(replacePathEnvirables);
+  // userDataPath 是绝对路径（如 ${INSTALL_PATH}/User），而元数据里的 file_name
+  // 是相对安装目录的路径；比较前先去掉安装目录前缀，统一成相对路径。
+  const installRoot = strip_first_slash(
+    source.value.replace(/\\/g, '/').replace(/\/+$/, ''),
+  ).toLowerCase();
+  const userDataPath = PROJECT_CONFIG.userDataPath.map((p) => {
+    const normalized = strip_first_slash(
+      replacePathEnvirables(p).replace(/\\/g, '/').replace(/\/+$/, ''),
+    ).toLowerCase();
+    if (installRoot && normalized.startsWith(`${installRoot}/`)) {
+      return normalized.slice(installRoot.length + 1);
+    }
+    return normalized;
+  });
   const ignoreFolderPath = PROJECT_CONFIG.ignoreFolderPath || [];
 
   // 预先检查所有 ignoreFolderPath 是否非空（仅在更新场景下检查）
@@ -1218,9 +1231,7 @@ async function runInstall(): Promise<void> {
     if (
       local &&
       userDataPath.some((userData) =>
-        strip_first_slash(local.file_name)
-          .toLowerCase()
-          .startsWith(strip_first_slash(userData).toLowerCase()),
+        strip_first_slash(local.file_name).toLowerCase().startsWith(userData),
       )
     ) {
       continue;
