@@ -46,6 +46,10 @@ DFS 会话拆分和 `vendor/rcedit-rs/` 副本；同时删除
 7. **移除全部遥测**：上游的 Sentry 错误上报（DSN 主机 `steambird.cocogoat.cn`）与
    前端使用统计（`77.cocogoat.cn/ev`）连依赖一起删除，`@sentry/cli` 一并去掉，
    两个 lock 重新生成。本项目是个人自用构建，不做任何统计。
+8. **依赖与构建面收敛**（第 13～16 节）：目标改回标准 `x86_64-pc-windows-msvc`、
+   `zip` 去掉 `xytoki/zip2` fork、H3 传输层换成 `quinn` + `rustls`、
+   `mslnk` / `nt_version` 换成系统 API（Shell Link / `ntdll`）。`Cargo.lock` 里
+   已经没有 git 依赖。
 
 逐文件的改动位置、原因与升级套用顺序见 [`LOCAL_PATCHES.md`](LOCAL_PATCHES.md)。
 第 1～6 项都是「加字段 / 加分支 / 加样式覆盖」，不写这些配置项时行为与上游完全一致；

@@ -194,8 +194,7 @@ fn main() {
 
 async fn tauri_main(args: InstallArgs) {
     tauri::async_runtime::set(tokio::runtime::Handle::current());
-    let (major, minor, build) = nt_version::get();
-    let build = (build & 0xffff) as u16;
+    let (major, minor, build) = crate::utils::os_version::get();
     // 使用 22000 作为 Windows 11 的构建号
     let is_win11 = major == 10 && minor == 0 && build >= 22000;
     let is_win11_ = is_win11;

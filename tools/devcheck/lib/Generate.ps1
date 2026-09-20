@@ -85,6 +85,8 @@ function New-TypecheckGen {
 
     $uninstall = Read-RustSource -Path (Join-Path $kachina 'installer/uninstall.rs')
     $error = Read-RustSource -Path (Join-Path $kachina 'utils/error.rs')
+    $lnk = Read-RustSource -Path (Join-Path $kachina 'installer/lnk.rs')
+    $dir = Read-RustSource -Path (Join-Path $kachina 'utils/dir.rs')
 
     $header = @'
 // 生成物，勿手改：由 tools/devcheck/devcheck.ps1 从 src-tauri/src 复制。
@@ -95,10 +97,18 @@ function New-TypecheckGen {
         -Content ($header + "`n" + (Remove-TauriCommandAttr -Text $uninstall.Text) + "`n")
     Write-GeneratedFile -Path (Join-Path $genDir 'utils_error.rs') `
         -Content ($header + "`n" + $error.Text)
+    # lnk.rs 里 create_lnk / get_dirs 两个命令都要去掉 #[tauri::command]；
+    # 它依赖的 is_safe_delete_target / has_reparse_point 由 gen/uninstall.rs 提供。
+    Write-GeneratedFile -Path (Join-Path $genDir 'lnk.rs') `
+        -Content ($header + "`n" + (Remove-TauriCommandAttr -Text $lnk.Text) + "`n")
+    Write-GeneratedFile -Path (Join-Path $genDir 'utils_dir.rs') `
+        -Content ($header + "`n" + $dir.Text)
 
     return @(
         (Join-Path $genDir 'uninstall.rs')
         (Join-Path $genDir 'utils_error.rs')
+        (Join-Path $genDir 'lnk.rs')
+        (Join-Path $genDir 'utils_dir.rs')
     )
 }
 

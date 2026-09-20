@@ -102,6 +102,16 @@ jobs:
         -Run { Test-VendoredSource } `
         -Cleanup { if (Test-Path -LiteralPath $dsnFile) { Remove-Item -LiteralPath $dsnFile -Force } }
 
+    # --- 0g) vendor：停更依赖被写回 Cargo.toml 就必须报错 ---
+    #     第 16 节把 mslnk / nt_version 换成了系统 API（IShellLinkW / ntdll），
+    #     写回去就等于把没人维护的依赖请回来，这条断言必须拦住。
+    Add-Case 'vendor 层能抓到停更依赖被写回 Cargo.toml' `
+        -Mutate {
+            Add-Content -Path $kaCargoToml -Encoding utf8 -Value "`nmslnk = `"=0.1`""
+        } `
+        -Run { Test-VendoredSource } `
+        -Cleanup { Restore-RepoFile -Backup (Get-RepoBackupPath -Path $kaCargoToml) -Path $kaCargoToml }
+
     # --- 1) ps1：临时放一个语法错误的 .ps1 进仓库 ---
     Add-Case 'ps1 层能抓到 PowerShell 语法错误' `
         -Mutate {
@@ -115,6 +125,21 @@ jobs:
         -Mutate {
             $f = Join-Path $DevCheckRoot 'rust/typecheck/src/gen/uninstall.rs'
             Add-Content -Path $f -Value "`nfn _devcheck_selftest() { let _x: u32 = `"不是数字`"; }" -Encoding utf8
+        } `
+        -Run { Test-RustTypecheck }
+
+    # --- 2b) rust：lnk.rs 的 COM 调用写错（或整份文件没挂进 crate）就必须报错 ---
+    #     这一段是「用系统 API 换掉 mslnk」的落点，只在 Windows 上跑，
+    #     本地唯一能守的就是「它在 msvc target 上编得过」。
+    Add-Case 'rust 层能抓到 lnk.rs 的 COM 调用写错' `
+        -Mutate {
+            $f = Join-Path $DevCheckRoot 'rust/typecheck/src/gen/lnk.rs'
+            Add-Content -Path $f -Encoding utf8 -Value @'
+
+fn _devcheck_selftest(l: &windows::Win32::UI::Shell::IShellLinkW) {
+    let _ = unsafe { l.SetPathTypo(&windows::core::HSTRING::from("x")) };
+}
+'@
         } `
         -Run { Test-RustTypecheck }
 

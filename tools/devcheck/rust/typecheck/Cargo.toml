@@ -29,7 +29,13 @@ tokio = { version = "1", features = [
     "net",
 ] }
 tracing = "0.1"
-windows = { version = "0.61.1", features = ["Win32_System_Threading"] }
+# Win32_UI_Shell 给 utils/dir.rs 的 SHGetKnownFolderPath 与 installer/lnk.rs 的
+# IShellLinkW；Win32_System_Com 给后者的 IPersistFile / CoInitializeEx。
+windows = { version = "0.61.1", features = [
+    "Win32_System_Threading",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+] }
 windows-registry = "0.5"
 
 [workspace]

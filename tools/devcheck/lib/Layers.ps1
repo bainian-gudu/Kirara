@@ -259,6 +259,46 @@ function Test-VendoredSource {
     }
     $notes.Add("ARP 卸载命令行与 cli/arg.rs 一致(UninstallString 已加引号；Quiet=$($used -join ' '))")
 
+    # 10) 停更 / 无保障的依赖不许回归。
+    #     第 14～16 节的重构把四个「没人维护」的依赖换成了系统 API 或标准 crates：
+    #     mslnk 0.1（2022 年后停更，自带约 1300 行手写 .lnk 序列化）→ IShellLinkW +
+    #     IPersistFile；nt_version 0.1（2020 年后停更）→ ntdll 的
+    #     RtlGetNtVersionNumbers；h3-msquic-async + xytoki/msquic-async-rs fork
+    #     （下载量千级、构建要编上千个 C 文件）→ quinn + rustls；xytoki/zip2 fork
+    #     → crates.io 的 zip + 调用侧的 decode_entry_name。换回去等于把这些风险请回来。
+    foreach ($stale in @('mslnk', 'nt_version')) {
+        if ($cargoTomlCode -match ('(?m)^\s*' + $stale + '\s*=')) {
+            throw "kachina 的 Cargo.toml 又声明了 $stale —— 已换成系统 API，见 LOCAL_PATCHES.md 第 16 节"
+        }
+        if ($cargoLock -match ('(?m)^name = "' + $stale + '"')) {
+            throw "Cargo.lock 里还锁着 $stale —— 改完依赖要重新生成 Cargo.lock（cargo metadata）"
+        }
+    }
+    if ($cargoTomlCode -match '(?m)^\s*(h3-)?msquic-async\s*=') {
+        throw 'kachina 又用回了 msquic 系（上游 fork 分支依赖）—— H3 传输层应保持 quinn + rustls'
+    }
+    if ($cargoLock -match '(?m)^name = "[^"]*msquic') {
+        throw 'Cargo.lock 里还有 msquic 系 crate —— 改完依赖要重新生成 Cargo.lock（cargo metadata）'
+    }
+    if ($cargoTomlCode -match 'xytoki/zip2' -or $cargoLock -match 'xytoki/zip2') {
+        throw 'zip 又指回 xytoki/zip2 fork —— 强制 UTF-8 的条目名解码已由 thirdparty/mirrorc.rs 复刻'
+    }
+    $notes.Add('停更依赖未回归(mslnk/nt_version/msquic 系/zip2 fork)')
+
+    # 10b) vendored 的 HDiffPatch 源码（libs/hdiff-sys、libs/hpatch-sys）是 MIT，
+    #      许可证必须随源码一起分发；出处与本地差异记在 libs/THIRDPARTY.md。
+    $libDocs = @(
+        'src-tauri/libs/THIRDPARTY.md',
+        'src-tauri/libs/hdiff-sys/LICENSE',
+        'src-tauri/libs/hpatch-sys/LICENSE'
+    )
+    foreach ($r in $libDocs) {
+        if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot $r))) {
+            throw "libs 下的 vendored 第三方源码缺 $r —— MIT 许可证必须随源码分发"
+        }
+    }
+    $notes.Add('libs 下 vendored 源码带齐 LICENSE 与出处说明')
+
     return ($notes -join '；')
 }
 
@@ -316,7 +356,7 @@ function Test-RustTypecheck {
     if ($r.ExitCode -ne 0) { throw 'cargo check（x86_64-pc-windows-msvc）失败，见上方输出' }
     $warn = ([regex]::Matches($r.Output, 'warning:')).Count
     $what = if ($warn) { "（$warn 条 warning）" } else { '，0 warning' }
-    return "uninstall.rs + utils/error.rs 在 $target 上类型检查通过$what"
+    return "uninstall.rs + lnk.rs + utils/{error,dir}.rs 在 $target 上类型检查通过$what"
 }
 
 function Test-RustLogic {

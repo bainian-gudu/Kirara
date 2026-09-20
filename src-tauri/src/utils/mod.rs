@@ -5,6 +5,7 @@ pub mod gui;
 pub mod hash;
 pub mod icon;
 pub mod metadata;
+pub mod os_version;
 pub mod progressed_read;
 pub mod secure_temp;
 pub mod uac;

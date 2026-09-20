@@ -26,8 +26,11 @@
 - [9. 下载与提权链路加固](#9-第三轮安全加固把下载后执行和提权管道两条链路一次收干净)
 - [10. 前端模块拆分与注释中文化](#10-前端模块拆分与注释语言统一)
 - [11. 构建日志告警收敛](#11-构建日志告警收敛)
+- [12. 品牌改名后的升级兼容](#12-品牌改名后的升级兼容)
 - [13. 构建目标改为 Windows 10/11](#13-构建目标改为-windows-1011)
 - [14. zip 依赖去掉 fork](#14-zip-依赖去掉-fork)
+- [15. H3 传输层改用 quinn + rustls](#15-h3-传输层改用-quinn--rustls)
+- [16. 停更依赖换成系统 API](#16-停更依赖换成系统-api)
 - [升级上游时的套用顺序](#升级上游时的套用顺序)
 
 | # | 需求 | 涉及文件 |
@@ -44,9 +47,12 @@
 | 8 | 卸载收尾、路径比较、提权状态与静默卸载入口 | `src-tauri/src/installer/uninstall.rs`、`src-tauri/src/ipc/manager.rs`、`src-tauri/src/installer/registry.rs`、`src/App.vue` |
 | 9 | 下载文件验签、临时文件、提权管道及后续复查修复 | `src-tauri/src/utils/secure_temp.rs`、`src-tauri/src/utils/acl.rs` 及相关调用点，详见第 9 节 |
 | 10 | DFS 会话模块拆分与注释中文化 | `src/dfs.ts`、`src/dfs/session.ts`；注释调整覆盖本目录项目源码和仓库内副本的功能注释 |
+| 11 | 构建日志告警收敛（上游两处警告、死代码告警） | 两个 `libs/*-sys/src/lib.rs`、`src-tauri/src/cli/arg.rs` |
 | 12 | 品牌改名后的旧主程序 / 安装目录识别、旧组件清理与快捷方式修复 | `src-tauri/src/installer/config.rs`、`src-tauri/src/installer/mod.rs`、`src/App.vue` |
 | 13 | 目标改回标准 `x86_64-pc-windows-msvc`，去掉 `-Z build-std` 与 `rust-ctor` fork | `package.json`、`build.ps1`、`.github/workflows/build.yml`、`src-tauri/Cargo.toml` |
 | 14 | zip 去掉 `xytoki/zip2` fork，改用 crates.io 8.6 并在调用侧复刻强制 UTF-8 | `src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`、`src-tauri/src/thirdparty/mirrorc.rs`、`tools/devcheck/` |
+| 15 | H3 传输层改用 `quinn` + `rustls`，去掉 `h3-msquic-async` / `msquic-async` fork | `src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`、`src-tauri/src/capabilities/h3.rs`、`src-tauri/src/capabilities/mod.rs`、`tools/devcheck/` |
+| 16 | 停更依赖换成系统 API（`mslnk` → Shell Link、`nt_version` → ntdll），补齐 vendored 源码许可证 | `src-tauri/src/installer/lnk.rs`、`src-tauri/src/utils/os_version.rs`（新增）、`src-tauri/src/utils/mod.rs`、`src-tauri/src/capabilities/mod.rs`、`src-tauri/src/main.rs`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`、`src-tauri/libs/`、`tools/devcheck/` |
 
 ---
 
@@ -890,6 +896,58 @@ H3 的真实连接只能在 Windows 上跑，靠 CI 的 Build + 四组安装 / �
 另外 HoYoEnhance 下发的 `packaging.config.json` 目前只有 `https://` 地址，没有
 `http3://`，也就是说这条链路在正式安装流程里默认不会被走到。
 
+## 16. 停更依赖换成系统 API；补齐 vendored 源码的许可证
+
+这一节收掉两个「多年没人维护、但做的事其实系统本来就有」的依赖，外加一处许可证缺口。
+共同点是**只换实现，不换行为**。
+
+### 16a. `mslnk 0.1` → `IShellLinkW` + `IPersistFile`
+
+`mslnk` 最后一次发布停在 2022 年，自带约 1300 行手写的 .lnk 二进制序列化代码 ——
+IDList、相对路径、图标这些格式细节都得自己维护。现在改用 Windows 自带的 Shell Link 组件：
+
+- `CoCreateInstance(&ShellLink, …)` 拿到 `IShellLinkW` → `SetPath` /
+  `SetWorkingDirectory` → `cast::<IPersistFile>()` → `Save`，格式细节交给系统；
+- 起始位置填目标文件所在目录（与 `mslnk` 那份实现填的值一致）；
+- COM 要求线程先初始化 apartment，而这条命令跑在 tokio 的工作线程上 —— 整段丢进
+  `spawn_blocking`，在同一个线程里自己 `CoInitializeEx` / `CoUninitialize`。
+  线程已被别的组件按另一种 apartment 初始化过时返回 `RPC_E_CHANGED_MODE`：
+  这不是失败（Shell Link 两种 apartment 都能用），继续执行，只是不配对调用
+  `CoUninitialize`（谁初始化谁负责）；
+- 上游那套路径校验一行没动：绝对路径、不许出现 `..`、必须以 `.lnk` 结尾、
+  `is_safe_delete_target`、目标不能是重解析点。
+
+### 16b. `nt_version 0.1` → `ntdll!RtlGetNtVersionNumbers`
+
+`nt_version` 最后一次发布是 2020 年，做的事就是调 `RtlGetNtVersionNumbers` 并返回
+`(major, minor, build)`。现在由 `src-tauri/src/utils/os_version.rs` 自己声明这个入口
+（`#[link(name = "ntdll")]`），不再引入任何依赖：
+
+- 走 `RtlGetNtVersionNumbers` 而不是 `GetVersionEx`：后者会因为「进程清单没声明支持
+  Win10」被兼容性改写，这也是原来那个 crate 存在的理由，行为保持一致；
+- `build` 的高位带着未文档化的标志位（历史上是 `0xF0000000`），低 16 位才是构建号。
+  上游两处调用点各自写了一次 `build & 0xffff`，现在统一在 `os_version::get()` 里裁好，
+  `main.rs` 与 `capabilities/mod.rs` 拿到的语义不变；
+- H3 的启用门槛（Win11 = `10.0` 且 build ≥ 22000）保持原样，没有跟着依赖替换一起放宽。
+
+### 16c. `libs/` 下 vendored 源码的许可证与出处
+
+`hdiff-sys` / `hpatch-sys` 各自打包了一份 HDiffPatch 的 C/C++ 源码（`v4.8.0`），
+但目录里缺上游的 `LICENSE` —— 那份许可是 MIT，必须随源码分发。现在两份 `LICENSE`
+都补齐了（`hdiff-sys` 那份还含 libdivsufsort 的 Yuta Mori 许可），并在
+`src-tauri/libs/THIRDPARTY.md` 里记下上游地址、快照版本、本地四类差异
+（include 路径、`extern "C"` 出口、hpatch 的具体错误码、注释被机翻）与升级步骤。
+
+### 复核方式
+
+`pwsh tools/devcheck/devcheck.ps1`：`rust` 层现在把 `installer/lnk.rs` 与
+`utils/dir.rs` 一起放进 msvc target 的类型检查（COM 接口名、参数类型、调用顺序写错
+当场就响，本地没有 Windows 也能守），`vendor` 层第 10 项盯着这四个依赖不许回来、
+`libs` 的许可证不许丢。
+
+快捷方式的**行为**仍然只能实机验证：装一次，看桌面 / 开始菜单里的快捷方式能正常启动、
+工作目录正确，再跑一次卸载确认它们被清干净（卸载侧的判定在第 1b 节，没有改动）。
+
 ---
 
 
@@ -941,6 +999,12 @@ H3 的真实连接只能在 Windows 上跑，靠 CI 的 Build + 四组安装 / �
    `rustls-platform-verifier`，`capabilities/h3.rs` 整份替换、`capabilities/mod.rs`
    的探测换成 `h3::probe()`，`tools/devcheck/lib/RustSource.ps1` 要支持 `enum` 抽取、
    `Generate.ps1` 与 `rust/logic/src/main.rs` 补回 [20] 组断言；
+3j. **重做第 16 节**：`installer/lnk.rs` 换成系统 Shell Link（`IShellLinkW` +
+   `IPersistFile`，去掉 `mslnk`）、新增 `utils/os_version.rs` 自己声明
+   `RtlGetNtVersionNumbers`（去掉 `nt_version`）、`Cargo.toml` 的 `windows` features
+   补 `Win32_System_Com`、`libs/{hdiff-sys,hpatch-sys}/LICENSE` 与 `libs/THIRDPARTY.md`
+   保持存在，`tools/devcheck/lib/Generate.ps1` 的 typecheck 生成清单要带上
+   `installer/lnk.rs` 与 `utils/dir.rs`；
 4. `npx tsc --noEmit -p tsconfig.json`（上游本身有 3 个 `noUnusedLocals` 报错，
    只要没有新增报错即可）+ 用 `@vue/compiler-sfc` 编译 `src/App.vue` 自检；
 5. Windows 上 `pnpm build` 出 `kachina-builder.exe`，跑一次

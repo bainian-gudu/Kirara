@@ -46,6 +46,7 @@ futures = "0.3"
 tokio-util = { version = "0.7", features = ["io-util"] }
 async-walkdir = "2.0"
 windows = { version = "0.61.1", features = [
+    "Win32_System_Com",
     "Win32_System_Console",
     "Win32_Security",
     "Win32_System_Registry",
@@ -65,10 +66,8 @@ rfd = { version = "0.15", default-features = false, features = [
     "tokio",
     "common-controls-v6",
 ] }
-nt_version = "0.1"
 lazy_static = "1.5"
 open = { version = "5.3.1", features = ["shellexecute-on-windows"] }
-mslnk = "=0.1"
 twox-hash = "2.1.0"
 pin-project = "1.1.7"
 fmmap = { version = "0.4", features = ["tokio"] }

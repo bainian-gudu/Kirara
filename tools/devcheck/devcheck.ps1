@@ -30,7 +30,7 @@
 .EXAMPLE
     pwsh tools/devcheck/devcheck.ps1 -Layer rust,logic
 .EXAMPLE
-    pwsh tools/devcheck/devcheck.ps1 -Fix      # 只对我们维护的两个 .rs 跑 rustfmt
+    pwsh tools/devcheck/devcheck.ps1 -Fix      # 只对我们维护的 4 个 .rs 跑 rustfmt
 
 .NOTES
     首次运行会下载：rustup target x86_64-pc-windows-msvc、front/node_modules、
@@ -92,7 +92,12 @@ $KachinaSrc = Join-Path $RepoRoot 'src-tauri/src'
 if ($Fix) {
     $rustfmt = Get-Tool 'rustfmt'
     if (-not $rustfmt) { throw 'rustfmt 不在 PATH（rustup component add rustfmt）' }
-    $targets = @((Join-Path $KachinaSrc 'installer/uninstall.rs'), (Join-Path $KachinaSrc 'builder/pack.rs'))
+    $targets = @(
+        (Join-Path $KachinaSrc 'installer/uninstall.rs'),
+        (Join-Path $KachinaSrc 'builder/pack.rs'),
+        (Join-Path $KachinaSrc 'installer/lnk.rs'),
+        (Join-Path $KachinaSrc 'utils/os_version.rs')
+    )
     foreach ($t in $targets) {
         $r = Invoke-Native -FilePath $rustfmt -Arguments @('--edition', '2021', $t)
         if ($r.ExitCode -ne 0) { throw "rustfmt 失败: $t" }

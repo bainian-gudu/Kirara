@@ -52,8 +52,7 @@ fn probe_h3_support() -> bool {
     // 1. Win11+ 检查。上游的 msquic + Schannel 组合要求构建号 >= 22000；换成
     //    quinn + rustls 之后这个技术限制已经不存在（QUIC 与加密都在进程内完成），
     //    但这里刻意保留原判定：H3 的启用范围属于对外行为，不该跟着依赖替换一起变。
-    let (major, minor, build) = nt_version::get();
-    let build_num = build & 0xffff;
+    let (major, minor, build_num) = crate::utils::os_version::get();
     if !(major == 10 && minor == 0 && build_num >= 22000) {
         tracing::info!(
             "[H3] Not Win11 (build={}, need 22000+), disabled",
@@ -128,7 +127,7 @@ impl Middleware for DynamicUaMiddleware {
 
 /// 生成 User-Agent 字符串，并按需附加 h3/enabled 后缀。
 pub fn ua_string() -> String {
-    let (major, minor, build) = nt_version::get();
+    let (major, minor, build) = crate::utils::os_version::get();
     let cpu_cores = num_cpus::get();
     let wv2ver = tauri::webview_version().unwrap_or_else(|_| "Unknown".to_string());
 
