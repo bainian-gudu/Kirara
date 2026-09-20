@@ -80,7 +80,7 @@ installer/tools/kachina-builder.exe
 `x86_64-pc-windows-msvc`，不再需要 `rust-src` 与 `-Z build-std`；nightly 仍然保留，
 因为 `trim-paths` 与 `profile.rustflags` 目前是 nightly 专属特性。
 
-首次冷构建耗时较长（`lto = true`、`codegen-units = 1`、静态 msquic）。
+首次冷构建耗时较长（`lto = true`、`codegen-units = 1`、`aws-lc-sys` 的 C 源码）。
 CI 里用 `Swatinem/rust-cache` 缓存后通常几分钟内完成。
 
 ## 许可提示（重要）

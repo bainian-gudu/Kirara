@@ -815,10 +815,9 @@ Other(Vec<String>),
 - `[patch.crates-io] ctor` 删除：`xytoki/rust-ctor` 那份 fork 只补了
   `target_vendor = "win7"` 分支，标准目标走的是上游原有的 `target_vendor = "pc"`
   分支，用 crates.io 的 `ctor 0.6.3` 即可；
-- `build.ps1` 在构建前按本机核数设置 `CMAKE_BUILD_PARALLEL_LEVEL`：`seera-msquic`
-  的构建脚本在 Windows 上会移除 `NUM_JOBS`，而 cmake-rs 只在 `NUM_JOBS` 存在时才给
-  cmake 传 `--parallel`，导致 msquic 的 C 源码被串行编译；cmake 自己认这个环境变量，
-  不必改上游 crate；
+- `build.ps1` 在构建前按本机核数设置 `CMAKE_BUILD_PARALLEL_LEVEL`：依赖里仍有 crate
+  用 cmake 编 C 源码（russh 的加密后端 `aws-lc-sys`），cmake 自己认这个环境变量，
+  按本机核数补上就不必改上游 crate；
 - CI 增加 `CARGO_PROFILE_RELEASE_DEBUG: "false"`：PDB 既不进 Release 也不上传 artifact，
   省掉一份没有去处的调试信息（本地构建不受影响）。
 
@@ -828,7 +827,7 @@ nightly 工具链保留：`Cargo.toml` 里的 `trim-paths` 与 `profile.rustflag
 
 复核方式：`pwsh build.ps1` 能产出 `tools\kirara-builder.exe`，CI 的四组安装 / 更新
 测试全绿；`tools/devcheck` 的 `vendor` 层仍会断言每个 git 依赖都锁到 commit
-（此时只剩 `msquic-async`，见第 14 节）。
+（第 15 节之后已经没有 git 依赖了）。
 
 ---
 
@@ -853,6 +852,43 @@ nightly 工具链保留：`Cargo.toml` 里的 `trim-paths` 与 `profile.rustflag
 「未置位的中文名按 UTF-8 还原 / 非 UTF-8 字节走 lossy 解码 / ASCII 名不受影响」。
 MirrorChyan 的完整解包链路没有自动化用例（CI 的四组测试走 GitHub Release），
 首次在 Windows 上用到镜像安装时建议对着一个真实包复核一遍。
+
+---
+
+## 15. H3 传输层改用 quinn + rustls
+
+上游的 HTTP/3 走 `h3-msquic-async` + `xytoki/msquic-async-rs` fork + `seera-msquic`
+（静态 msquic）：前两个都不在 crates.io 主线维护（下载量分别约 1.8k / 0.7k），fork 里
+还有自研的证书校验代码，构建时要把上千个 C 文件编一遍。
+
+现在换成 `quinn 0.11` + `rustls 0.23` + `h3-quinn 0.0.10` +
+`rustls-platform-verifier 0.7`，`capabilities/h3.rs` 的对外接口与证书固定语义逐条保持：
+
+- 验证器是 `PinVerifier`：外面包一层系统证书验证器（Windows 上就是 CryptoAPI 证书链，
+  与上游的 Schannel 等价），`PinningMode::Force` / `Add` 的判定顺序不变 ——
+  `Add` 模式下系统信任就直接放行，系统不信任才比对固定值；
+- `PinTarget::Spki` 改为在证书 DER 上直接定位 SubjectPublicKeyInfo
+  （`extract_spki_der`），与上游 `CryptEncodeObjectEx(X509_PUBLIC_KEY_INFO)` 的字节
+  一致，所以 `openssl x509 -pubkey -noout | openssl pkey -pubin -outform DER | sha256sum`
+  的结果仍然可以直接当固定值用；
+- 连接池（按 `host / port / pin` 复用、空闲与死亡连接清扫、上限 32）、
+  `http3://` 拦截、失败即 `disable_h3()`、UA 里的 `h3/enabled` 标记、`discover()`
+  的「接受任意证书并回传哈希」全部照旧；
+- 加密提供者显式指定 ring：本仓库的 rustls 同时开着 aws-lc-rs（russh 要的），
+  走 `ClientConfig::builder()` 会因为「默认提供者不唯一」直接 panic；
+- QUIC 端点是懒创建的，按地址族各留一个（`0.0.0.0:0` / `[::]:0`），不依赖双栈 socket
+  在各平台上不一致的 `IPV6_V6ONLY` 默认值；
+- Win11+ 的启用门槛保留：那是上游为 msquic + Schannel 定的，换掉依赖后技术上已无必要，
+  但「H3 在哪些系统上启用」属于对外行为，不跟着依赖替换一起变。
+
+顺带的结果：`Cargo.lock` 里不再有任何 git 依赖，msquic 相关的 crate
+（`h3-msquic-async`、`msquic-async`、`seera-msquic`、`ctor` / `dtor` 等）全部消失。
+
+复核方式：`pwsh tools/devcheck/devcheck.ps1 -Layer logic` 的 [20] 组断言覆盖固定值
+解析与 SPKI 哈希（样例证书的哈希由 openssl 独立算出，两边必须逐字节一致）。
+H3 的真实连接只能在 Windows 上跑，靠 CI 的 Build + 四组安装 / 更新测试兜底；
+另外 HoYoEnhance 下发的 `packaging.config.json` 目前只有 `https://` 地址，没有
+`http3://`，也就是说这条链路在正式安装流程里默认不会被走到。
 
 ---
 
@@ -900,6 +936,11 @@ MirrorChyan 的完整解包链路没有自动化用例（CI 的四组测试走 G
 3h. **重做第 14 节的 zip 替换**：`Cargo.toml` 的 `zip` 改回 crates.io 版本，
    `thirdparty/mirrorc.rs` 恢复 `decode_entry_name` 与按索引取名字的写法，
    `tools/devcheck/lib/Generate.ps1` 与 `rust/logic/src/main.rs` 补回 [19] 组断言；
+3i. **重做第 15 节的 H3 传输层替换**：`Cargo.toml` 去掉 `h3-msquic-async` 与
+   `[patch.crates-io] msquic-async`、换成 `h3-quinn` / `quinn` / `rustls` /
+   `rustls-platform-verifier`，`capabilities/h3.rs` 整份替换、`capabilities/mod.rs`
+   的探测换成 `h3::probe()`，`tools/devcheck/lib/RustSource.ps1` 要支持 `enum` 抽取、
+   `Generate.ps1` 与 `rust/logic/src/main.rs` 补回 [20] 组断言；
 4. `npx tsc --noEmit -p tsconfig.json`（上游本身有 3 个 `noUnusedLocals` 报错，
    只要没有新增报错即可）+ 用 `@vue/compiler-sfc` 编译 `src/App.vue` 自检；
 5. Windows 上 `pnpm build` 出 `kachina-builder.exe`，跑一次

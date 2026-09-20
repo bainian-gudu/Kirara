@@ -54,6 +54,20 @@ $script:LogicMirrorcItems = @(
     @{ Kind = 'fn'; Name = 'decode_entry_name' }
 )
 
+# capabilities/h3.rs 里只抽证书固定（pinning）与证书哈希这几段纯逻辑：它们是安全阀本身
+# （固定值比对错了就等于形同虚设），而 H3 的传输层在 Windows 上才能真连，本地只能靠这些
+# 断言兜住。DER 解析出来的 SPKI 必须与 openssl 的结果逐字节一致，见 main.rs 的 [20] 组。
+$script:LogicH3Items = @(
+    @{ Kind = 'enum';   Name = 'PinningMode' }
+    @{ Kind = 'enum';   Name = 'PinTarget' }
+    @{ Kind = 'struct'; Name = 'PinConfig' }
+    @{ Kind = 'fn';     Name = 'sha256' }
+    @{ Kind = 'fn';     Name = 'extract_spki_der' }
+    @{ Kind = 'fn';     Name = 'compute_spki_hash' }
+    @{ Kind = 'fn';     Name = 'compute_cert_hash' }
+    @{ Kind = 'fn';     Name = 'parse_pin_from_fragment' }
+)
+
 function Get-DevCheckRepoRoot {
     param([Parameter(Mandatory)][string]$ScriptRoot)
     # tools/devcheck/lib -> 仓库根
@@ -101,12 +115,13 @@ function New-LogicGen {
     $pack = Read-RustSource -Path (Join-Path $kachina 'builder/pack.rs')
     $secureTemp = Read-RustSource -Path (Join-Path $kachina 'utils/secure_temp.rs')
     $mirrorc = Read-RustSource -Path (Join-Path $kachina 'thirdparty/mirrorc.rs')
+    $h3 = Read-RustSource -Path (Join-Path $kachina 'capabilities/h3.rs')
 
     $parts = [System.Collections.Generic.List[string]]::new()
     $parts.Add(@'
 // 生成物，勿手改：由 tools/devcheck/devcheck.ps1 按名字从
 // src-tauri/src/{installer/uninstall.rs, builder/pack.rs,
-// utils/secure_temp.rs, thirdparty/mirrorc.rs} 抽取。
+// utils/secure_temp.rs, thirdparty/mirrorc.rs, capabilities/h3.rs} 抽取。
 // 抽取规则见 tools/devcheck/lib/RustSource.ps1；找不到清单里的 item 会直接报错。
 // 本文件被 src/main.rs 用 include! 展开到 crate 根，Path/PathBuf 由 main.rs 引入。
 
@@ -142,6 +157,10 @@ fn is_under_system_root(path: &Path) -> bool {
     foreach ($item in $script:LogicMirrorcItems) {
         $parts.Add((Get-RustItem -Text $mirrorc.Text -Masked $mirrorc.Masked `
                     -Kind $item.Kind -Name $item.Name -SourceName 'thirdparty/mirrorc.rs'))
+    }
+    foreach ($item in $script:LogicH3Items) {
+        $parts.Add((Get-RustItem -Text $h3.Text -Masked $h3.Masked `
+                    -Kind $item.Kind -Name $item.Name -SourceName 'capabilities/h3.rs'))
     }
 
     $out = Join-Path $genDir 'extracted.rs'

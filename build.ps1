@@ -129,9 +129,8 @@ try {
     & pnpm install --frozen-lockfile
     if ($LASTEXITCODE -ne 0) { throw "pnpm install 失败" }
 
-    # seera-msquic 的构建脚本在 Windows 上会移除 NUM_JOBS，而 cmake-rs 只在 NUM_JOBS
-    # 存在时才给 cmake 传 --parallel，于是 msquic 的 C 源码被串行编译。cmake 自己认
-    # 这个环境变量，按本机核数补上即可，不需要改上游 crate。
+    # 依赖里还有用 cmake 编 C 源码的 crate（russh 的加密后端 aws-lc-sys），cmake 自己
+    # 认这个环境变量，按本机核数补上，省得在 Windows 上退回串行编译。
     if (-not $env:CMAKE_BUILD_PARALLEL_LEVEL) {
         $env:CMAKE_BUILD_PARALLEL_LEVEL = [string][Environment]::ProcessorCount
     }

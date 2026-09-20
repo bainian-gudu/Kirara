@@ -88,8 +88,8 @@ pwsh tools/devcheck/devcheck.ps1 -Fix         # 只对我们维护的两个 .rs 
 | --- | --- |
 | `RUST_TOOLCHAIN: nightly` | `Cargo.toml` 里的 `trim-paths` 与 `profile.rustflags` 仍是 nightly 专属特性，stable 编不过；标准目标不需要 `-Z build-std` |
 | `CARGO_PROFILE_RELEASE_DEBUG: "false"` | CI 编出的 PDB 既不进 Release 也不上传 artifact，关掉只省编译时间（本地构建不受影响） |
-| `CMAKE_BUILD_PARALLEL_LEVEL`（`build.ps1` 里按本机核数设置） | `seera-msquic` 的构建脚本在 Windows 上会移除 `NUM_JOBS`，cmake-rs 只在 `NUM_JOBS` 存在时才传 `--parallel`，不加这个变量 msquic 的 C 源码会串行编译 |
-| `CMAKE_GENERATOR: Ninja` + `Enable Windows long paths` | `seera-msquic` 的静态构建会在极深路径下写 `.tlog`，超过 Windows 260 字符上限时 MSBuild 报 `error FTK1011`。Ninja 不写 `.tlog`，长路径是第二道防线。**副作用**：Ninja 不会自己去 VS 安装目录找 `cl.exe`，必须先跑 `tools/ci/Import-DevCmd.ps1` 注入 `PATH` / `INCLUDE` / `LIB` |
+| `CMAKE_BUILD_PARALLEL_LEVEL`（`build.ps1` 里按本机核数设置） | 依赖里仍有 crate 用 cmake 编 C 源码（russh 的加密后端 `aws-lc-sys`），按本机核数给它一个明确的并行度，省得退回串行编译 |
+| `CMAKE_GENERATOR: Ninja` + `Enable Windows long paths` | 让 cmake 走 Ninja：不写 MSBuild 的 `.tlog`，也不会被 Windows 260 字符路径上限卡住。**副作用**：Ninja 不会自己去 VS 安装目录找 `cl.exe`，必须先跑 `tools/ci/Import-DevCmd.ps1` 注入 `PATH` / `INCLUDE` / `LIB` |
 | `tools/ci/Import-DevCmd.ps1` | 按 `ProgramFiles` / `ProgramFiles(x86)` 枚举 `vcvarsall.bat`，用 `Start-Process` 跑一次子 cmd 拿全量环境变量，结果写进 `$GITHUB_ENV`；不依赖任何 Node 运行时，所以不会产生 action 弃用告警 |
 | `NODE_NO_WARNINGS: "1"` | 压掉第三方 action 自己的 Node 弃用告警 |
 | `.gitattributes`（`* text=auto eol=lf`） | windows-latest 的 git 默认 `core.autocrlf=true`，检出成 CRLF 后 `prettier --check` 在 Windows 上必挂 |

@@ -1102,6 +1102,114 @@ fn zip_entry_name_cases() {
     check("ASCII 名不受影响", ascii == "changes.json", format!("got {ascii}"));
 }
 
+/// H3 证书固定用的样例证书：openssl 现生成的 P-256 自签证书（CN=h3check.example），
+/// 三个常量都由 openssl 侧独立算出来，用来交叉验证我们自己写的 DER 解析。
+const H3_CERT_DER_HEX: &str = concat!(
+    "308201a53082014ba0030201020214483c51f5abd347944d1c8e31bec76ad5908db5c5300a06082a8648ce3d040302301a31",
+    "18301606035504030c0f6833636865636b2e6578616d706c65301e170d3236303932303038343832375a170d333630393137",
+    "3038343832375a301a3118301606035504030c0f6833636865636b2e6578616d706c653059301306072a8648ce3d02010608",
+    "2a8648ce3d03010703420004d7ed138f10848d71c26e9d40f0e17f3663fa72dc2bdf7c064e4bafe7918e33c6e3e5ca94a092",
+    "adc6125bc1a17e196045ae50c535b86440a94305ceec6bba9de2a36f306d301d0603551d0e0416041420af054940430aa165",
+    "dff8a6b27b6b0b6a524152301f0603551d2304183016801420af054940430aa165dff8a6b27b6b0b6a524152300f0603551d",
+    "130101ff040530030101ff301a0603551d1104133011820f6833636865636b2e6578616d706c65300a06082a8648ce3d0403",
+    "02034800304502200a81dca0423688aeadeab80d039a5a4e31f5cf0840261de6471c0ddb0e20c455022100e426f3160b8d8a",
+    "d32949224717db0297427011baee0e59eec8a7017dc5befa42",
+);
+const H3_CERT_SHA256: &str = "898f47029c53f83646567fa56237fcdc6fc111de5f5e2ae8ac84197be0ae98a6";
+const H3_SPKI_SHA256: &str = "9af0e528ef99ca47a58d45101878168c38d283655d971eef7608f8d1bd7f469d";
+
+fn h3_pin_cases() {
+    println!("[20] H3 证书固定（pinning）与 SPKI 哈希");
+
+    let parse = |frag: &str| {
+        parse_pin_from_fragment(
+            &url::Url::parse(&format!("http3://example.com/file#{frag}")).expect("url"),
+        )
+    };
+    let spki = "aa".repeat(32);
+    let cert = "bb".repeat(32);
+
+    let cfg = parse(&format!("spki={spki}")).expect("spki");
+    check(
+        "固定值：只给 spki 时默认 force",
+        cfg.mode == PinningMode::Force && cfg.target == PinTarget::Spki([0xaa; 32]),
+        format!("{cfg:?}"),
+    );
+
+    let cfg = parse(&format!("spki={spki}&pinning_mode=add")).expect("spki+add");
+    check(
+        "固定值：pinning_mode=add 生效",
+        cfg.mode == PinningMode::Add,
+        format!("{cfg:?}"),
+    );
+
+    let cfg = parse(&format!("spki={spki}&pinning_mode=whatever")).expect("unknown mode");
+    check(
+        "固定值：未知 pinning_mode 退回 force（安全默认值）",
+        cfg.mode == PinningMode::Force,
+        format!("{cfg:?}"),
+    );
+
+    let cfg = parse(&format!("cert={cert}")).expect("cert");
+    check(
+        "固定值：cert 目标可解析",
+        cfg.target == PinTarget::Cert([0xbb; 32]),
+        format!("{cfg:?}"),
+    );
+
+    let cfg = parse(&format!("spki={spki}&cert={cert}&pinning_mode=add")).expect("both");
+    check(
+        "固定值：spki 与 cert 同时出现时 cert 优先",
+        cfg.target == PinTarget::Cert([0xbb; 32]) && cfg.mode == PinningMode::Add,
+        format!("{cfg:?}"),
+    );
+
+    check(
+        "固定值：长度不足 64 被拒绝",
+        parse("spki=abcd").is_none(),
+        "长度 4 的 spki 不该通过".to_string(),
+    );
+    check(
+        "固定值：非 hex 被拒绝",
+        parse(&format!("spki={}", "zz".repeat(32))).is_none(),
+        "非 hex 不该通过".to_string(),
+    );
+    check(
+        "固定值：只写 pinning_mode 被拒绝",
+        parse("pinning_mode=add").is_none(),
+        "没有 spki/cert 时不该给出配置".to_string(),
+    );
+    check(
+        "固定值：没有 fragment 被拒绝",
+        parse_pin_from_fragment(&url::Url::parse("http3://example.com/file").expect("url"))
+            .is_none(),
+        "无 fragment 不该给出配置".to_string(),
+    );
+
+    // SPKI 定位必须与 openssl 完全一致，否则用户按文档算出来的固定值会全部失配。
+    let der = hex::decode(H3_CERT_DER_HEX).expect("fixture hex");
+    check(
+        "证书哈希：整张证书的 SHA-256 与 openssl 一致",
+        hex::encode(compute_cert_hash(&der)) == H3_CERT_SHA256,
+        format!("got {}", hex::encode(compute_cert_hash(&der))),
+    );
+    check(
+        "证书哈希：SPKI 的 SHA-256 与 openssl 一致",
+        compute_spki_hash(&der).map(hex::encode).as_deref() == Some(H3_SPKI_SHA256),
+        format!("got {:?}", compute_spki_hash(&der).map(hex::encode)),
+    );
+    check(
+        "证书哈希：截断的 DER 被拒绝",
+        extract_spki_der(&der[..der.len() / 2]).is_none(),
+        "截断输入不该解析出 SPKI".to_string(),
+    );
+    check(
+        "证书哈希：不定长编码被拒绝",
+        extract_spki_der(&[0x30, 0x80, 0x00]).is_none(),
+        "DER 不允许不定长".to_string(),
+    );
+}
+
 #[tokio::main]
 async fn main() {
     reg_target_cases();
@@ -1122,6 +1230,7 @@ async fn main() {
     scheduled_task_name_cases();
     scheduled_task_wiring_case();
     zip_entry_name_cases();
+    h3_pin_cases();
     let (pass, fail) = (PASS.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed));
     println!("\n==== PASS {pass} / FAIL {fail} ====");
     if fail > 0 {

@@ -106,13 +106,13 @@ function Get-RustMaskedText {
     return $sb.ToString()
 }
 
-# 抽取一个 item（fn / const / struct / static / type），连同它上方连续的 doc 注释与属性行。
+# 抽取一个 item（fn / const / struct / enum / static / type），连同它上方连续的 doc 注释与属性行。
 # 找不到就抛错 —— 上游重命名或删掉这些函数时，devcheck 必须炸出来，而不是静默少测。
 function Get-RustItem {
     param(
         [Parameter(Mandatory)][string]$Text,
         [Parameter(Mandatory)][string]$Masked,
-        [Parameter(Mandatory)][ValidateSet('fn', 'const', 'struct', 'static', 'type')][string]$Kind,
+        [Parameter(Mandatory)][ValidateSet('fn', 'const', 'struct', 'enum', 'static', 'type')][string]$Kind,
         [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)][string]$SourceName
     )
@@ -123,6 +123,7 @@ function Get-RustItem {
         'const'  { "(?m)^${vis}const\s+$Name\b" }
         'static' { "(?m)^${vis}static\s+$Name\b" }
         'struct' { "(?m)^${vis}struct\s+$Name\b" }
+        'enum'   { "(?m)^${vis}enum\s+$Name\b" }
         'type'   { "(?m)^${vis}type\s+$Name\b" }
     }
 
