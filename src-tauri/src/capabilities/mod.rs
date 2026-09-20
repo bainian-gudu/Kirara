@@ -1,7 +1,7 @@
 //! kachina-installer 的 H3（基于 QUIC 的 HTTP/3）能力管理。
 //!
 //! 此模块提供：
-//! - `init()`：启动时检查 H3 是否可用（Win11+、无代理、MsQuic 正常）
+//! - `init()`：启动时检查 H3 是否可用（Win11+、无代理、QUIC 客户端配置可用）
 //! - `is_h3_available()` / `disable_h3()`：运行时 H3 状态管理
 //! - `DynamicUaMiddleware`：注入 User-Agent，并在 H3 可用时加入 h3/enabled
 //! - `H3FallbackMiddleware`：拦截 http3:// URL，并在失败时回退
@@ -49,9 +49,10 @@ pub fn init() -> bool {
 }
 
 fn probe_h3_support() -> bool {
-    // 1. Win11+ 检查 (MsQuic QUIC 使用 Schannel requires 构建 >= 22000)
-    let (major, minor, build) = nt_version::get();
-    let build_num = build & 0xffff;
+    // 1. Win11+ 检查。上游的 msquic + Schannel 组合要求构建号 >= 22000；换成
+    //    quinn + rustls 之后这个技术限制已经不存在（QUIC 与加密都在进程内完成），
+    //    但这里刻意保留原判定：H3 的启用范围属于对外行为，不该跟着依赖替换一起变。
+    let (major, minor, build_num) = crate::utils::os_version::get();
     if !(major == 10 && minor == 0 && build_num >= 22000) {
         tracing::info!(
             "[H3] Not Win11 (build={}, need 22000+), disabled",
@@ -66,15 +67,14 @@ fn probe_h3_support() -> bool {
         return false;
     }
 
-    // 3. MsQuic availability 探测 — 创建 Registration 到 验证 DLL + Schannel
-    use h3_msquic_async::msquic_async::msquic;
-    match msquic::Registration::new(&msquic::RegistrationConfig::default()) {
-        Ok(_reg) => {
+    // 3. QUIC 客户端配置探测 — 验证加密提供者 + 系统证书验证器能就绪
+    match h3::probe() {
+        Ok(()) => {
             tracing::info!("[H3] Probe succeeded, enabled");
             true
         }
         Err(e) => {
-            tracing::info!("[H3] Probe failed: {:?}, disabled", e);
+            tracing::info!("[H3] Probe failed: {:#}, disabled", e);
             false
         }
     }
@@ -127,7 +127,7 @@ impl Middleware for DynamicUaMiddleware {
 
 /// 生成 User-Agent 字符串，并按需附加 h3/enabled 后缀。
 pub fn ua_string() -> String {
-    let (major, minor, build) = nt_version::get();
+    let (major, minor, build) = crate::utils::os_version::get();
     let cpu_cores = num_cpus::get();
     let wv2ver = tauri::webview_version().unwrap_or_else(|_| "Unknown".to_string());
 

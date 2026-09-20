@@ -33,9 +33,13 @@ pwsh build.ps1            # 源码 → tools\kirara-builder.exe
 pwsh build.ps1 -Force     # 忽略「产物比源码新」的判断，强制重建
 ```
 
-需要 Rust nightly（含 `rust-src`，上游用 `-Z build-std`）、Node.js 20+、pnpm 10、
-PowerShell 7 与 Windows MSVC / VS Build Tools；`build.ps1` 会检查工具链并安装
-Rust 工具链与 `rust-src`，其余缺什么就报什么。
+需要 Rust nightly、Node.js 20+、pnpm 10、PowerShell 7 与 Windows MSVC / VS Build Tools；
+`build.ps1` 会检查工具链并安装 Rust 工具链，其余缺什么就报什么。
+
+目标三元组是标准的 `x86_64-pc-windows-msvc`：本仓库只服务 HoYoEnhance，兼容范围与宿主
+一致（64 位 Windows 10 1607+ / Windows 11），因此不再使用上游的
+`x86_64-win7-windows-msvc` 自定义目标（tier-3，rustup 没有预编译标准库），
+`rust-src` 与 `-Z build-std` 也随之删除。
 
 产物 `tools\kirara-builder.exe` 是「打包器 CLI + 安装器 GUI 模板」的二进制拼接体，
 供下游按 `pack` / `gen` 子命令调用。
@@ -62,10 +66,13 @@ pwsh tools/devcheck/devcheck.ps1 -Fix         # 只对我们维护的两个 .rs 
 | 工作流 | 触发 | 做什么 |
 | --- | --- | --- |
 | **Devcheck**（`.github/workflows/devcheck.yml`） | push 到 main、任何 PR、手动 | `vendor` 层 → `all` → `-SelfTest`（ubuntu + windows 双 runner） |
-| **Build**（`.github/workflows/build.yml`） | push / PR / 手动；tag 触发 Release | 从源码构建 `kirara-builder.exe` → 跑安装 / 更新行为测试 → tag 时把产物挂到 Release |
+| **Build**（`.github/workflows/build.yml`） | push / PR / 手动；tag 触发 Release | 从源码构建 `kirara-builder.exe` → 跑安装 / 更新 / 卸载行为测试与 Rust 单元测试 → tag 时把产物挂到 Release |
 
 `Build` 的 `test` job 会拿刚构建出的 builder 在 runner 上真装一次、真升一次
-（`offline-install` / `online-install` / `offline-update` / `online-update` 四组）。
+（`offline-install` / `online-install` / `offline-update` / `online-update` /
+`already-latest` / `uninstall` / `userdata-ignore` / `occupied-process` /
+`builder-extract-replace` 九组）；`unit-test` job 另跑
+`cargo test --bin kachina-builder --locked`（哈希、PE 识别、抽取路径安全阀）。
 上游同款流程里有一处 Sentry 上传步骤，本仓库没有（遥测已移除）。
 
 ## 日志里哪些告警是正常的
@@ -73,7 +80,7 @@ pwsh tools/devcheck/devcheck.ps1 -Fix         # 只对我们维护的两个 .rs 
 | 字样 | 来源 |
 | --- | --- |
 | `warning: the following packages contain code that will be rejected by a future version of Rust: russh v0.54.5` | 上游依赖的 future-incompat 提示，升级 `russh` 才会消失 |
-| `Could Not Find ...\target\x86_64-win7-windows-msvc\release\kachina-builder...` | tauri CLI 自己探测产物路径的输出；产物落在不带三元组的 `target\release\`，`build.ps1` 有兜底分支 |
+| `Could Not Find ...\target\x86_64-pc-windows-msvc\release\kachina-builder...` | tauri CLI 自己探测产物路径的输出；产物落在不带三元组的 `target\release\`，`build.ps1` 有兜底分支 |
 | `NODE_NO_WARNINGS` 静音掉的 `DEP0040` / `DEP0169` | `actions/setup-node` 等 action 自己依赖的旧 API 告警，与本仓库无关 |
 
 ## workflow 里那些看着多余的设置
@@ -82,8 +89,10 @@ pwsh tools/devcheck/devcheck.ps1 -Fix         # 只对我们维护的两个 .rs 
 
 | 设置 | 为什么 |
 | --- | --- |
-| `RUST_TOOLCHAIN: nightly` + `-Z build-std` | 上游的构建方式，stable 工具链编不过 |
-| `CMAKE_GENERATOR: Ninja` + `Enable Windows long paths` | `seera-msquic` 的静态构建会在极深路径下写 `.tlog`，超过 Windows 260 字符上限时 MSBuild 报 `error FTK1011`。Ninja 不写 `.tlog`，长路径是第二道防线。**副作用**：Ninja 不会自己去 VS 安装目录找 `cl.exe`，必须先跑 `tools/ci/Import-DevCmd.ps1` 注入 `PATH` / `INCLUDE` / `LIB` |
+| `RUST_TOOLCHAIN: nightly` | `Cargo.toml` 里的 `trim-paths` 与 `profile.rustflags` 仍是 nightly 专属特性，stable 编不过；标准目标不需要 `-Z build-std` |
+| `CARGO_PROFILE_RELEASE_DEBUG: "false"` | CI 编出的 PDB 既不进 Release 也不上传 artifact，关掉只省编译时间（本地构建不受影响） |
+| `CMAKE_BUILD_PARALLEL_LEVEL`（`build.ps1` 里按本机核数设置） | 依赖里仍有 crate 用 cmake 编 C 源码（russh 的加密后端 `aws-lc-sys`），按本机核数给它一个明确的并行度，省得退回串行编译 |
+| `CMAKE_GENERATOR: Ninja` + `Enable Windows long paths` | 让 cmake 走 Ninja：不写 MSBuild 的 `.tlog`，也不会被 Windows 260 字符路径上限卡住。**副作用**：Ninja 不会自己去 VS 安装目录找 `cl.exe`，必须先跑 `tools/ci/Import-DevCmd.ps1` 注入 `PATH` / `INCLUDE` / `LIB` |
 | `tools/ci/Import-DevCmd.ps1` | 按 `ProgramFiles` / `ProgramFiles(x86)` 枚举 `vcvarsall.bat`，用 `Start-Process` 跑一次子 cmd 拿全量环境变量，结果写进 `$GITHUB_ENV`；不依赖任何 Node 运行时，所以不会产生 action 弃用告警 |
 | `NODE_NO_WARNINGS: "1"` | 压掉第三方 action 自己的 Node 弃用告警 |
 | `.gitattributes`（`* text=auto eol=lf`） | windows-latest 的 git 默认 `core.autocrlf=true`，检出成 CRLF 后 `prettier --check` 在 Windows 上必挂 |

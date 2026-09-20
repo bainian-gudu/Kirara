@@ -1,10 +1,13 @@
 import crypto from 'crypto';
+import { spawn } from 'child_process';
 import fs from 'fs-extra';
 import path from 'path';
 import os from 'os';
 
 export const dev = !!process.env.DEV;
 export const FLAGS = dev ? '-I' : '-S';
+// NSIS 风格的斜杠开关：这条别名路径也要端到端覆盖
+export const FLAGS_SLASH = dev ? '-I' : '/S';
 
 export function getTestDir(name) {
   return path.join(os.tmpdir(), `kachina-test-${name}-${Date.now()}`);
@@ -141,7 +144,7 @@ export async function waitForServer(url, maxAttempts = 10, interval = 1000) {
 }
 
 export async function printLogFileIfExists() {
-  const logFile = path.join(os.tmpdir(), 'KachinaInstaller.log');
+  const logFile = getLogFilePath();
   if (await fs.pathExists(logFile)) {
     console.log(chalk.yellow('\n=== Installer Log File Contents ==='));
     const logs = await fs.readFile(logFile, 'utf-8');
@@ -150,4 +153,88 @@ export async function printLogFileIfExists() {
   } else {
     console.log(chalk.yellow('Log file not found at: ' + logFile));
   }
+}
+
+export function getLogFilePath() {
+  return path.join(os.tmpdir(), 'KachinaInstaller.log');
+}
+
+export async function clearLogFile() {
+  const logFile = getLogFilePath();
+  if (await fs.pathExists(logFile)) {
+    await fs.remove(logFile);
+  }
+}
+
+/// 跑一次安装器：带超时，超时后把日志打出来再抛（否则 CI 上只剩一句 timed out）
+export async function runInstaller(exe, args, label, timeout = '3m') {
+  const { $, usePwsh } = await import('zx');
+  usePwsh();
+  try {
+    return await $`& ${exe} ${args}`.timeout(timeout);
+  } catch (error) {
+    if (error.message && error.message.includes('timed out')) {
+      console.error(chalk.red(`${label} timed out after ${timeout}`));
+      await printLogFileIfExists();
+    }
+    throw error;
+  }
+}
+
+export function spawnInstaller(exe, args) {
+  return spawn(exe, args, {
+    windowsHide: true,
+    stdio: 'ignore',
+  });
+}
+
+export function waitForProcess(child, timeout = 180000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(
+        new Error(`Process ${child.pid ?? '<unknown>'} did not exit in time`),
+      );
+    }, timeout);
+    child.once('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once('exit', (code, signal) => {
+      clearTimeout(timer);
+      resolve({ exitCode: code, signal });
+    });
+  });
+}
+
+export function assertExitOk(result, label) {
+  if (result.exitCode !== 0) {
+    throw new Error(`${label} failed with exit code ${result.exitCode}`);
+  }
+}
+
+export async function assertNoInstallerError() {
+  const logFile = getLogFilePath();
+  if (!(await fs.pathExists(logFile))) {
+    return;
+  }
+  const logs = await fs.readFile(logFile, 'utf-8');
+  console.log(logs);
+  if (logs.includes('ERROR kachina_installer::installer')) {
+    throw new Error('Installer log contains errors');
+  }
+}
+
+export function reportVerification(name, verification, extraFailed = []) {
+  const failed = [...verification.failed, ...extraFailed];
+  if (failed.length === 0) {
+    console.log(chalk.green(`✓ ${name}`));
+    if (verification.passed?.length) {
+      console.log(chalk.gray(`  Verified: ${verification.passed.join(', ')}`));
+    }
+    return;
+  }
+  console.error(chalk.red(`✗ ${name} failed:`));
+  failed.forEach((msg) => console.error(chalk.red(`  - ${msg}`)));
+  process.exit(1);
 }

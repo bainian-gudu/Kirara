@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tauri dev --exit-on-panic",
-    "build": "cross-env STATIC_VCRUNTIME=false tauri build -- --target x86_64-win7-windows-msvc -Z build-std=std,panic_abort -Z build-std-features=\"optimize_for_size\" && cd src-tauri/target/x86_64-win7-windows-msvc/release && ren kachina-builder.exe kachina-builder-standalone.exe && del kachina-builder.exe && copy /b kachina-builder-standalone.exe+kachina-installer.exe kachina-builder.exe",
+    "build": "cross-env STATIC_VCRUNTIME=false tauri build -- --target x86_64-pc-windows-msvc && cd src-tauri/target/x86_64-pc-windows-msvc/release && ren kachina-builder.exe kachina-builder-standalone.exe && del kachina-builder.exe && copy /b kachina-builder-standalone.exe+kachina-installer.exe kachina-builder.exe",
     "debug": "tauri build --debug && pnpm dev:uac",
     "preview": "rsbuild preview",
     "tauri": "tauri",
@@ -14,7 +14,12 @@
     "test:online-install": "cd tests && node online-install.mjs",
     "test:offline-update": "cd tests && node offline-update.mjs",
     "test:online-update": "cd tests && node online-update.mjs",
-    "test:all": "npm run test:prepare && npm run test:offline-install && npm run test:online-install && npm run test:offline-update && npm run test:online-update"
+    "test:already-latest": "cd tests && node already-latest.mjs",
+    "test:uninstall": "cd tests && node uninstall.mjs",
+    "test:userdata-ignore": "cd tests && node userdata-ignore.mjs",
+    "test:occupied-process": "cd tests && node occupied-process.mjs",
+    "test:builder-extract-replace": "cd tests && node builder-extract-replace.mjs",
+    "test:all": "npm run test:prepare && npm run test:offline-install && npm run test:online-install && npm run test:offline-update && npm run test:online-update && npm run test:already-latest && npm run test:uninstall && npm run test:userdata-ignore && npm run test:occupied-process && npm run test:builder-extract-replace"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.5.0",

@@ -1,7 +1,11 @@
 use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
-use crate::{cli::PackArgs, local::get_reader_for_bundle, utils::metadata::RepoMetadata};
+use crate::{
+    cli::PackArgs,
+    local::{get_reader_for_bundle, preferred_file_hash},
+    utils::metadata::RepoMetadata,
+};
 
 /// 把 `agreementFile` 指向的协议正文内联进打包配置（写成 `agreement.content`），
 /// 安装器界面点击「用户协议」即可弹窗显示完整内容，无需联网或额外文件。
@@ -84,7 +88,8 @@ pub async fn pack_cli(args: PackArgs) {
     let reader = get_reader_for_bundle().await;
     if reader.is_err() {
         eprintln!("Failed to get reader: {:?}", reader.err());
-        return;
+        // 打包失败必须是失败退出：调用方（脚本 / CI）靠退出码判断有没有产物
+        std::process::exit(1);
     }
     let reader = reader.unwrap();
     let config = tokio::fs::read(&args.config).await;
@@ -151,11 +156,7 @@ pub async fn pack_cli(args: PackArgs) {
         if let Some(metadata) = metadata.as_ref() {
             if let Some(hashed) = metadata.hashed.as_ref() {
                 for file in hashed.iter() {
-                    let hash = if file.md5.is_some() {
-                        file.md5.as_ref().unwrap()
-                    } else if file.xxh.is_some() {
-                        file.xxh.as_ref().unwrap()
-                    } else {
+                    let Some(hash) = preferred_file_hash(&file.md5, &file.xxh) else {
                         eprintln!("No hash found for file: {:?}", file.file_name);
                         return;
                     };
@@ -179,19 +180,12 @@ pub async fn pack_cli(args: PackArgs) {
             }
             if let Some(patches) = metadata.patches.as_ref() {
                 for patch in patches.iter() {
-                    let from_hash = if patch.from.md5.is_some() {
-                        patch.from.md5.as_ref().unwrap()
-                    } else if patch.from.xxh.is_some() {
-                        patch.from.xxh.as_ref().unwrap()
-                    } else {
+                    let Some(from_hash) = preferred_file_hash(&patch.from.md5, &patch.from.xxh)
+                    else {
                         eprintln!("No hash found for patch: {:?}", patch.file_name);
                         return;
                     };
-                    let to_hash = if patch.to.md5.is_some() {
-                        patch.to.md5.as_ref().unwrap()
-                    } else if patch.to.xxh.is_some() {
-                        patch.to.xxh.as_ref().unwrap()
-                    } else {
+                    let Some(to_hash) = preferred_file_hash(&patch.to.md5, &patch.to.xxh) else {
                         eprintln!("No hash found for patch: {:?}", patch.file_name);
                         return;
                     };
@@ -263,16 +257,30 @@ pub async fn pack(
     mut config: PackConfig,
 ) {
     println!("Generating exe with version info...");
-    // 将基础内容写入临时文件
-    let tmppath = std::env::temp_dir().join("kachina_installer_tmp.exe");
-    let mut tmpfile = tokio::fs::File::create(tmppath.clone()).await.unwrap();
+    // 将基础内容写入临时文件。文件名带进程号 + UUID：固定名字在并发打包
+    // （同机跑多个 builder、CI 上多 job 共用 TEMP）时会互相踩，且上一次崩溃
+    // 留下的半截文件会被这次直接读走。
+    let tmppath = std::env::temp_dir().join(format!(
+        "kachina_installer_tmp_{}_{}.exe",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let mut tmpfile = tokio::fs::File::create(&tmppath).await.unwrap();
     tokio::io::copy(&mut base, &mut tmpfile).await.unwrap();
-    // 关闭临时文件
+    // 关闭前先落盘：rcedit 是另一个进程内的实现，靠文件内容读，不能只看缓冲
+    tmpfile.sync_all().await.unwrap();
     tmpfile.shutdown().await.unwrap();
     drop(tmpfile);
+    let tmp_len = tokio::fs::metadata(&tmppath).await.unwrap().len();
     // 打开资源文件
     let mut updater = rcedit::ResourceUpdater::new();
-    updater.load(&tmppath).unwrap();
+    if let Err(e) = updater.load(&tmppath) {
+        panic!(
+            "rcedit load {} ({} bytes): {e:?}",
+            tmppath.display(),
+            tmp_len
+        );
+    }
     let unwrapped_config = config.config.as_object().unwrap();
     let title = unwrapped_config
         .get("windowTitle")
@@ -311,11 +319,12 @@ pub async fn pack(
     // 删除临时文件
     tokio::fs::remove_file(tmppath).await.unwrap();
 
-    // 先克隆 packing_info 用于排序
+    // 先克隆 packing_info 用于排序；空表时不参与分类（下面按 [0]..[4] 打印会越界）
     let packing_info_clone = config
         .metadata
         .as_ref()
-        .and_then(|m| m.packing_info.clone());
+        .and_then(|m| m.packing_info.clone())
+        .filter(|p| !p.is_empty());
 
     let metadata_bytes = if let Some(mut metadata) = config.metadata {
         println!("Writing metadata...");

@@ -1,21 +1,29 @@
+//! H3（HTTP/3 over QUIC）客户端中间件。
+//!
+//! 传输层是 `quinn` + `rustls`，替换掉上游的 `h3-msquic-async` +
+//! `xytoki/msquic-async-rs` fork + 静态 `seera-msquic`
+//! （理由、影响与回退方式见 ../../LOCAL_PATCHES.md 第 15 节）。
+//!
+//! 对外行为保持不变：
+//! - 连接按 `(host, port, 固定配置)` 复用，空闲 / 已死连接会被清扫，池子上限 32
+//! - 证书固定语义不变，见 [`PinningMode`] / [`PinTarget`]
+//! - URL 片段里没有固定值时只做系统证书验证
+//! - [`H3Middleware::discover`] 接受任意证书并回传算出来的哈希
+
 use async_trait::async_trait;
 use bytes::{Buf, Bytes};
 use futures::future::poll_fn;
-use h3_msquic_async::msquic;
-use h3_msquic_async::msquic_async;
 use reqwest_middleware::{Middleware, Next};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, SignatureScheme};
 use std::collections::HashMap;
-use std::mem::ManuallyDrop;
-use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
-
-// 为方便用户重新导出
-pub use h3_msquic_async::msquic_async::{CertValidator, PeerCertInfo};
 
 // ============================================================
 // 固定模式与配置
@@ -25,9 +33,9 @@ pub use h3_msquic_async::msquic_async::{CertValidator, PeerCertInfo};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PinningMode {
     /// 无论系统是否信任证书，始终检查固定值（默认）。
-    /// 即使 Schannel 信任该证书，固定值也必须匹配。
+    /// 即使系统验证通过，固定值也必须匹配。
     Force,
-    /// 仅在系统（Schannel）不信任证书时检查固定值。
+    /// 仅在系统不信任证书时检查固定值。
     /// 系统信任证书时直接接受，不检查固定值。
     Add,
 }
@@ -50,250 +58,308 @@ pub struct PinConfig {
 }
 
 // ============================================================
-// 基于 Windows CryptoAPI 的固定校验器
+// 证书哈希：极简 DER 定位 + SHA-256
 // ============================================================
 
-#[cfg(target_os = "windows")]
-mod win_pin {
-    use super::*;
-    use std::ffi::c_void;
-    use tracing::info;
-    use windows::Win32::Security::Cryptography::*;
+/// SHA-256。
+fn sha256(data: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
 
-    /// 根据 PCCERT_CONTEXT 指针，计算 SubjectPublicKeyInfo（SPKI）
-    /// DER 编码的 SHA-256 哈希；任何步骤失败均返回 None。
-    ///
-    /// # 安全要求
-    /// `certificate` 必须是有效的 PCCERT_CONTEXT 指针，且只能在
-    /// MsQuic 的 PeerCertificateReceived 回调期间调用（受指针生命周期限制）。
-    unsafe fn compute_spki_hash(certificate: *mut c_void) -> Option<[u8; 32]> {
-        if certificate.is_null() {
-            return None;
-        }
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher.finalize().into()
+}
 
-        // 转换为 windows crate 的 CERT_CONTEXT（布局和对齐均正确）
-        let cert_ctx = &*(certificate as *const CERT_CONTEXT);
+/// 从 X.509 证书的 DER 里取出 SubjectPublicKeyInfo 的**整段** DER（含 tag 与长度）。
+///
+/// 上游走 Windows CryptoAPI：`CryptEncodeObjectEx(X509_PUBLIC_KEY_INFO)` 把 Schannel
+/// 解析出来的公钥重新编码一遍。这里改为在原始 DER 上直接定位同一段 —— 对同一张证书
+/// 两者字节相同，所以 `openssl x509 -pubkey -noout | openssl pkey -pubin -outform DER
+/// | sha256sum` 的结果仍然可以直接当固定值用。
+///
+/// 只走 `Certificate → TBSCertificate → 第 7 个字段` 这条路径，不做任何猜测：
+/// 长度越界、不定长编码（DER 不允许）、tag 不对，一律返回 None。
+fn extract_spki_der(cert_der: &[u8]) -> Option<&[u8]> {
+    /// 读一个 TLV，返回 (tag, value, 整段 TLV)，并把游标推到下一个 TLV。
+    fn read_tlv<'a>(buf: &'a [u8], pos: &mut usize) -> Option<(u8, &'a [u8], &'a [u8])> {
+        let start = *pos;
+        let tag = *buf.get(start)?;
+        let first_len = *buf.get(start + 1)?;
+        let mut cursor = start + 2;
 
-        // pCertInfo 是 PCERT_INFO，已由 Schannel 解析，始终有效
-        // 在回调期间
-        let cert_info = cert_ctx.pCertInfo;
-        if cert_info.is_null() {
-            return None;
-        }
-        let spki = &(*cert_info).SubjectPublicKeyInfo;
+        let len = if first_len & 0x80 == 0 {
+            first_len as usize
+        } else {
+            let n = (first_len & 0x7f) as usize;
+            // 0x80 是不定长（DER 不允许）；证书长度不会超过 4 字节。
+            if n == 0 || n > 4 {
+                return None;
+            }
+            let mut value = 0usize;
+            for _ in 0..n {
+                value = (value << 8) | *buf.get(cursor)? as usize;
+                cursor += 1;
+            }
+            value
+        };
 
-        // 对 SubjectPublicKeyInfo 进行 DER 编码
-        let mut spki_der_size: u32 = 0;
-        if CryptEncodeObjectEx(
-            X509_ASN_ENCODING,
-            X509_PUBLIC_KEY_INFO,
-            spki as *const _ as *const c_void,
-            CRYPT_ENCODE_OBJECT_FLAGS(0),
-            None,
-            None,
-            &mut spki_der_size,
-        )
-        .is_err()
-        {
-            debug!("[Pin] CryptEncodeObjectEx size query failed");
-            return None;
-        }
-
-        let mut spki_der = vec![0u8; spki_der_size as usize];
-        if CryptEncodeObjectEx(
-            X509_ASN_ENCODING,
-            X509_PUBLIC_KEY_INFO,
-            spki as *const _ as *const c_void,
-            CRYPT_ENCODE_OBJECT_FLAGS(0),
-            None,
-            Some(spki_der.as_mut_ptr() as *mut c_void),
-            &mut spki_der_size,
-        )
-        .is_err()
-        {
-            debug!("[Pin] CryptEncodeObjectEx encode failed");
-            return None;
-        }
-        spki_der.truncate(spki_der_size as usize);
-
-        // 通过 CNG 计算 SHA-256 哈希（BCRYPT_SHA256_ALG_HANDLE 是预分配的伪句柄）
-        let mut hash = [0u8; 32];
-        if BCryptHash(BCRYPT_SHA256_ALG_HANDLE, None, &spki_der, &mut hash).is_err() {
-            debug!("[Pin] BCryptHash (SPKI) failed");
-            return None;
-        }
-
-        Some(hash)
+        let end = cursor.checked_add(len)?;
+        let full = buf.get(start..end)?;
+        *pos = end;
+        Some((tag, buf.get(cursor..end)?, full))
     }
 
-    /// 计算完整证书 DER 编码的 SHA-256 哈希，
-    /// 输入为 PCCERT_CONTEXT 指针。
-    ///
-    /// 等价于以下命令：
-    ///   openssl x509 -in cert.crt -outform DER | openssl dgst -sha256 -binary | xxd -p -c 32
-    ///
-    /// # 安全要求
-    /// 与 `compute_spki_hash` 相同。
-    unsafe fn compute_cert_hash(certificate: *mut c_void) -> Option<[u8; 32]> {
-        if certificate.is_null() {
-            return None;
-        }
-
-        let cert_ctx = &*(certificate as *const CERT_CONTEXT);
-
-        // pbCertEncoded 与 cbCertEncoded 指定完整证书的 DER 编码
-        if cert_ctx.pbCertEncoded.is_null() || cert_ctx.cbCertEncoded == 0 {
-            return None;
-        }
-        let der =
-            std::slice::from_raw_parts(cert_ctx.pbCertEncoded, cert_ctx.cbCertEncoded as usize);
-
-        let mut hash = [0u8; 32];
-        if BCryptHash(BCRYPT_SHA256_ALG_HANDLE, None, der, &mut hash).is_err() {
-            debug!("[Pin] BCryptHash (cert) failed");
-            return None;
-        }
-
-        Some(hash)
+    let mut pos = 0;
+    let (cert_tag, cert_body, _) = read_tlv(cert_der, &mut pos)?;
+    if cert_tag != 0x30 {
+        return None;
     }
 
-    /// 根据 PinTarget 选择目标，对证书执行固定值校验。
-    fn check_pin(info: &PeerCertInfo, config: &PinConfig) -> bool {
-        let system_trusts = info.deferred_status.is_ok();
+    let mut pos = 0;
+    let (tbs_tag, tbs_body, _) = read_tlv(cert_body, &mut pos)?;
+    if tbs_tag != 0x30 {
+        return None;
+    }
 
-        match config.mode {
-            PinningMode::Add if system_trusts => {
-                debug!("[Pin] mode=add, system trusts, accepting");
-                return true;
-            }
-            PinningMode::Add => {
-                debug!(
-                    "[Pin] mode=add, system rejects (status={:#x}), checking pin...",
-                    info.deferred_status.0
-                );
-            }
-            PinningMode::Force => {
-                debug!(
-                    "[Pin] mode=force, system_trusts={}, checking pin...",
-                    system_trusts
-                );
-            }
+    // TBSCertificate ::= SEQUENCE {
+    //     version [0] EXPLICIT Version DEFAULT v1,   -- 可选
+    //     serialNumber, signature, issuer, validity, subject,
+    //     subjectPublicKeyInfo, ... }
+    let mut pos = 0;
+    let (first_tag, _first_value, _first_full) = read_tlv(tbs_body, &mut pos)?;
+    // 读到 version 就还剩 5 个字段，否则刚读到的就是 serialNumber。
+    let remaining = if first_tag == 0xa0 { 5 } else { 4 };
+    for _ in 0..remaining {
+        read_tlv(tbs_body, &mut pos)?;
+    }
+
+    let (spki_tag, _spki_value, spki_full) = read_tlv(tbs_body, &mut pos)?;
+    if spki_tag != 0x30 {
+        return None;
+    }
+    Some(spki_full)
+}
+
+/// 计算证书 SPKI 的 SHA-256；DER 结构不认识时返回 None。
+fn compute_spki_hash(cert_der: &[u8]) -> Option<[u8; 32]> {
+    extract_spki_der(cert_der).map(sha256)
+}
+
+/// 计算整张证书 DER 的 SHA-256。
+fn compute_cert_hash(cert_der: &[u8]) -> [u8; 32] {
+    sha256(cert_der)
+}
+
+// ============================================================
+// 证书验证器：系统验证（+ 可选的固定值校验）
+// ============================================================
+
+/// 从服务器证书中发现的哈希值。
+#[derive(Debug, Clone, Default)]
+pub struct DiscoveredHashes {
+    pub spki: Option<[u8; 32]>,
+    pub cert: Option<[u8; 32]>,
+}
+
+/// 证书验证的四种形态。
+enum VerifyMode {
+    /// 只用系统证书验证器（URL 片段里没给固定值）。
+    SystemOnly,
+    /// 系统验证 + 固定值校验，关系由 [`PinningMode`] 决定。
+    Pin(PinConfig),
+    /// 发现模式：接受任何证书，把算出来的哈希写进这里（`discover()` 用）。
+    Discovery(Arc<Mutex<DiscoveredHashes>>),
+    /// 构造基础配置时的占位：什么证书都不接受。
+    /// 真实连接都会把验证器换成上面三种之一，这个形态不会走到握手。
+    RejectAll,
+}
+
+/// 包一层系统证书验证器（Windows 上是 CryptoAPI 证书链验证，等价于上游的 Schannel），
+/// 再按 [`VerifyMode`] 决定要不要额外比对固定值。
+struct PinVerifier {
+    inner: Arc<rustls_platform_verifier::Verifier>,
+    mode: VerifyMode,
+}
+
+impl std::fmt::Debug for PinVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PinVerifier")
+            .field("mode", &self.mode_name())
+            .finish()
+    }
+}
+
+impl PinVerifier {
+    fn new(inner: Arc<rustls_platform_verifier::Verifier>, mode: VerifyMode) -> Self {
+        Self { inner, mode }
+    }
+
+    fn mode_name(&self) -> &'static str {
+        match self.mode {
+            VerifyMode::SystemOnly => "system",
+            VerifyMode::Pin(_) => "pin",
+            VerifyMode::Discovery(_) => "discovery",
+            VerifyMode::RejectAll => "reject-all",
         }
+    }
 
+    /// 系统是否信任这张证书（等价于上游的 `deferred_status.is_ok()`）。
+    fn system_trusts(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> bool {
+        self.inner
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+            .is_ok()
+    }
+
+    /// 比对固定值：命中返回断言，不命中返回证书错误。
+    fn check_pin(
+        &self,
+        config: &PinConfig,
+        cert_der: &[u8],
+    ) -> Result<ServerCertVerified, rustls::Error> {
         match &config.target {
-            PinTarget::Spki(expected) => {
-                let hash = unsafe { compute_spki_hash(info.certificate) };
-                match hash {
-                    Some(h) if h == *expected => {
-                        debug!("[Pin] SPKI pin MATCHED");
-                        true
-                    }
-                    Some(h) => {
-                        warn!(
-                            "[Pin] SPKI pin MISMATCH! expected={}, got={}",
-                            hex::encode(expected),
-                            hex::encode(h)
-                        );
-                        false
-                    }
-                    None => {
-                        warn!("[Pin] Failed to compute SPKI hash, rejecting");
-                        false
-                    }
+            PinTarget::Spki(expected) => match compute_spki_hash(cert_der) {
+                Some(got) if got == *expected => {
+                    debug!("[Pin] SPKI pin MATCHED");
+                    Ok(ServerCertVerified::assertion())
                 }
-            }
+                Some(got) => {
+                    warn!(
+                        "[Pin] SPKI pin MISMATCH! expected={}, got={}",
+                        hex::encode(expected),
+                        hex::encode(got)
+                    );
+                    Err(pin_error("SPKI pin mismatch"))
+                }
+                None => {
+                    warn!("[Pin] Failed to parse SubjectPublicKeyInfo, rejecting");
+                    Err(pin_error("malformed certificate"))
+                }
+            },
             PinTarget::Cert(expected) => {
-                let hash = unsafe { compute_cert_hash(info.certificate) };
-                match hash {
-                    Some(h) if h == *expected => {
-                        debug!("[Pin] Cert pin MATCHED");
-                        true
-                    }
-                    Some(h) => {
-                        warn!(
-                            "[Pin] Cert pin MISMATCH! expected={}, got={}",
-                            hex::encode(expected),
-                            hex::encode(h)
-                        );
-                        false
-                    }
-                    None => {
-                        warn!("[Pin] Failed to compute cert hash, rejecting");
-                        false
-                    }
+                let got = compute_cert_hash(cert_der);
+                if got == *expected {
+                    debug!("[Pin] Cert pin MATCHED");
+                    Ok(ServerCertVerified::assertion())
+                } else {
+                    warn!(
+                        "[Pin] Cert pin MISMATCH! expected={}, got={}",
+                        hex::encode(expected),
+                        hex::encode(got)
+                    );
+                    Err(pin_error("certificate pin mismatch"))
                 }
             }
-        }
-    }
-
-    /// 使用 PinConfig（目标和模式）的 CertValidator。
-    pub struct PinValidator {
-        pub config: PinConfig,
-    }
-
-    impl CertValidator for PinValidator {
-        fn validate(&self, info: &PeerCertInfo) -> bool {
-            check_pin(info, &self.config)
-        }
-    }
-
-    /// 从服务器证书中发现的哈希值。
-    #[derive(Debug, Clone, Default)]
-    pub struct DiscoveredHashes {
-        pub spki: Option<[u8; 32]>,
-        pub cert: Option<[u8; 32]>,
-    }
-
-    /// 接受所有证书并捕获所计算哈希值的 CertValidator。
-    /// 用于发现服务器证书的 SPKI/完整证书哈希。
-    pub struct DiscoveryValidator {
-        pub results: std::sync::Arc<std::sync::Mutex<DiscoveredHashes>>,
-    }
-
-    impl DiscoveryValidator {
-        pub fn new() -> (Self, std::sync::Arc<std::sync::Mutex<DiscoveredHashes>>) {
-            let results = std::sync::Arc::new(std::sync::Mutex::new(DiscoveredHashes::default()));
-            (
-                Self {
-                    results: results.clone(),
-                },
-                results,
-            )
-        }
-    }
-
-    impl CertValidator for DiscoveryValidator {
-        fn validate(&self, info: &PeerCertInfo) -> bool {
-            let system_trusts = info.deferred_status.is_ok();
-            info!(
-                "[Discovery] system_trusts={}, deferred_status={:#x}, flags={:#x}",
-                system_trusts, info.deferred_status.0, info.deferred_error_flags
-            );
-
-            let spki = unsafe { compute_spki_hash(info.certificate) };
-            match spki {
-                Some(h) => info!("[Discovery] SPKI SHA-256: {}", hex::encode(h)),
-                None => warn!("[Discovery] Failed to compute SPKI hash"),
-            }
-
-            let cert = unsafe { compute_cert_hash(info.certificate) };
-            match cert {
-                Some(h) => info!("[Discovery] Cert SHA-256: {}", hex::encode(h)),
-                None => warn!("[Discovery] Failed to compute cert hash"),
-            }
-
-            if let Ok(mut results) = self.results.lock() {
-                results.spki = spki;
-                results.cert = cert;
-            }
-
-            true // 发现模式下仍然接受
         }
     }
 }
 
-#[cfg(target_os = "windows")]
-pub use win_pin::{DiscoveredHashes, DiscoveryValidator, PinValidator};
+/// 构造一个「证书不被接受」的 rustls 错误（与系统验证器的错误同一类型）。
+fn pin_error(message: &str) -> rustls::Error {
+    rustls::Error::InvalidCertificate(rustls::CertificateError::Other(rustls::OtherError(
+        Arc::from(Box::<dyn std::error::Error + Send + Sync>::from(
+            message.to_string(),
+        )),
+    )))
+}
+
+impl ServerCertVerifier for PinVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        match &self.mode {
+            VerifyMode::SystemOnly => self.inner.verify_server_cert(
+                end_entity,
+                intermediates,
+                server_name,
+                ocsp_response,
+                now,
+            ),
+            VerifyMode::Discovery(results) => {
+                let cert_der = end_entity.as_ref();
+                let spki = compute_spki_hash(cert_der);
+                let cert = compute_cert_hash(cert_der);
+                let system_trusts =
+                    self.system_trusts(end_entity, intermediates, server_name, ocsp_response, now);
+
+                match spki {
+                    Some(hash) => tracing::info!("[Discovery] SPKI SHA-256: {}", hex::encode(hash)),
+                    None => warn!("[Discovery] Failed to parse SubjectPublicKeyInfo"),
+                }
+                tracing::info!(
+                    "[Discovery] system_trusts={}, Cert SHA-256: {}",
+                    system_trusts,
+                    hex::encode(cert)
+                );
+
+                if let Ok(mut guard) = results.lock() {
+                    guard.spki = spki;
+                    guard.cert = Some(cert);
+                }
+
+                // 发现模式的目的就是拿到哈希：无论系统是否信任都接受。
+                Ok(ServerCertVerified::assertion())
+            }
+            VerifyMode::Pin(config) => {
+                let cert_der = end_entity.as_ref();
+                let system_trusts =
+                    self.system_trusts(end_entity, intermediates, server_name, ocsp_response, now);
+
+                match config.mode {
+                    PinningMode::Add if system_trusts => {
+                        debug!("[Pin] mode=add, system trusts, accepting");
+                        Ok(ServerCertVerified::assertion())
+                    }
+                    PinningMode::Add => {
+                        debug!("[Pin] mode=add, system rejects, checking pin...");
+                        self.check_pin(config, cert_der)
+                    }
+                    PinningMode::Force => {
+                        debug!(
+                            "[Pin] mode=force, system_trusts={}, checking pin...",
+                            system_trusts
+                        );
+                        self.check_pin(config, cert_der)
+                    }
+                }
+            }
+            VerifyMode::RejectAll => Err(pin_error("no certificate verifier for this connection")),
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
 
 // ============================================================
 // URL 片段解析器：#spki={hex}&cert={hex}&pinning_mode=force|add
@@ -350,35 +416,10 @@ fn parse_pin_from_fragment(url: &url::Url) -> Option<PinConfig> {
 }
 
 // ============================================================
-// 修复 1：缩小 SendWrapper 的适用范围，使用专用新类型替代泛型
+// 连接池
 // ============================================================
 
-#[repr(transparent)]
-struct QuicRegistration(msquic::Registration);
-unsafe impl Send for QuicRegistration {}
-unsafe impl Sync for QuicRegistration {}
-impl Deref for QuicRegistration {
-    type Target = msquic::Registration;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-#[repr(transparent)]
-struct QuicConfiguration(msquic::Configuration);
-unsafe impl Send for QuicConfiguration {}
-unsafe impl Sync for QuicConfiguration {}
-impl Deref for QuicConfiguration {
-    type Target = msquic::Configuration;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-// ============================================================
-// 修复 5：使用活动流守卫，避免连接被当作空闲连接移除
-// ============================================================
-
+/// 活动流守卫，避免连接被当作空闲连接移除。
 struct ActiveStreamGuard {
     counter: Arc<AtomicUsize>,
 }
@@ -389,11 +430,7 @@ impl Drop for ActiveStreamGuard {
     }
 }
 
-// ============================================================
-// 连接池条目
-// ============================================================
-
-pub type H3SendRequest = h3::client::SendRequest<h3_msquic_async::OpenStreams, Bytes>;
+pub type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
 
 /// 连接池中的最大连接数。
 const MAX_POOL_SIZE: usize = 32;
@@ -415,9 +452,33 @@ impl Drop for H3ConnEntry {
     }
 }
 
-// ============================================================
-// 修复 2：H3Inner 通过 Arc 共享状态，在响应体存活期间保持连接
-// ============================================================
+/// 按地址族各留一个 UDP 端点。
+///
+/// 不共用一个双栈 socket：`IPV6_V6ONLY` 的默认值各平台不一致，分开之后
+/// 「IPv4 目标用 IPv4 socket、IPv6 目标用 IPv6 socket」是确定的。
+#[derive(Default)]
+struct EndpointPool {
+    v4: Option<quinn::Endpoint>,
+    v6: Option<quinn::Endpoint>,
+}
+
+impl EndpointPool {
+    fn get(&mut self, ipv6: bool) -> anyhow::Result<quinn::Endpoint> {
+        let slot = if ipv6 { &mut self.v6 } else { &mut self.v4 };
+        if let Some(endpoint) = slot {
+            return Ok(endpoint.clone());
+        }
+
+        let bind: std::net::SocketAddr = if ipv6 {
+            "[::]:0".parse().expect("字面量地址")
+        } else {
+            "0.0.0.0:0".parse().expect("字面量地址")
+        };
+        let endpoint = quinn::Endpoint::client(bind)?;
+        *slot = Some(endpoint.clone());
+        Ok(endpoint)
+    }
+}
 
 type PoolKey = (String, u16, Option<PinConfig>);
 
@@ -433,10 +494,20 @@ fn normalize_host(host: &str) -> String {
     }
 }
 
+// ============================================================
+// 修复 2：H3Inner 通过 Arc 共享状态，在响应体存活期间保持连接
+// ============================================================
+
 struct H3Inner {
-    registration: ManuallyDrop<QuicRegistration>,
-    configuration: ManuallyDrop<QuicConfiguration>,
-    pool: std::sync::Mutex<HashMap<PoolKey, H3ConnEntry>>,
+    /// 系统证书验证器：Windows 上就是 CryptoAPI 证书链验证。
+    platform_verifier: Arc<rustls_platform_verifier::Verifier>,
+    /// 只带 ALPN=h3 的 TLS 1.3 配置模板；每个连接克隆一份再换掉验证器。
+    base_tls_config: rustls::ClientConfig,
+    /// QUIC 传输参数（空闲超时、并发流上限）。
+    transport: Arc<quinn::TransportConfig>,
+    /// 每个地址族一个 UDP 端点，懒创建。
+    endpoints: tokio::sync::Mutex<EndpointPool>,
+    pool: Mutex<HashMap<PoolKey, H3ConnEntry>>,
     idle_timeout: Duration,
 }
 
@@ -457,10 +528,6 @@ impl Drop for H3Inner {
         if let Ok(mut pool) = self.pool.lock() {
             pool.drain();
         }
-        unsafe {
-            ManuallyDrop::drop(&mut self.configuration);
-            ManuallyDrop::drop(&mut self.registration);
-        }
         debug!("[H3Inner] Dropped successfully");
     }
 }
@@ -473,31 +540,113 @@ pub struct H3Middleware {
     inner: Arc<H3Inner>,
 }
 
+/// 启动探测：构建一次完整的 QUIC 客户端配置。
+///
+/// 等价于上游「能不能建出 msquic Registration + Schannel 凭据」的那次探测：
+/// 这里验证 ring 加密提供者、系统证书验证器和 QUIC 参数是否都能就绪。
+/// 只建配置、不开 socket，代价可以忽略。
+pub fn probe() -> anyhow::Result<()> {
+    H3Middleware::new(Duration::from_secs(60)).map(|_| ())
+}
+
 impl H3Middleware {
     pub fn new(idle_timeout: Duration) -> anyhow::Result<Self> {
-        let registration = msquic::Registration::new(&msquic::RegistrationConfig::default())?;
+        // 显式指定 ring：本仓库的 rustls 同时开着 aws-lc-rs（russh 要的），
+        // 走 `ClientConfig::builder()` 会因为「默认提供者不唯一」直接 panic。
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let platform_verifier = Arc::new(rustls_platform_verifier::Verifier::new(Arc::clone(
+            &provider,
+        ))?);
 
-        let idle_ms = idle_timeout.as_millis().min(u64::MAX as u128) as u64;
+        let mut base_tls_config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinVerifier::new(
+                Arc::clone(&platform_verifier),
+                VerifyMode::RejectAll,
+            )))
+            .with_no_client_auth();
+        base_tls_config.alpn_protocols = vec![b"h3".to_vec()];
 
-        let alpn = [msquic::BufferRef::from("h3")];
-        let settings = msquic::Settings::new()
-            .set_IdleTimeoutMs(idle_ms)
-            .set_PeerBidiStreamCount(100)
-            .set_PeerUnidiStreamCount(100);
-
-        let configuration = msquic::Configuration::open(&registration, &alpn, Some(&settings))?;
-        let cred_config = msquic::CredentialConfig::new_client()
-            .set_credential_flags(msquic::CredentialFlags::INDICATE_CERTIFICATE_RECEIVED)
-            .set_credential_flags(msquic::CredentialFlags::DEFER_CERTIFICATE_VALIDATION);
-        configuration.load_credential(&cred_config)?;
+        let mut transport = quinn::TransportConfig::default();
+        transport
+            .max_idle_timeout(Some(quinn::IdleTimeout::try_from(idle_timeout)?))
+            .max_concurrent_bidi_streams(100u32.into())
+            .max_concurrent_uni_streams(100u32.into());
 
         Ok(Self {
             inner: Arc::new(H3Inner {
-                registration: ManuallyDrop::new(QuicRegistration(registration)),
-                configuration: ManuallyDrop::new(QuicConfiguration(configuration)),
-                pool: std::sync::Mutex::new(HashMap::new()),
+                platform_verifier,
+                base_tls_config,
+                transport: Arc::new(transport),
+                endpoints: tokio::sync::Mutex::new(EndpointPool::default()),
+                pool: Mutex::new(HashMap::new()),
                 idle_timeout,
             }),
+        })
+    }
+
+    /// 组装一个 quinn 客户端配置：克隆 TLS 模板、换掉证书验证器、挂上传输参数。
+    fn client_config(&self, mode: VerifyMode) -> anyhow::Result<quinn::ClientConfig> {
+        let mut tls_config = self.inner.base_tls_config.clone();
+        tls_config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(PinVerifier::new(
+                Arc::clone(&self.inner.platform_verifier),
+                mode,
+            )));
+
+        let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)?;
+        let mut config = quinn::ClientConfig::new(Arc::new(crypto));
+        config.transport_config(Arc::clone(&self.inner.transport));
+        Ok(config)
+    }
+
+    /// 建一条 QUIC 连接（DNS 解析 + 按地址族取端点 + 握手）。
+    async fn connect(
+        &self,
+        host: &str,
+        port: u16,
+        mode: VerifyMode,
+    ) -> Result<quinn::Connection, reqwest_middleware::Error> {
+        let resolved = tokio::net::lookup_host((host, port)).await.map_err(|e| {
+            warn!(host = %host, port, error = %e, "[H3] DNS lookup failed");
+            reqwest_middleware::Error::Middleware(anyhow::anyhow!("h3 dns: {e}"))
+        })?;
+        let addresses: Vec<std::net::SocketAddr> = resolved.collect();
+        // 优先 IPv4：绝大多数下载源都同时有 A / AAAA 记录，先用 A 记录能少一次
+        // 「IPv6 不通再退回来」的等待。
+        let addr = addresses
+            .iter()
+            .find(|addr| addr.is_ipv4())
+            .or_else(|| addresses.first())
+            .copied()
+            .ok_or_else(|| {
+                warn!(host = %host, port, "[H3] DNS returned no address");
+                reqwest_middleware::Error::Middleware(anyhow::anyhow!("h3 dns: no address"))
+            })?;
+
+        let endpoint = {
+            let mut endpoints = self.inner.endpoints.lock().await;
+            endpoints.get(addr.is_ipv6()).map_err(|e| {
+                warn!(error = %e, "[H3] Failed to open UDP endpoint");
+                reqwest_middleware::Error::Middleware(e)
+            })?
+        };
+
+        let config = self.client_config(mode).map_err(|e| {
+            warn!(host = %host, port, error = %e, "[H3] Client config failed");
+            reqwest_middleware::Error::Middleware(e)
+        })?;
+
+        let connecting = endpoint.connect_with(config, addr, host).map_err(|e| {
+            warn!(host = %host, port, error = %e, "[H3] connect_with failed");
+            reqwest_middleware::Error::Middleware(anyhow::anyhow!("h3 connect: {e}"))
+        })?;
+
+        connecting.await.map_err(|e| {
+            warn!(host = %host, port, error = %e, "[H3] QUIC handshake failed");
+            reqwest_middleware::Error::Middleware(anyhow::anyhow!("h3 handshake: {e}"))
         })
     }
 
@@ -589,30 +738,17 @@ impl H3Middleware {
         }
         // 已释放锁
 
-        // 根据 PinConfig 为每个请求创建 CertValidator
-        let cert_validator: Option<Arc<dyn CertValidator>> =
-            pin_config.map(|cfg| Arc::new(PinValidator { config: cfg }) as Arc<dyn CertValidator>);
+        let mode = match pin_config {
+            Some(config) => VerifyMode::Pin(config),
+            None => VerifyMode::SystemOnly,
+        };
 
         debug!(host = %norm_host, port, pin = ?pin_config, "[H3] Creating new QUIC connection");
-        let conn = msquic_async::Connection::new_with_cert_validator(
-            &self.inner.registration,
-            cert_validator,
-        )
-        .map_err(|e| {
-            warn!(host = %norm_host, port, error = %e, "[H3] Connection::new failed");
-            reqwest_middleware::Error::Middleware(e.into())
-        })?;
-
-        conn.start(&self.inner.configuration, host, port)
-            .await
-            .map_err(|e| {
-                warn!(host = %norm_host, port, error = %e, "[H3] Connection::start failed");
-                reqwest_middleware::Error::Middleware(e.into())
-            })?;
+        let conn = self.connect(&norm_host, port, mode).await?;
 
         debug!(host = %norm_host, port, "[H3] QUIC connection established");
 
-        let h3_conn = h3_msquic_async::Connection::new(conn);
+        let h3_conn = h3_quinn::Connection::new(conn);
         let (mut driver, send_request) = h3::client::new(h3_conn).await.map_err(|e| {
             warn!(host = %norm_host, port, error = %e, "[H3] h3 handshake failed");
             reqwest_middleware::Error::Middleware(anyhow::anyhow!("h3 handshake: {}", e))
@@ -811,31 +947,30 @@ impl H3Middleware {
     }
 
     /// 发现远程服务器证书的 SPKI 和完整证书 SHA-256 哈希。
-    /// 建立一次性 QUIC 连接，通过 DiscoveryValidator 提取哈希后关闭连接。
+    /// 建立一次性 QUIC 连接，通过发现模式的验证器提取哈希后关闭连接。
     pub async fn discover(
         &self,
         host: &str,
         port: u16,
     ) -> Result<DiscoveredHashes, reqwest_middleware::Error> {
-        let (validator, hashes) = DiscoveryValidator::new();
+        let results = Arc::new(Mutex::new(DiscoveredHashes::default()));
+        let norm_host = normalize_host(host);
 
-        let conn = msquic_async::Connection::new_with_cert_validator(
-            &self.inner.registration,
-            Some(Arc::new(validator) as Arc<dyn CertValidator>),
-        )
-        .map_err(|e| reqwest_middleware::Error::Middleware(e.into()))?;
+        let conn = self
+            .connect(
+                &norm_host,
+                port,
+                VerifyMode::Discovery(Arc::clone(&results)),
+            )
+            .await?;
 
-        conn.start(&self.inner.configuration, host, port)
-            .await
-            .map_err(|e| reqwest_middleware::Error::Middleware(e.into()))?;
-
-        // 执行最小 H3 握手，确保触发证书回调
-        let h3_conn = h3_msquic_async::Connection::new(conn);
+        // 执行最小 H3 握手，确保触发证书验证
+        let h3_conn = h3_quinn::Connection::new(conn);
         let (_driver, _send_request) = h3::client::new(h3_conn).await.map_err(|e| {
             reqwest_middleware::Error::Middleware(anyhow::anyhow!("h3 discover: {}", e))
         })?;
 
-        let result = hashes
+        let result = results
             .lock()
             .map_err(|_| reqwest_middleware::Error::Middleware(anyhow::anyhow!("mutex poisoned")))?
             .clone();

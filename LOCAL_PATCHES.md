@@ -26,6 +26,13 @@
 - [9. 下载与提权链路加固](#9-第三轮安全加固把下载后执行和提权管道两条链路一次收干净)
 - [10. 前端模块拆分与注释中文化](#10-前端模块拆分与注释语言统一)
 - [11. 构建日志告警收敛](#11-构建日志告警收敛)
+- [12. 品牌改名后的升级兼容](#12-品牌改名后的升级兼容)
+- [13. 构建目标改为 Windows 10/11](#13-构建目标改为-windows-1011)
+- [14. zip 依赖去掉 fork](#14-zip-依赖去掉-fork)
+- [15. H3 传输层改用 quinn + rustls](#15-h3-传输层改用-quinn--rustls)
+- [16. 停更依赖换成系统 API](#16-停更依赖换成系统-api)
+- [17. 同步上游 0.5.1 之后的打包器修复](#17-同步上游-051-之后的打包器修复)
+- [18. 同步上游最新的安装行为测试与 unit-test job](#18-同步上游最新的安装行为测试与-unit-test-job)
 - [升级上游时的套用顺序](#升级上游时的套用顺序)
 
 | # | 需求 | 涉及文件 |
@@ -42,7 +49,13 @@
 | 8 | 卸载收尾、路径比较、提权状态与静默卸载入口 | `src-tauri/src/installer/uninstall.rs`、`src-tauri/src/ipc/manager.rs`、`src-tauri/src/installer/registry.rs`、`src/App.vue` |
 | 9 | 下载文件验签、临时文件、提权管道及后续复查修复 | `src-tauri/src/utils/secure_temp.rs`、`src-tauri/src/utils/acl.rs` 及相关调用点，详见第 9 节 |
 | 10 | DFS 会话模块拆分与注释中文化 | `src/dfs.ts`、`src/dfs/session.ts`；注释调整覆盖本目录项目源码和仓库内副本的功能注释 |
+| 11 | 构建日志告警收敛（上游两处警告、死代码告警） | 两个 `libs/*-sys/src/lib.rs`、`src-tauri/src/cli/arg.rs` |
 | 12 | 品牌改名后的旧主程序 / 安装目录识别、旧组件清理与快捷方式修复 | `src-tauri/src/installer/config.rs`、`src-tauri/src/installer/mod.rs`、`src/App.vue` |
+| 13 | 目标改回标准 `x86_64-pc-windows-msvc`，去掉 `-Z build-std` 与 `rust-ctor` fork | `package.json`、`build.ps1`、`.github/workflows/build.yml`、`src-tauri/Cargo.toml` |
+| 14 | zip 去掉 `xytoki/zip2` fork，改用 crates.io 8.6 并在调用侧复刻强制 UTF-8 | `src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`、`src-tauri/src/thirdparty/mirrorc.rs`、`tools/devcheck/` |
+| 15 | H3 传输层改用 `quinn` + `rustls`，去掉 `h3-msquic-async` / `msquic-async` fork | `src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`、`src-tauri/src/capabilities/h3.rs`、`src-tauri/src/capabilities/mod.rs`、`tools/devcheck/` |
+| 16 | 停更依赖换成系统 API（`mslnk` → Shell Link、`nt_version` → ntdll），补齐 vendored 源码许可证 | `src-tauri/src/installer/lnk.rs`、`src-tauri/src/utils/os_version.rs`（新增）、`src-tauri/src/utils/mod.rs`、`src-tauri/src/capabilities/mod.rs`、`src-tauri/src/main.rs`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`、`src-tauri/libs/`、`tools/devcheck/` |
+| 17 | 同步上游 0.5.1 之后的打包器修复（包体 PE 识别、嵌入名规则、抽取路径越界、临时文件与摘要） | `src-tauri/src/builder/local.rs`、`builder/append.rs`、`builder/extract.rs`、`builder/pack.rs`、`src-tauri/src/utils/hash.rs`、`tools/devcheck/` |
 
 ---
 
@@ -749,7 +762,7 @@ AppContainer 进程、远程会话，并把完整性级别压到 Low。于是别
 
 ## 11. 构建日志告警收敛
 
-`pnpm build` 在 `-Z build-std` 下会带出两类与产物无关的告警，逐条从源头上消掉：
+`pnpm build` 会带出两类与产物无关的告警（自 rustc 1.9x 起），逐条从源头上消掉：
 
 ### `libs/hdiff-sys/src/lib.rs`、`libs/hpatch-sys/src/lib.rs`
 
@@ -799,6 +812,277 @@ Other(Vec<String>),
 
 ---
 
+## 13. 构建目标改为 Windows 10/11
+
+本仓库只服务 HoYoEnhance，兼容范围与宿主一致（64 位 Windows 10 1607+ / Windows 11），
+因此不再需要上游的 Windows 7 目标：
+
+- `package.json`、`build.ps1`、`.github/workflows/build.yml` 的目标三元组从
+  `x86_64-win7-windows-msvc` 换成标准 `x86_64-pc-windows-msvc`；
+- 随之删掉 `-Z build-std=std,panic_abort` 与 `rust-src` 组件：win7 是 tier-3 目标，
+  rustup 没有预编译标准库才需要从源码编标准库，标准目标是 tier-1；
+- `[patch.crates-io] ctor` 删除：`xytoki/rust-ctor` 那份 fork 只补了
+  `target_vendor = "win7"` 分支，标准目标走的是上游原有的 `target_vendor = "pc"`
+  分支，用 crates.io 的 `ctor 0.6.3` 即可；
+- `build.ps1` 在构建前按本机核数设置 `CMAKE_BUILD_PARALLEL_LEVEL`：依赖里仍有 crate
+  用 cmake 编 C 源码（russh 的加密后端 `aws-lc-sys`），cmake 自己认这个环境变量，
+  按本机核数补上就不必改上游 crate；
+- CI 增加 `CARGO_PROFILE_RELEASE_DEBUG: "false"`：PDB 既不进 Release 也不上传 artifact，
+  省掉一份没有去处的调试信息（本地构建不受影响）。
+
+nightly 工具链保留：`Cargo.toml` 里的 `trim-paths` 与 `profile.rustflags`
+（`-Zthreads=8`）目前仍是 nightly 专属特性，stable 会直接报
+`feature trim-paths is required`。
+
+复核方式：`pwsh build.ps1` 能产出 `tools\kirara-builder.exe`，CI 的四组安装 / 更新
+测试全绿；`tools/devcheck` 的 `vendor` 层仍会断言每个 git 依赖都锁到 commit
+（第 15 节之后已经没有 git 依赖了）。
+
+---
+
+## 14. zip 依赖去掉 fork
+
+上游用 `xytoki/zip2`（2.6.1）这个 fork，它相对上游 zip 只改了一处：`read.rs` 里把
+`is_utf8` 写死成 `true`，也就是不看 zip 的 UTF-8 标志位、一律按 UTF-8 解条目名。
+原因是部分打包工具写中文文件名时不置该标志位，zip 会退回 CP437 解出乱码
+（「中文」解成「Σ╕¡µûç」），MirrorChyan 下发的包正好属于这一类。
+
+现在改用 crates.io 的 `zip 8.6`，并在 `src-tauri/src/thirdparty/mirrorc.rs` 里复刻同一语义：
+
+- 新增 `decode_entry_name(&[u8]) -> String`，内部是 `String::from_utf8_lossy`，
+  与 fork 的分支逐字一致；
+- 文件清单不再用 `ZipArchive::file_names()`（它按标志位解码），改为逐个 `by_index(i)`
+  取 `name_raw()` 再解码，前缀计算与后续的路径安全判定都建立在这份名字上；
+- `by_name()` 可以继续用：zip 8.x 的名字索引按**原始字节**建表，用 UTF-8 名字查得到；
+- feature 保持与 fork 时相同的解压能力（`deflate-flate2-zlib-rs` / `deflate64` / `zstd`），
+  其中 flate2 走纯 Rust 的 zlib-rs 后端，不引入新的 C 依赖。
+
+复核方式：`pwsh tools/devcheck/devcheck.ps1 -Layer logic` 的 [19] 组断言覆盖
+「未置位的中文名按 UTF-8 还原 / 非 UTF-8 字节走 lossy 解码 / ASCII 名不受影响」。
+MirrorChyan 的完整解包链路没有自动化用例（CI 的四组测试走 GitHub Release），
+首次在 Windows 上用到镜像安装时建议对着一个真实包复核一遍。
+
+---
+
+## 15. H3 传输层改用 quinn + rustls
+
+上游的 HTTP/3 走 `h3-msquic-async` + `xytoki/msquic-async-rs` fork + `seera-msquic`
+（静态 msquic）：前两个都不在 crates.io 主线维护（下载量分别约 1.8k / 0.7k），fork 里
+还有自研的证书校验代码，构建时要把上千个 C 文件编一遍。
+
+现在换成 `quinn 0.11` + `rustls 0.23` + `h3-quinn 0.0.10` +
+`rustls-platform-verifier 0.7`，`capabilities/h3.rs` 的对外接口与证书固定语义逐条保持：
+
+- 验证器是 `PinVerifier`：外面包一层系统证书验证器（Windows 上就是 CryptoAPI 证书链，
+  与上游的 Schannel 等价），`PinningMode::Force` / `Add` 的判定顺序不变 ——
+  `Add` 模式下系统信任就直接放行，系统不信任才比对固定值；
+- `PinTarget::Spki` 改为在证书 DER 上直接定位 SubjectPublicKeyInfo
+  （`extract_spki_der`），与上游 `CryptEncodeObjectEx(X509_PUBLIC_KEY_INFO)` 的字节
+  一致，所以 `openssl x509 -pubkey -noout | openssl pkey -pubin -outform DER | sha256sum`
+  的结果仍然可以直接当固定值用；
+- 连接池（按 `host / port / pin` 复用、空闲与死亡连接清扫、上限 32）、
+  `http3://` 拦截、失败即 `disable_h3()`、UA 里的 `h3/enabled` 标记、`discover()`
+  的「接受任意证书并回传哈希」全部照旧；
+- 加密提供者显式指定 ring：本仓库的 rustls 同时开着 aws-lc-rs（russh 要的），
+  走 `ClientConfig::builder()` 会因为「默认提供者不唯一」直接 panic；
+- QUIC 端点是懒创建的，按地址族各留一个（`0.0.0.0:0` / `[::]:0`），不依赖双栈 socket
+  在各平台上不一致的 `IPV6_V6ONLY` 默认值；
+- Win11+ 的启用门槛保留：那是上游为 msquic + Schannel 定的，换掉依赖后技术上已无必要，
+  但「H3 在哪些系统上启用」属于对外行为，不跟着依赖替换一起变。
+
+顺带的结果：`Cargo.lock` 里不再有任何 git 依赖，msquic 相关的 crate
+（`h3-msquic-async`、`msquic-async`、`seera-msquic`、`ctor` / `dtor` 等）全部消失。
+
+复核方式：`pwsh tools/devcheck/devcheck.ps1 -Layer logic` 的 [20] 组断言覆盖固定值
+解析与 SPKI 哈希（样例证书的哈希由 openssl 独立算出，两边必须逐字节一致）。
+H3 的真实连接只能在 Windows 上跑，靠 CI 的 Build + 四组安装 / 更新测试兜底；
+另外 HoYoEnhance 下发的 `packaging.config.json` 目前只有 `https://` 地址，没有
+`http3://`，也就是说这条链路在正式安装流程里默认不会被走到。
+
+## 16. 停更依赖换成系统 API；补齐 vendored 源码的许可证
+
+这一节收掉两个「多年没人维护、但做的事其实系统本来就有」的依赖，外加一处许可证缺口。
+共同点是**只换实现，不换行为**。
+
+### 16a. `mslnk 0.1` → `IShellLinkW` + `IPersistFile`
+
+`mslnk` 最后一次发布停在 2022 年，自带约 1300 行手写的 .lnk 二进制序列化代码 ——
+IDList、相对路径、图标这些格式细节都得自己维护。现在改用 Windows 自带的 Shell Link 组件：
+
+- `CoCreateInstance(&ShellLink, …)` 拿到 `IShellLinkW` → `SetPath` /
+  `SetWorkingDirectory` → `cast::<IPersistFile>()` → `Save`，格式细节交给系统；
+- 起始位置填目标文件所在目录（与 `mslnk` 那份实现填的值一致）；
+- COM 要求线程先初始化 apartment，而这条命令跑在 tokio 的工作线程上 —— 整段丢进
+  `spawn_blocking`，在同一个线程里自己 `CoInitializeEx` / `CoUninitialize`。
+  线程已被别的组件按另一种 apartment 初始化过时返回 `RPC_E_CHANGED_MODE`：
+  这不是失败（Shell Link 两种 apartment 都能用），继续执行，只是不配对调用
+  `CoUninitialize`（谁初始化谁负责）；
+- 上游那套路径校验一行没动：绝对路径、不许出现 `..`、必须以 `.lnk` 结尾、
+  `is_safe_delete_target`、目标不能是重解析点。
+
+### 16b. `nt_version 0.1` → `ntdll!RtlGetNtVersionNumbers`
+
+`nt_version` 最后一次发布是 2020 年，做的事就是调 `RtlGetNtVersionNumbers` 并返回
+`(major, minor, build)`。现在由 `src-tauri/src/utils/os_version.rs` 自己声明这个入口
+（`#[link(name = "ntdll")]`），不再引入任何依赖：
+
+- 走 `RtlGetNtVersionNumbers` 而不是 `GetVersionEx`：后者会因为「进程清单没声明支持
+  Win10」被兼容性改写，这也是原来那个 crate 存在的理由，行为保持一致；
+- `build` 的高位带着未文档化的标志位（历史上是 `0xF0000000`），低 16 位才是构建号。
+  上游两处调用点各自写了一次 `build & 0xffff`，现在统一在 `os_version::get()` 里裁好，
+  `main.rs` 与 `capabilities/mod.rs` 拿到的语义不变；
+- H3 的启用门槛（Win11 = `10.0` 且 build ≥ 22000）保持原样，没有跟着依赖替换一起放宽。
+
+### 16c. `libs/` 下 vendored 源码的许可证与出处
+
+`hdiff-sys` / `hpatch-sys` 各自打包了一份 HDiffPatch 的 C/C++ 源码（`v4.8.0`），
+但目录里缺上游的 `LICENSE` —— 那份许可是 MIT，必须随源码分发。现在两份 `LICENSE`
+都补齐了（`hdiff-sys` 那份还含 libdivsufsort 的 Yuta Mori 许可），并在
+`src-tauri/libs/THIRDPARTY.md` 里记下上游地址、快照版本、本地四类差异
+（include 路径、`extern "C"` 出口、hpatch 的具体错误码、注释被机翻）与升级步骤。
+
+### 复核方式
+
+`pwsh tools/devcheck/devcheck.ps1`：`rust` 层现在把 `installer/lnk.rs`、
+`utils/dir.rs` 与 `utils/os_version.rs` 一起放进 msvc target 的类型检查（COM 接口名、
+参数类型、调用顺序、`unsafe extern` 声明写错当场就响，本地没有 Windows 也能守；
+`os_version.rs` 里那条「文档注释挂在 `extern` 块上」的无效写法就是这么发现的），
+`vendor` 层第 10 项盯着这四个依赖不许回来、`libs` 的许可证不许丢。
+
+快捷方式的**行为**仍然只能实机验证：装一次，看桌面 / 开始菜单里的快捷方式能正常启动、
+工作目录正确，再跑一次卸载确认它们被清干净（卸载侧的判定在第 1b 节，没有改动）。
+
+## 17. 同步上游 0.5.1 之后的打包器修复
+
+上游在本快照（tag `0.5.1`）之后又走了几十个提交，其中一次大重构把整个项目从
+Tauri + Vue 换成「原生 Win32 + WebView2 宿主 + Preact」，目录也从 `src-tauri/`
+挪到了仓库根（见 `UPSTREAM.md`）。那套重构没法按提交挑拣，本仓库也不打算跟着换架构 ——
+但重构前后**打包器（builder）里那几个真问题**是通用的，这一节把它们单独搬了过来。
+
+移植时对照的是上游 `main`（`a52a4c66`），逐条如下：
+
+### 17a. 包体识别：`MZ\x90\x00` → 真正的 PE 映像
+
+打包产物是「builder 字节 + installer 字节」拼出来的，读的时候要找出后半段安装器的起点。
+上游原来按 `MZ\x90\x00` 四个字节扫，安装器体内（压缩数据、图标、资源段）一旦出现这串
+字节就会被当成映像起点，rcedit 随后加载到半截文件直接失败。现在改成只认真正的 PE 映像：
+`MZ` + DOS 头里的 `e_lfanew` 落在 `0x40..0x1000` 且指向 `PE\0\0`。
+
+### 17b. 嵌入名规则：写入端与读取端必须一致
+
+读取器只接受内置 `\0` 名称与 ASCII 字母/数字/`.`/`_`/`-`，而 `append` 原来不校验：
+名字不合规时数据照样写进包里，但 `--list` / `--name` 永远看不到它 —— 一个静默丢数据的口子。
+现在写入端用同一个 `is_embedded_name` 校验并直接报错。顺带把读取端补齐：
+名称长度（`0 < len <= 512`）、名称 UTF-8、内容长度越界都先判再读，畸形包不再 panic。
+空名字额外拒绝（`chars().all(..)` 对空串恒真，两端都放行就是同一个丢数据问题）。
+
+### 17c. 抽取路径：包内路径不许写到输出根之外
+
+`--extract` 的输出路径来自归档 metadata 里的文件名，上游原来直接 `output_dir.join(name)`：
+`..\..\x` 这类名字能把文件写到输出目录外面。现在先过 `relative_under_root`
+（只允许 Normal 组件）与 `verify_within_root`（逐组件 canonicalize，确认解析 symlink /
+junction 之后仍在输出根内），并且**先规划完所有路径再落盘** —— 任何一条越界即整体失败，
+不会留下半次提取。
+
+### 17d. 打包临时文件与摘要
+
+- `pack` 原来把基础内容写到固定的 `%TEMP%\kachina_installer_tmp.exe`：同机并发打包会
+  互相踩，上一次崩溃留下的半截文件会被这次直接读走。现在文件名带进程号 + UUID，
+  并且在交给 rcedit 之前先 `sync_all()`；rcedit 加载失败时打印文件大小再 panic。
+- `get_reader_for_bundle` 失败时改为 `exit(1)`（原来只是 `return`，脚本靠退出码判断
+  产物时会误判成功）。
+- `utils/hash.rs` 的 md5 与 xxh 走同一条 1 MB 顺序读循环，并加
+  `FILE_FLAG_SEQUENTIAL_SCAN`；文件 IO 整段丢进 `spawn_blocking`，不再占住 async 线程。
+  顺带去掉 `chksum-md5` 的 `async-runtime-tokio` feature（不再用 `async_chksum`），
+  `chksum-reader` / `chksum-writer` 两个 crate 从依赖树里消失。
+
+### 没有跟着搬的部分（有意为之）
+
+- **架构重构**：Tauri + Vue → 原生 Win32 + WebView2 + Preact。那会连带作废本文件
+  第 1～16 节的全部改动，属于「重写」而不是「同步」，不在本分支范围。
+- **两阶段提交（staging 目录）与安装会话**：上游把安装流程重写成
+  `session/` + `fs/staging.rs` + `fs/commit.rs`，并配了 `updater-survival` 测试。
+  它是新架构的一部分，单独搬过来没有落点。
+- **插件系统 / DFS 会话**：同上，`plugin-stub`、`dfs2` 两个测试依赖新架构。
+- **Sentry**：上游仍然保留（甚至换成了自研最小客户端），本项目继续物理移除。
+
+### 复核方式
+
+`pwsh tools/devcheck/devcheck.ps1`：`logic` 层第 [21] 组断言覆盖 PE 识别（含「体内埋
+`MZ\x90\x00`」这条反例）、嵌入名规则、哈希取值与抽取路径安全阀；第 [22] 组覆盖
+md5 / xxh 的已知摘要与跨 1 MB 分块一致性。打包器本身只在 Windows 上编译，
+完整链路由 CI 的 Build 与 `builder-extract-replace` 等行为测试兜底。
+
+---
+
+## 18. 同步上游最新的安装行为测试与 unit-test job
+
+上游 `main`（`a52a4c66`）在 0.5.1 之后把测试矩阵扩到了十几组，其中一半依赖
+Tauri → 原生 Win32 的重写（`dfs2`、`updater-survival`、`plugin-stub`、
+`dump-offline-install`），本仓库没有那套架构，没有跟着搬。可独立复用的部分已经
+移植过来。
+
+### 18a. 安装行为测试（`test` job）
+
+新增 5 组测试，`test` job 的矩阵从 4 组扩到 9 组：
+
+- `already-latest`：同版本重复安装不覆盖已装文件；
+- `uninstall`：静默卸载删掉包内文件与 `extraUninstallPath`，默认保留 `userDataPath`；
+- `userdata-ignore`：升级时 `userDataPath` 保留用户改过的文件、`ignoreFolderPath`
+  整目录不动；
+- `occupied-process`：主程序占用 `app.exe` 时更新流程先结束进程再替换；
+- `builder-extract-replace`：`extract --list` / `--all` / `--name` 与
+  `replace-bin` 的端到端覆盖。
+
+`tests/prepare.mjs` 为这些用例补了 `User/settings.json`、`cache/keep.dat` 与
+`userDataPath` / `ignoreFolderPath` / `extraUninstallPath` 配置。夹具打包命令去掉了
+`--icon`（本仓库拆分后没有 `resources/icons/icon.ico`，该参数可选），并且 `main()`
+失败时恢复 `process.exitCode = 1`，避免夹具构建失败被 CI 当成成功。
+
+### 18b. Rust 单元测试（`unit-test` job）
+
+新增 job 在 `windows-latest` 上跑 `cargo test --bin kachina-builder --locked`，
+与 Build 分开缓存、互不覆盖 `target`。用例覆盖：
+
+- `utils/hash.rs`：md5 已知摘要、只读文件、未知算法报错；
+- `builder/local.rs`：PE 映像识别（含「安装器体内埋 `MZ\x90\x00`」反例）；
+- `builder/extract.rs`：`..\x`、盘符、UNC 等包内路径必须被 `relative_under_root` 拒绝。
+
+### 18c. `replace-bin` 的包格式修复
+
+新测试暴露了 `builder/replace_bin.rs` 的旧实现与 `builder/pack.rs` 的写入格式不一致：
+索引头里 `base_end` 是绝对偏移，后面 4 个字段是各段**长度**，旧实现却全部按
+「段结束偏移」解析，`config_end - base_end` 算出的长度直接越界，`replace-bin`
+在 Windows 上 panic。现在整份换成上游新版实现：
+
+- 按真实格式解析 `PackLayout`（base 绝对偏移 + 4 个长度）；
+- payload 起点兼容两种包：优先用 `base_end` 指向的 `!IN\0`，旧包回退到
+  `get_embedded` 的第一个条目；
+- 输出先写同目录临时文件，成功后替换，输入输出是同一路径时不会先截断输入；
+- 复制区间带边界检查，新增 5 组单元测试（格式往返、长度语义、payload 保留、
+  in-place 安全、TLV 头长度）。
+
+### 18d. 升级时保留 `userDataPath` 下的用户文件
+
+`userDataPath` 配置是绝对路径（`${INSTALL_PATH}/User`），而元数据里的 `file_name`
+是相对安装目录的路径，旧比较逻辑拿两者直接 `startsWith`，永远匹配不上，升级会
+覆盖用户改过的 `User/settings.json`。现在比较前先去掉安装目录前缀、统一分隔符
+和大小写，`userdata-ignore` 测试覆盖这条行为。
+
+### 有意未移植
+
+- `dfs2`、`plugin-stub`、`updater-survival`、`dump-offline-install`：依赖上游新架构的
+  DFS 会话 / 插件系统 / staging 提交，当前快照没有对应落点；
+- Sentry 上传：本仓库继续物理移除遥测，Release 只挂产物。
+
+### 复核方式
+
+`pwsh tools/devcheck/devcheck.ps1`（含 `-SelfTest`）与 CI 的 `Build` 全绿：
+`test` job 九组行为测试与 `unit-test` job 均通过。本机没有 MSVC 时，Rust 单元测试
+只能在 Windows runner 上执行。
+
+---
+
 
 ## 升级上游时的套用顺序
 
@@ -836,6 +1120,37 @@ Other(Vec<String>),
 3f. **重做第 12 节的改名兼容**：`installer/config.rs` 增加旧 exe / 旧安装目录探测，
    `installer/mod.rs` 的 `select_dir` 增加 `legacy_exe_names`，`App.vue` 同步结束旧进程
    并在更新时重建快捷方式；
+3g. **重做第 13 节的构建目标**：`package.json`、`build.ps1`、
+   `.github/workflows/build.yml` 换成标准 `x86_64-pc-windows-msvc` 并去掉
+   `-Z build-std`，`src-tauri/Cargo.toml` 去掉 `ctor` 的 `[patch.crates-io]`
+   （上游升级后如果又带回 win7 目标，同样换掉）；
+3h. **重做第 14 节的 zip 替换**：`Cargo.toml` 的 `zip` 改回 crates.io 版本，
+   `thirdparty/mirrorc.rs` 恢复 `decode_entry_name` 与按索引取名字的写法，
+   `tools/devcheck/lib/Generate.ps1` 与 `rust/logic/src/main.rs` 补回 [19] 组断言；
+3i. **重做第 15 节的 H3 传输层替换**：`Cargo.toml` 去掉 `h3-msquic-async` 与
+   `[patch.crates-io] msquic-async`、换成 `h3-quinn` / `quinn` / `rustls` /
+   `rustls-platform-verifier`，`capabilities/h3.rs` 整份替换、`capabilities/mod.rs`
+   的探测换成 `h3::probe()`，`tools/devcheck/lib/RustSource.ps1` 要支持 `enum` 抽取、
+   `Generate.ps1` 与 `rust/logic/src/main.rs` 补回 [20] 组断言；
+3j. **重做第 16 节**：`installer/lnk.rs` 换成系统 Shell Link（`IShellLinkW` +
+   `IPersistFile`，去掉 `mslnk`）、新增 `utils/os_version.rs` 自己声明
+   `RtlGetNtVersionNumbers`（去掉 `nt_version`）、`Cargo.toml` 的 `windows` features
+   补 `Win32_System_Com`、`libs/{hdiff-sys,hpatch-sys}/LICENSE` 与 `libs/THIRDPARTY.md`
+   保持存在，`tools/devcheck/lib/Generate.ps1` 的 typecheck 生成清单要带上
+   `installer/lnk.rs`、`utils/dir.rs` 与 `utils/os_version.rs`；
+3k. **重做第 17 节的打包器修复**：新快照若还带旧写法，按 17a～17d 重打一遍
+   （`builder/local.rs` 的 PE 识别与嵌入名校验、`builder/extract.rs` 的路径安全阀、
+   `builder/pack.rs` 的临时文件名与退出码、`utils/hash.rs` 的顺序读摘要），
+   `tools/devcheck/lib/Generate.ps1` 补回 `LogicBuilderItems` / `LogicExtractItems` /
+   `LogicHashItems` 三张清单与 `rust/logic/src/main.rs` 的 [21]/[22] 组断言；
+3l. **重做第 18 节的工作流与测试同步**：从上游最新 `main` 挑出 5 组不依赖新架构的
+   行为测试（`already-latest` / `uninstall` / `userdata-ignore` /
+   `occupied-process` / `builder-extract-replace`），依赖 DFS / 插件 / staging 的
+   测试不搬；`tests/prepare.mjs` 的 builder 路径按本仓库布局
+   （`src-tauri/target/...`）改，夹具打包去掉 `--icon`，失败要
+   `process.exitCode = 1`；`.github/workflows/build.yml` 的 `test` 矩阵与
+   `unit-test` job 同步更新；新测试若暴露 `replace-bin` 解析或 `userDataPath`
+   匹配问题，按 18c / 18d 修掉；
 4. `npx tsc --noEmit -p tsconfig.json`（上游本身有 3 个 `noUnusedLocals` 报错，
    只要没有新增报错即可）+ 用 `@vue/compiler-sfc` 编译 `src/App.vue` 自检；
 5. Windows 上 `pnpm build` 出 `kachina-builder.exe`，跑一次

@@ -16,7 +16,8 @@
     即使 tools\kirara-builder.exe 已存在也重新构建。
 
 .PARAMETER Toolchain
-    Rust 工具链，默认 nightly（上游 src-tauri\rust-toolchain.toml 指定）。
+    Rust 工具链，默认 nightly（src-tauri\rust-toolchain.toml 指定；`trim-paths` 与
+    `profile.rustflags` 目前仍是 nightly 专属特性，stable 编不过）。
 
 .EXAMPLE
     pwsh build.ps1
@@ -34,8 +35,11 @@ $RepoRoot     = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ToolsDir     = Join-Path $RepoRoot "tools"
 $BuilderOut   = Join-Path $ToolsDir "kirara-builder.exe"
 
-# 上游 build 脚本的输出位置与文件名（target 三元组固定，产物名保持上游的 kachina-builder.exe）
-$TargetTriple  = "x86_64-win7-windows-msvc"
+# 目标三元组：本项目只服务 HoYoEnhance，兼容范围与宿主一致（64 位 Windows 10
+# 1607+ / Windows 11），因此用标准 tier-1 目标，不再需要上游的 win7 自定义目标
+# （tier-3，rustup 没有预编译标准库，才要 nightly + rust-src + -Z build-std）。
+# 产物名保持上游的 kachina-builder.exe。
+$TargetTriple  = "x86_64-pc-windows-msvc"
 $ReleaseDir    = Join-Path $RepoRoot "src-tauri\target\$TargetTriple\release"
 $BuiltBuilder  = Join-Path $ReleaseDir "kachina-builder.exe"
 
@@ -94,11 +98,9 @@ $null = Require "rustup" "请安装 Rust：https://rustup.rs （需 MSVC 生成�
 $null = Require "cargo"  "rustup 安装后重开终端"
 $null = Require "node"   "请安装 Node.js 20+"
 
-Step "安装 Rust 工具链 $Toolchain + rust-src（build-std 需要）"
+Step "安装 Rust 工具链 $Toolchain"
 & rustup toolchain install $Toolchain --profile minimal
 if ($LASTEXITCODE -ne 0) { throw "rustup toolchain install $Toolchain 失败" }
-& rustup component add rust-src --toolchain $Toolchain
-if ($LASTEXITCODE -ne 0) { throw "rustup component add rust-src 失败" }
 
 # pnpm：优先 corepack（Node 自带），退回 npm 全局安装
 $pnpm = Get-Command pnpm -ErrorAction SilentlyContinue
@@ -127,7 +129,13 @@ try {
     & pnpm install --frozen-lockfile
     if ($LASTEXITCODE -ne 0) { throw "pnpm install 失败" }
 
-    Step "pnpm build（tauri build → $TargetTriple，-Z build-std，LTO；首次冷构建较慢）"
+    # 依赖里还有用 cmake 编 C 源码的 crate（russh 的加密后端 aws-lc-sys），cmake 自己
+    # 认这个环境变量，按本机核数补上，省得在 Windows 上退回串行编译。
+    if (-not $env:CMAKE_BUILD_PARALLEL_LEVEL) {
+        $env:CMAKE_BUILD_PARALLEL_LEVEL = [string][Environment]::ProcessorCount
+    }
+
+    Step "pnpm build（tauri build → $TargetTriple，LTO；首次冷构建较慢）"
     # 上游 build 脚本内部用 cmd 内建 ren/del/copy /b 拼接 builder + installer，
     # 必须经由 pnpm 走 cmd.exe 执行，这里不要自己重排命令。
     & pnpm build

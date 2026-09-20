@@ -10,6 +10,7 @@
 //!
 //! 其余全是上游/本项目的真实代码。断言失败 → 进程退出码 1。
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use std::sync::Mutex;
@@ -1079,6 +1080,303 @@ fn scheduled_task_wiring_case() {
     );
 }
 
+fn zip_entry_name_cases() {
+    println!("[19] zip 条目名解码（替代 zip fork 的强制 UTF-8）");
+    // 打包工具写中文名却不置 UTF-8 标志位时，zip 自己会按 CP437 解出乱码
+    // （「中文」→「Σ╕¡µûç」）；decode_entry_name 必须按原始字节还原。
+    let utf8_raw = "中文/文件.txt".as_bytes();
+    let got = decode_entry_name(utf8_raw);
+    check(
+        "未置位的中文名按 UTF-8 还原",
+        got == "中文/文件.txt",
+        format!("got {got}"),
+    );
+    // 非 UTF-8 字节：与 fork 一样走 lossy 解码，不 panic、也不丢条目。
+    let lossy = decode_entry_name(&[0xff, 0xfe, b'a']);
+    check(
+        "非 UTF-8 字节走 lossy 解码",
+        lossy == "\u{fffd}\u{fffd}a",
+        format!("got {lossy:?}"),
+    );
+    // ASCII 名（changes.json / .metadata.json 这类）不受影响。
+    let ascii = decode_entry_name(b"changes.json");
+    check("ASCII 名不受影响", ascii == "changes.json", format!("got {ascii}"));
+}
+
+/// H3 证书固定用的样例证书：openssl 现生成的 P-256 自签证书（CN=h3check.example），
+/// 三个常量都由 openssl 侧独立算出来，用来交叉验证我们自己写的 DER 解析。
+const H3_CERT_DER_HEX: &str = concat!(
+    "308201a53082014ba0030201020214483c51f5abd347944d1c8e31bec76ad5908db5c5300a06082a8648ce3d040302301a31",
+    "18301606035504030c0f6833636865636b2e6578616d706c65301e170d3236303932303038343832375a170d333630393137",
+    "3038343832375a301a3118301606035504030c0f6833636865636b2e6578616d706c653059301306072a8648ce3d02010608",
+    "2a8648ce3d03010703420004d7ed138f10848d71c26e9d40f0e17f3663fa72dc2bdf7c064e4bafe7918e33c6e3e5ca94a092",
+    "adc6125bc1a17e196045ae50c535b86440a94305ceec6bba9de2a36f306d301d0603551d0e0416041420af054940430aa165",
+    "dff8a6b27b6b0b6a524152301f0603551d2304183016801420af054940430aa165dff8a6b27b6b0b6a524152300f0603551d",
+    "130101ff040530030101ff301a0603551d1104133011820f6833636865636b2e6578616d706c65300a06082a8648ce3d0403",
+    "02034800304502200a81dca0423688aeadeab80d039a5a4e31f5cf0840261de6471c0ddb0e20c455022100e426f3160b8d8a",
+    "d32949224717db0297427011baee0e59eec8a7017dc5befa42",
+);
+const H3_CERT_SHA256: &str = "898f47029c53f83646567fa56237fcdc6fc111de5f5e2ae8ac84197be0ae98a6";
+const H3_SPKI_SHA256: &str = "9af0e528ef99ca47a58d45101878168c38d283655d971eef7608f8d1bd7f469d";
+
+fn h3_pin_cases() {
+    println!("[20] H3 证书固定（pinning）与 SPKI 哈希");
+
+    let parse = |frag: &str| {
+        parse_pin_from_fragment(
+            &url::Url::parse(&format!("http3://example.com/file#{frag}")).expect("url"),
+        )
+    };
+    let spki = "aa".repeat(32);
+    let cert = "bb".repeat(32);
+
+    let cfg = parse(&format!("spki={spki}")).expect("spki");
+    check(
+        "固定值：只给 spki 时默认 force",
+        cfg.mode == PinningMode::Force && cfg.target == PinTarget::Spki([0xaa; 32]),
+        format!("{cfg:?}"),
+    );
+
+    let cfg = parse(&format!("spki={spki}&pinning_mode=add")).expect("spki+add");
+    check(
+        "固定值：pinning_mode=add 生效",
+        cfg.mode == PinningMode::Add,
+        format!("{cfg:?}"),
+    );
+
+    let cfg = parse(&format!("spki={spki}&pinning_mode=whatever")).expect("unknown mode");
+    check(
+        "固定值：未知 pinning_mode 退回 force（安全默认值）",
+        cfg.mode == PinningMode::Force,
+        format!("{cfg:?}"),
+    );
+
+    let cfg = parse(&format!("cert={cert}")).expect("cert");
+    check(
+        "固定值：cert 目标可解析",
+        cfg.target == PinTarget::Cert([0xbb; 32]),
+        format!("{cfg:?}"),
+    );
+
+    let cfg = parse(&format!("spki={spki}&cert={cert}&pinning_mode=add")).expect("both");
+    check(
+        "固定值：spki 与 cert 同时出现时 cert 优先",
+        cfg.target == PinTarget::Cert([0xbb; 32]) && cfg.mode == PinningMode::Add,
+        format!("{cfg:?}"),
+    );
+
+    check(
+        "固定值：长度不足 64 被拒绝",
+        parse("spki=abcd").is_none(),
+        "长度 4 的 spki 不该通过".to_string(),
+    );
+    check(
+        "固定值：非 hex 被拒绝",
+        parse(&format!("spki={}", "zz".repeat(32))).is_none(),
+        "非 hex 不该通过".to_string(),
+    );
+    check(
+        "固定值：只写 pinning_mode 被拒绝",
+        parse("pinning_mode=add").is_none(),
+        "没有 spki/cert 时不该给出配置".to_string(),
+    );
+    check(
+        "固定值：没有 fragment 被拒绝",
+        parse_pin_from_fragment(&url::Url::parse("http3://example.com/file").expect("url"))
+            .is_none(),
+        "无 fragment 不该给出配置".to_string(),
+    );
+
+    // SPKI 定位必须与 openssl 完全一致，否则用户按文档算出来的固定值会全部失配。
+    let der = hex::decode(H3_CERT_DER_HEX).expect("fixture hex");
+    check(
+        "证书哈希：整张证书的 SHA-256 与 openssl 一致",
+        hex::encode(compute_cert_hash(&der)) == H3_CERT_SHA256,
+        format!("got {}", hex::encode(compute_cert_hash(&der))),
+    );
+    check(
+        "证书哈希：SPKI 的 SHA-256 与 openssl 一致",
+        compute_spki_hash(&der).map(hex::encode).as_deref() == Some(H3_SPKI_SHA256),
+        format!("got {:?}", compute_spki_hash(&der).map(hex::encode)),
+    );
+    check(
+        "证书哈希：截断的 DER 被拒绝",
+        extract_spki_der(&der[..der.len() / 2]).is_none(),
+        "截断输入不该解析出 SPKI".to_string(),
+    );
+    check(
+        "证书哈希：不定长编码被拒绝",
+        extract_spki_der(&[0x30, 0x80, 0x00]).is_none(),
+        "DER 不允许不定长".to_string(),
+    );
+}
+
+/// 造一个最小 PE 映像：DOS 头 + `e_lfanew` 指向的 `PE\0\0`。
+fn mini_pe(tag: u8) -> Vec<u8> {
+    let e_lfanew = 0x80usize;
+    let mut bytes = vec![0u8; 0x200];
+    bytes[0] = b'M';
+    bytes[1] = b'Z';
+    bytes[2] = 0x90;
+    bytes[3] = 0x00;
+    bytes[0x3C..0x40].copy_from_slice(&(e_lfanew as u32).to_le_bytes());
+    bytes[e_lfanew..e_lfanew + 4].copy_from_slice(b"PE\0\0");
+    bytes[e_lfanew + 4] = tag;
+    bytes
+}
+
+fn builder_pack_cases() {
+    println!("[21] 打包器：包体 PE 识别 / 嵌入名规则 / 抽取路径安全阀");
+
+    let pe = mini_pe(1);
+    check(
+        "PE：合法映像起点被识别",
+        is_pe_at(&pe, 0),
+        "e_lfanew=0x80 且带 PE 签名".to_string(),
+    );
+    let mut false_mz = vec![0x4D, 0x5A, 0x90, 0x00];
+    false_mz.extend_from_slice(&[0u8; 60]);
+    check(
+        "PE：只有 MZ\\x90\\x00 不算映像",
+        !is_pe_at(&false_mz, 0),
+        "缺 PE 签名".to_string(),
+    );
+    check(
+        "PE：截断输入不 panic",
+        !is_pe_at(&[0x4D, 0x5A], 0),
+        "长度不足 0x40".to_string(),
+    );
+    let mut far = pe.clone();
+    far[0x3C..0x40].copy_from_slice(&0x2000u32.to_le_bytes());
+    check(
+        "PE：e_lfanew 超出窗口被拒",
+        !is_pe_at(&far, 0),
+        "0x2000 > 0x1000".to_string(),
+    );
+    let mut low = pe.clone();
+    low[0x3C..0x40].copy_from_slice(&0x20u32.to_le_bytes());
+    check(
+        "PE：e_lfanew 过小被拒",
+        !is_pe_at(&low, 0),
+        "0x20 < 0x40".to_string(),
+    );
+
+    // 打包产物 = builder 字节 + installer 字节；安装器体内再埋一个 DOS 魔数。
+    // 旧实现按 MZ\x90\x00 扫，会把埋在体内的那个当成映像起点，于是 rcedit 加载半截文件。
+    let builder = mini_pe(1);
+    let installer = mini_pe(2);
+    let mut bundle = builder.clone();
+    bundle.extend_from_slice(&installer);
+    let planted = builder.len() + 0x40;
+    bundle[planted..planted + 4].copy_from_slice(&[0x4D, 0x5A, 0x90, 0x00]);
+    check(
+        "包体：只认真正的 PE 起点（忽略体内埋的 MZ）",
+        pe_image_starts(&bundle) == vec![0, builder.len()],
+        format!("got {:?}", pe_image_starts(&bundle)),
+    );
+
+    for ok in ["\0CONFIG", "changes.json", "abc-DEF_1.2", "a"] {
+        check(
+            &format!("嵌入名：{ok:?} 放行"),
+            is_embedded_name(ok),
+            "应放行".to_string(),
+        );
+    }
+    for bad in ["", "中文", "a b", "../x", "a/b", "\0NOPE"] {
+        check(
+            &format!("嵌入名：{bad:?} 拒绝"),
+            !is_embedded_name(bad),
+            "应拒绝".to_string(),
+        );
+    }
+
+    let (md5, xxh) = (Some("m".to_string()), Some("x".to_string()));
+    check(
+        "哈希取值：md5 优先",
+        preferred_file_hash(&md5, &xxh).map(String::as_str) == Some("m"),
+        "两个都有时取 md5".to_string(),
+    );
+    check(
+        "哈希取值：只有 xxh 时用它",
+        preferred_file_hash(&None, &xxh).map(String::as_str) == Some("x"),
+        "md5 缺失时取 xxh".to_string(),
+    );
+    check(
+        "哈希取值：都没有则 None",
+        preferred_file_hash(&None, &None).is_none(),
+        "两个都没有时应为 None".to_string(),
+    );
+
+    // 抽取路径安全阀：包内路径来自归档 metadata，越界必须整体拒绝。
+    // 只断言跨平台语义一致的部分；`..\x` / `C:\x` 这类反斜杠形式在 Linux 上
+    // 是普通文件名，由 Windows 上的 cargo test 覆盖（见 utils/hash.rs 同批改动）。
+    let root = Path::new("out");
+    check(
+        "抽取路径：单层文件名放行",
+        relative_under_root(root, "app.exe").is_ok(),
+        "app.exe".to_string(),
+    );
+    check(
+        "抽取路径：子目录放行",
+        relative_under_root(root, "User/settings.json").is_ok(),
+        "User/settings.json".to_string(),
+    );
+    for evil in ["../outside.txt", "a/../../outside.txt", "/etc/passwd", ""] {
+        check(
+            &format!("抽取路径：{evil:?} 被拒"),
+            relative_under_root(root, evil).is_err(),
+            "应拒绝".to_string(),
+        );
+    }
+}
+
+fn hash_reader_cases() {
+    println!("[22] 文件哈希：md5 / xxh 摘要与分块边界");
+
+    let hello = hash_reader("md5", &b"hello"[..]).expect("md5 hello");
+    check(
+        "md5：已知摘要",
+        hello == "5d41402abc4b2a76b9719d911017c592",
+        format!("got {hello}"),
+    );
+    let empty = hash_reader("md5", &b""[..]).expect("md5 empty");
+    check(
+        "md5：空输入",
+        empty == "d41d8cd98f00b204e9800998ecf8427e",
+        format!("got {empty}"),
+    );
+
+    // 跨过 1 MB 读缓冲：分块读不能改变摘要（换缓冲大小、改成一次性读都要一致）
+    let mut big = vec![0u8; 3 * 1024 * 1024 + 7];
+    for (i, b) in big.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    let expected_md5 = chksum_md5::hash(&big).to_hex_lowercase();
+    let got_md5 = hash_reader("md5", &big[..]).expect("md5 big");
+    check(
+        "md5：跨 1 MB 分块与一次性哈希一致",
+        got_md5 == expected_md5,
+        format!("got {got_md5} want {expected_md5}"),
+    );
+
+    let mut hasher = twox_hash::XxHash3_128::new();
+    // XxHash3_128 有自己的 `write(&[u8])`，不走 std::hash::Hasher（后者只到 64 位）
+    hasher.write(&big);
+    let expected_xxh = format!("{:x}", hasher.finish_128());
+    let got_xxh = hash_reader("xxh", &big[..]).expect("xxh big");
+    check(
+        "xxh：与直接哈希一致",
+        got_xxh == expected_xxh,
+        format!("got {got_xxh} want {expected_xxh}"),
+    );
+
+    check(
+        "未知算法报错",
+        hash_reader("sha1", &b"x"[..]).is_err(),
+        "NO_HASH_ALGO_ERR".to_string(),
+    );
+}
+
 #[tokio::main]
 async fn main() {
     reg_target_cases();
@@ -1098,6 +1396,10 @@ async fn main() {
     rm_list_cases();
     scheduled_task_name_cases();
     scheduled_task_wiring_case();
+    zip_entry_name_cases();
+    h3_pin_cases();
+    builder_pack_cases();
+    hash_reader_cases();
     let (pass, fail) = (PASS.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed));
     println!("\n==== PASS {pass} / FAIL {fail} ====");
     if fail > 0 {

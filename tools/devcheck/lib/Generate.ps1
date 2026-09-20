@@ -48,6 +48,50 @@ $script:LogicRuntimeItems = @(
     @{ Kind = 'fn'; Name = 'is_trusted_microsoft_signature' }
 )
 
+# mirrorc.rs 里只抽 decode_entry_name：它替代了 zip fork「不看标志位、强制按 UTF-8
+# 解条目名」的行为，必须在任意平台上可断言（完整构建只在 Windows 上跑）。
+$script:LogicMirrorcItems = @(
+    @{ Kind = 'fn'; Name = 'decode_entry_name' }
+)
+
+# capabilities/h3.rs 里只抽证书固定（pinning）与证书哈希这几段纯逻辑：它们是安全阀本身
+# （固定值比对错了就等于形同虚设），而 H3 的传输层在 Windows 上才能真连，本地只能靠这些
+# 断言兜住。DER 解析出来的 SPKI 必须与 openssl 的结果逐字节一致，见 main.rs 的 [20] 组。
+$script:LogicH3Items = @(
+    @{ Kind = 'enum';   Name = 'PinningMode' }
+    @{ Kind = 'enum';   Name = 'PinTarget' }
+    @{ Kind = 'struct'; Name = 'PinConfig' }
+    @{ Kind = 'fn';     Name = 'sha256' }
+    @{ Kind = 'fn';     Name = 'extract_spki_der' }
+    @{ Kind = 'fn';     Name = 'compute_spki_hash' }
+    @{ Kind = 'fn';     Name = 'compute_cert_hash' }
+    @{ Kind = 'fn';     Name = 'parse_pin_from_fragment' }
+)
+
+# builder/local.rs 里抽包体识别与嵌入名规则这几段纯函数：PE 识别错了会把安装器
+# 当成 builder（打包出坏包），嵌入名规则两边不一致会静默丢数据，都必须在任意平台可断言。
+$script:LogicBuilderItems = @(
+    @{ Kind = 'const'; Name = 'PE_LFANEW_MIN' }
+    @{ Kind = 'const'; Name = 'PE_LFANEW_MAX' }
+    @{ Kind = 'fn'; Name = 'preferred_file_hash' }
+    @{ Kind = 'fn'; Name = 'is_embedded_name' }
+    @{ Kind = 'fn'; Name = 'pe_image_starts' }
+    @{ Kind = 'fn'; Name = 'is_pe_at' }
+)
+
+# builder/extract.rs 里抽「相对路径必须落在输出根内」这条安全阀：包内路径来自
+# 归档 metadata，`..` / 绝对路径 / 盘符必须被拒，否则解包能写到输出目录之外。
+$script:LogicExtractItems = @(
+    @{ Kind = 'fn'; Name = 'relative_under_root' }
+)
+
+# utils/hash.rs 里抽摘要核心：文件 IO 是 Windows 专有（FILE_FLAG_SEQUENTIAL_SCAN），
+# 但「同一份字节算出的摘要」必须能在任意平台断言。
+$script:LogicHashItems = @(
+    @{ Kind = 'const'; Name = 'HASH_BUFFER_SIZE' }
+    @{ Kind = 'fn'; Name = 'hash_reader' }
+)
+
 function Get-DevCheckRepoRoot {
     param([Parameter(Mandatory)][string]$ScriptRoot)
     # tools/devcheck/lib -> 仓库根
@@ -65,6 +109,9 @@ function New-TypecheckGen {
 
     $uninstall = Read-RustSource -Path (Join-Path $kachina 'installer/uninstall.rs')
     $error = Read-RustSource -Path (Join-Path $kachina 'utils/error.rs')
+    $lnk = Read-RustSource -Path (Join-Path $kachina 'installer/lnk.rs')
+    $dir = Read-RustSource -Path (Join-Path $kachina 'utils/dir.rs')
+    $osVersion = Read-RustSource -Path (Join-Path $kachina 'utils/os_version.rs')
 
     $header = @'
 // 生成物，勿手改：由 tools/devcheck/devcheck.ps1 从 src-tauri/src 复制。
@@ -75,10 +122,21 @@ function New-TypecheckGen {
         -Content ($header + "`n" + (Remove-TauriCommandAttr -Text $uninstall.Text) + "`n")
     Write-GeneratedFile -Path (Join-Path $genDir 'utils_error.rs') `
         -Content ($header + "`n" + $error.Text)
+    # lnk.rs 里 create_lnk / get_dirs 两个命令都要去掉 #[tauri::command]；
+    # 它依赖的 is_safe_delete_target / has_reparse_point 由 gen/uninstall.rs 提供。
+    Write-GeneratedFile -Path (Join-Path $genDir 'lnk.rs') `
+        -Content ($header + "`n" + (Remove-TauriCommandAttr -Text $lnk.Text) + "`n")
+    Write-GeneratedFile -Path (Join-Path $genDir 'utils_dir.rs') `
+        -Content ($header + "`n" + $dir.Text)
+    Write-GeneratedFile -Path (Join-Path $genDir 'utils_os_version.rs') `
+        -Content ($header + "`n" + $osVersion.Text)
 
     return @(
         (Join-Path $genDir 'uninstall.rs')
         (Join-Path $genDir 'utils_error.rs')
+        (Join-Path $genDir 'lnk.rs')
+        (Join-Path $genDir 'utils_dir.rs')
+        (Join-Path $genDir 'utils_os_version.rs')
     )
 }
 
@@ -94,12 +152,18 @@ function New-LogicGen {
     $uninstall = Read-RustSource -Path (Join-Path $kachina 'installer/uninstall.rs')
     $pack = Read-RustSource -Path (Join-Path $kachina 'builder/pack.rs')
     $secureTemp = Read-RustSource -Path (Join-Path $kachina 'utils/secure_temp.rs')
+    $mirrorc = Read-RustSource -Path (Join-Path $kachina 'thirdparty/mirrorc.rs')
+    $h3 = Read-RustSource -Path (Join-Path $kachina 'capabilities/h3.rs')
+    $builderLocal = Read-RustSource -Path (Join-Path $kachina 'builder/local.rs')
+    $builderExtract = Read-RustSource -Path (Join-Path $kachina 'builder/extract.rs')
+    $hashRs = Read-RustSource -Path (Join-Path $kachina 'utils/hash.rs')
 
     $parts = [System.Collections.Generic.List[string]]::new()
     $parts.Add(@'
 // 生成物，勿手改：由 tools/devcheck/devcheck.ps1 按名字从
 // src-tauri/src/{installer/uninstall.rs, builder/pack.rs,
-// utils/secure_temp.rs} 抽取。
+// utils/secure_temp.rs, thirdparty/mirrorc.rs, capabilities/h3.rs,
+// builder/local.rs, builder/extract.rs, utils/hash.rs} 抽取。
 // 抽取规则见 tools/devcheck/lib/RustSource.ps1；找不到清单里的 item 会直接报错。
 // 本文件被 src/main.rs 用 include! 展开到 crate 根，Path/PathBuf 由 main.rs 引入。
 
@@ -131,6 +195,26 @@ fn is_under_system_root(path: &Path) -> bool {
     foreach ($item in $script:LogicRuntimeItems) {
         $parts.Add((Get-RustItem -Text $secureTemp.Text -Masked $secureTemp.Masked `
                     -Kind $item.Kind -Name $item.Name -SourceName 'utils/secure_temp.rs'))
+    }
+    foreach ($item in $script:LogicMirrorcItems) {
+        $parts.Add((Get-RustItem -Text $mirrorc.Text -Masked $mirrorc.Masked `
+                    -Kind $item.Kind -Name $item.Name -SourceName 'thirdparty/mirrorc.rs'))
+    }
+    foreach ($item in $script:LogicH3Items) {
+        $parts.Add((Get-RustItem -Text $h3.Text -Masked $h3.Masked `
+                    -Kind $item.Kind -Name $item.Name -SourceName 'capabilities/h3.rs'))
+    }
+    foreach ($item in $script:LogicBuilderItems) {
+        $parts.Add((Get-RustItem -Text $builderLocal.Text -Masked $builderLocal.Masked `
+                    -Kind $item.Kind -Name $item.Name -SourceName 'builder/local.rs'))
+    }
+    foreach ($item in $script:LogicExtractItems) {
+        $parts.Add((Get-RustItem -Text $builderExtract.Text -Masked $builderExtract.Masked `
+                    -Kind $item.Kind -Name $item.Name -SourceName 'builder/extract.rs'))
+    }
+    foreach ($item in $script:LogicHashItems) {
+        $parts.Add((Get-RustItem -Text $hashRs.Text -Masked $hashRs.Masked `
+                    -Kind $item.Kind -Name $item.Name -SourceName 'utils/hash.rs'))
     }
 
     $out = Join-Path $genDir 'extracted.rs'
