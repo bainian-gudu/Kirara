@@ -300,7 +300,11 @@ pub async fn run_mirrorc_download(
     // 正在运行的 exe。真命中说明调用方给错了路径：立刻还原并失败，绝不让更新器
     // 以 `.instbak` 的形态留在磁盘上。
     if let Some(backup) = prepare_target(zip_path).await? {
-        crate::fs::rollback_self_update_backup_sync(&std::path::PathBuf::from(zip_path), &backup);
+        if let Err(e) =
+            crate::fs::rollback_self_update_backup_sync(&std::path::PathBuf::from(zip_path), &backup)
+        {
+            tracing::error!("还原被误命中的更新器失败，备份保留在 {}: {e}", backup.display());
+        }
         return crate::utils::error::return_ta_result(
             "Mirrorc archive path collides with the running installer".to_string(),
             "MIRRORC_TARGET_ERR",

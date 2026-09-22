@@ -951,12 +951,16 @@ pub fn rollback_self_update_backup_sync(target: &Path, backup: &Path) -> std::io
 pub async fn rollback_self_update_backup(target: &str, backup: &Path) {
     let target = PathBuf::from(target);
     let backup = backup.to_path_buf();
+    let backup_for_log = backup.clone();
     let res =
         tokio::task::spawn_blocking(move || rollback_self_update_backup_sync(&target, &backup))
             .await;
     match res {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::error!("自更新回滚失败，旧安装器保留在 {}: {e}", backup.display()),
+        Ok(Err(e)) => tracing::error!(
+            "自更新回滚失败，旧安装器保留在 {}: {e}",
+            backup_for_log.display()
+        ),
         Err(e) => tracing::error!("自更新回滚任务失败: {e}"),
     }
 }

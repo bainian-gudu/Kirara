@@ -30,11 +30,29 @@ pwsh tools/devcheck/devcheck.ps1 -Fix            # 只对我们维护的 .rs 跑
 | `gen` | 从 `src-tauri/`、`src/` 源码生成检查用的 Rust / TS 文件 | pwsh 7 | ~0.3s |
 | `rust` | **整份** `installer/uninstall.rs` + `installer/lnk.rs` + `utils/{error,dir,os_version}.rs` 的类型检查：塞进一个只有 11 个依赖的 crate，`cargo check --target x86_64-pc-windows-msvc`。不需要 tauri、不需要 Windows 机器 | cargo + `rustup target add x86_64-pc-windows-msvc` | 首次 ~30s，之后 ~0.6s |
 | `native` | vendored `rcedit-sys` 的 C++（`rescle.cc` / `librcedit.cpp`）真用 MSVC 编一遍。没有 `cl.exe` 的机器（Linux / 未进 VS 开发环境的 Windows）自动 SKIP | cargo + MSVC（`cl.exe` 在 PATH） | 首次 ~30s，之后 ~2s |
-| `logic` | 同一批函数的**行为断言**（238 条，含循环用例）：注册表 / 快捷方式 / 计划任务名 / 用户数据目录 / 安装目录内文件清单 / 旧版本残留清单安全阀、路径归一化与比较、微软签名判定、zip 条目名解码（替代 zip fork 的那条语义）、H3 证书固定值与 SPKI 哈希（用 openssl 算出的样例证书交叉验证）、打包器的包体 PE 识别 / 嵌入名规则 / 抽取路径越界防护、md5 与 xxh 的分块摘要，以及用**临时配置文件 + 临时协议正文**跑 `resolve_agreement`（下游应用侧的配置不在本仓库，所以这里不依赖它） | cargo | 首次 ~15s，之后 ~0.4s |
+| `logic` | 同一批函数的**行为断言**（244 条，含循环用例）：注册表 / 快捷方式 / 计划任务名 / 用户数据目录 / 安装目录内文件清单 / 旧版本残留清单安全阀、路径归一化与比较、微软签名判定、zip 条目名解码（替代 zip fork 的那条语义）、H3 证书固定值与 SPKI 哈希（用 openssl 算出的样例证书交叉验证）、打包器的包体 PE 识别 / 嵌入名规则 / 抽取路径越界防护、md5 / xxh / sha256 的分块摘要、自更新失败时把 `.instbak` 还原回原名的语义（真实临时文件），以及用**临时配置文件 + 临时协议正文**跑 `resolve_agreement`（下游应用侧的配置不在本仓库，所以这里不依赖它） | cargo | 首次 ~15s，之后 ~0.4s |
 | `front` | `utils/agreement.ts` + `types.ts` 的 `tsc --strict`；`src` 下**全部** `.vue` 的 `@vue/compiler-sfc` 编译；`agreement.ts` 的 prettier 风格 | node + npm | 首次 ~10s，之后 ~2s |
 | `ci` | `tools/ci/Import-DevCmd.ps1` 的行为：用假 vcvarsall 输出跑一遍「生成 .cmd → 解析输出 → 注入环境 → 写 `GITHUB_ENV`」，并断言工作流里的 action 版本不低于 `README.md` 登记的下限 | pwsh 7 | ~1s |
 
 全套热跑 ≈ 5–10 秒（`native` 依赖 Windows + MSVC，缺平台时直接 SKIP）。
+
+## 本地整包类型检查（`tools/devcheck/check-installer.sh`）
+
+`rust` 层只覆盖 `uninstall.rs` / `lnk.rs` / 几个 utils；`fs.rs`、`ipc/`、`thirdparty/`、
+`dfs.rs`、`module/wv2.rs` 这些文件的类型/借用错误过去只能等 Windows runner 的 `Build`
+job 报出来（一轮十几分钟）。在 WSL 上可以先把它们跑一遍：
+
+```bash
+bash tools/devcheck/check-installer.sh
+```
+
+做法是用一组 stub 工具链（`cl` / `lib` / `link` / `nasm` / `llvm-rc`，脚本运行时在临时
+目录里生成并 `chmod +x`）喂给 `cargo check --target x86_64-pc-windows-msvc`：`check`
+不做链接，所以 C 侧产物的内容无关紧要，只要 cc-rs / `embed-resource` / `aws-lc-sys`
+能拿到「生成成功」的文件就能继续往下走。**它只做类型检查，不产生可用二进制**；
+真正的构建、链接与 LTO 仍然只在 Windows 上跑。
+
+首次运行要把整包依赖编一遍（本仓库 `src-tauri/target` 有缓存时约 10 秒，冷缓存几分钟）。
 
 ## `-SelfTest` 的并发与清场
 
@@ -204,8 +222,9 @@ Rust 类型/借用/生命周期错误（含 `std::os::windows`、`windows`、
   都是 IO）。本轮另搭最小 crate 在 msvc 上类型检查过，**没有实机跑过**：验签的证书
   Subject 布局要实机确认
 - `utils/acl.rs` 的 SDDL 改动是否真的还能让提权流程连上管道 —— 只有实机安装能验证
-- kachina 其余 Rust 模块（`dfs.rs`、`local.rs`、`module/wv2.rs`、`cli/mod.rs`、
-  `main.rs` …）
+- kachina 其余 Rust 模块的**行为**（`dfs.rs`、`local.rs`、`module/wv2.rs`、`cli/mod.rs`、
+  `main.rs` …）：类型层面现在可以用 `tools/devcheck/check-installer.sh` 在 Linux 上
+  整包跑一遍，但运行期语义仍然只有实机安装能验证
 - `installer/lnk.rs` 的**行为**：COM 那条路只在 Windows 上跑，这里只能保证它在
   `x86_64-pc-windows-msvc` 上编得过；快捷方式真的写出来没有、指向对不对，
   仍然要实机装一次才知道
