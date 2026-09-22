@@ -140,6 +140,8 @@ interface RunMirrorcDownload {
   type: 'RunMirrorcDownload';
   url: string;
   zip_path: string;
+  /** 接口返回的归档摘要；安装器侧会用它校验下载内容 */
+  sha256?: string;
 }
 
 interface RunMirrorcInstall {
@@ -296,11 +298,12 @@ export interface MirrorcUpdate {
 export async function ipcRunMirrorcDownload(
   url: string,
   zip_path: string,
+  sha256: string | undefined,
   notify: (value: Event<MirrorcStatus>) => void,
   elevate = false,
 ) {
   return ipc<RunMirrorcDownload, void, MirrorcStatus>(
-    { type: 'RunMirrorcDownload', url, zip_path },
+    { type: 'RunMirrorcDownload', url, zip_path, sha256 },
     elevate,
     notify,
   );

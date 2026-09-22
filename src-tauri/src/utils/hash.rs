@@ -16,7 +16,20 @@ pub fn hash_reader<R: Read>(hash_algorithm: &str, mut reader: R) -> anyhow::Resu
     use anyhow::Context as _;
 
     let mut buffer = vec![0u8; HASH_BUFFER_SIZE];
-    if hash_algorithm == "md5" {
+    if hash_algorithm == "sha256" {
+        // 只用在校验 Mirror酱 归档：接口给的 `sha256` 字段此前仅用来拼文件名，
+        // 下载内容从未与之比对。
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        loop {
+            let read = reader.read(&mut buffer).context("READ_FILE_ERR")?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Ok(format!("{:x}", hasher.finalize()))
+    } else if hash_algorithm == "md5" {
         let mut hasher = chksum_md5::MD5::new();
         loop {
             let read = reader.read(&mut buffer).context("READ_FILE_ERR")?;

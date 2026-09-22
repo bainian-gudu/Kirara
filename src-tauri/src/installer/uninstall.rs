@@ -1048,10 +1048,7 @@ pub async fn run_uninstall(
             }
         }
         // 写入 delete_on_exit 值
-        DELETE_SELF_ON_EXIT_PATH
-            .write()
-            .unwrap()
-            .replace(tmp_uninstaller_path.to_string_lossy().to_string());
+        schedule_delete_on_exit(&tmp_uninstaller_path);
     }
 
     let mut delete_list: Vec<PathBuf> = Vec::new();
@@ -1166,6 +1163,18 @@ pub async fn run_uninstall(
         return Err(e.into());
     }
     Ok(res)
+}
+
+/// 登记「进程退出时删除这个文件」。
+///
+/// 只应在确实需要删除该文件的那一刻调用：自更新把正在运行的 exe 改名成 `.instbak`
+/// 之后，这份备份就是旧版本的最后一份拷贝，**失败路径登记它等于把更新器删掉**。
+/// 因此写入点只有两个——自更新/自卸载全部成功之后，以及卸载器把自己挪进 %TEMP% 之后。
+pub fn schedule_delete_on_exit(path: &Path) {
+    DELETE_SELF_ON_EXIT_PATH
+        .write()
+        .unwrap()
+        .replace(path.to_string_lossy().to_string());
 }
 
 pub fn delete_self_on_exit() {

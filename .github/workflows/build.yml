@@ -137,6 +137,7 @@ jobs:
           - userdata-ignore
           - occupied-process
           - builder-extract-replace
+          - interrupted-download
     steps:
       - name: Checkout
         uses: actions/checkout@v5

@@ -11,9 +11,36 @@ use anyhow::Result;
 use async_compression::tokio::bufread::ZstdDecoder as TokioZstdDecoder;
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, BufReader};
 use tracing::{info, warn};
+
+/// 自更新收尾。
+///
+/// `prepare_target` 把正在运行的 exe 改名成 `.instbak` 之后，原名文件在磁盘上已经
+/// 不存在、备份是旧版本的最后一份拷贝。这里保证只有整次安装真的成功才登记
+/// 「退出时删除备份」；失败（网络中断、哈希不符、磁盘满、进程占用）一律把备份改回
+/// 原名，用户手上的更新器不会因为一次失败的更新而消失。
+async fn finalize_self_update<T, E>(
+    target: &str,
+    backup: Option<&PathBuf>,
+    res: Result<T, E>,
+) -> Result<T, E> {
+    let Some(backup) = backup else {
+        return res;
+    };
+    match res {
+        Ok(v) => {
+            crate::fs::commit_self_update_backup(backup);
+            Ok(v)
+        }
+        Err(e) => {
+            crate::fs::rollback_self_update_backup(target, backup).await;
+            Err(e)
+        }
+    }
+}
 
 fn default_as_false() -> bool {
     false
@@ -128,8 +155,18 @@ pub async fn ipc_install_file(
     args: InstallFileArgs,
     notify: impl Fn(serde_json::Value) + std::marker::Send + 'static,
 ) -> TAResult<serde_json::Value> {
-    let target = args.target;
+    let target = args.target.clone();
     let override_old_path = prepare_target(&target).await?;
+    let res = install_file_inner(args, override_old_path.as_ref(), notify).await;
+    finalize_self_update(&target, override_old_path.as_ref(), res).await
+}
+
+async fn install_file_inner(
+    args: InstallFileArgs,
+    override_old_path: Option<&PathBuf>,
+    notify: impl Fn(serde_json::Value) + std::marker::Send + 'static,
+) -> TAResult<serde_json::Value> {
+    let target = args.target;
     let progress_noti = move |downloaded: usize| {
         notify(serde_json::json!(downloaded));
     };
@@ -202,7 +239,7 @@ pub async fn ipc_install_file(
                 &target,
                 diff_size,
                 progress_noti,
-                override_old_path,
+                override_old_path.cloned(),
                 None, // 传入None，因为现在insight由处理管理
             )
             .await?;
@@ -303,8 +340,22 @@ pub async fn install_file_by_reader<C>(
 where
     C: tokio::io::AsyncRead + Unpin + std::marker::Send,
 {
-    let target = args.target;
+    let target = args.target.clone();
     let override_old_path = prepare_target(&target).await?;
+    let res = install_file_by_reader_inner(args, reader, override_old_path.as_ref(), notify).await;
+    finalize_self_update(&target, override_old_path.as_ref(), res).await
+}
+
+async fn install_file_by_reader_inner<C>(
+    args: InstallFileArgs,
+    reader: &mut C,
+    override_old_path: Option<&PathBuf>,
+    notify: impl Fn(serde_json::Value) + std::marker::Send + 'static,
+) -> Result<serde_json::Value>
+where
+    C: tokio::io::AsyncRead + Unpin + std::marker::Send,
+{
+    let target = args.target;
     let progress_noti = move |downloaded: usize| {
         notify(serde_json::json!(downloaded));
     };
@@ -336,10 +387,16 @@ where
             progressed_copy(reader, &mut buffer, progress_noti).await?;
             let reader = std::io::Cursor::new(buffer);
             let is_self_update = override_old_path.is_some();
-            let res =
-                progressed_hpatch(reader, &target, diff_size, |_| {}, override_old_path, None)
-                    .await?
-                    .0;
+            let res = progressed_hpatch(
+                reader,
+                &target,
+                diff_size,
+                |_| {},
+                override_old_path.cloned(),
+                None,
+            )
+            .await?
+            .0;
             if args.md5.is_some() || args.xxh.is_some() {
                 // 如果需要清理安装器索引标记，先清理再进行哈希校验
                 if args.clear_installer_index_mark.unwrap_or(false) || is_self_update {

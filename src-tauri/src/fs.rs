@@ -19,7 +19,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, R
 
 use crate::{
     dfs::InsightItem,
-    installer::uninstall::DELETE_SELF_ON_EXIT_PATH,
     local::mmap,
     utils::{
         error::{TAResult, DOWNLOAD_STALLED, DOWNLOAD_TOO_SLOW},
@@ -486,18 +485,47 @@ pub struct Metadata {
     pub unwritable: bool,
 }
 
+/// `check_local_files` 的结果。
+///
+/// 除了「清单里有哪些文件在本地」，还要给出「本地有哪些文件不在清单里」：后者此前
+/// 完全不可见（函数只按清单逐条比对），安装目录里留着的旧版本残留、用户自己放进去的
+/// 文件都不会出现在计划里。
+#[derive(Serialize, Debug, Clone)]
+pub struct LocalScan {
+    /// 清单里、本地确实存在的文件（`file_name` 是绝对路径）
+    pub files: Vec<Metadata>,
+    /// 本地存在但不在清单里的文件：相对安装目录、小写、`/` 分隔
+    pub unmanaged: Vec<String>,
+}
+
+/// 路径归一化成「小写 + `/` 分隔」，清单与本地路径都走这一步再比对。
+fn normalize_for_match(path: &str) -> String {
+    path.replace('\\', "/").to_lowercase()
+}
+
 pub async fn check_local_files(
     source: String,
     hash_algorithm: String,
     file_list: Vec<String>,
     notify: impl Fn(serde_json::Value) + std::marker::Send + 'static,
-) -> Result<Vec<Metadata>> {
+) -> Result<LocalScan> {
+    let empty = LocalScan {
+        files: Vec::new(),
+        unmanaged: Vec::new(),
+    };
     let path = Path::new(&source);
     if !path.exists() {
-        return Ok(Vec::new());
+        return Ok(empty);
     }
-    let mut entries = async_walkdir::WalkDir::new(source);
+    // 清单先做成查表：以前是每个目录项线性扫一遍清单、每次比对都 `to_lowercase()`
+    // 分配一次字符串，几万个文件的安装目录乘上千条清单就是几千万次分配。
+    let wanted: std::collections::HashSet<String> =
+        file_list.iter().map(|f| normalize_for_match(f)).collect();
+    let source_norm = normalize_for_match(&source);
+    let source_norm = source_norm.trim_end_matches('/');
+    let mut entries = async_walkdir::WalkDir::new(&source);
     let mut files = Vec::new();
+    let mut unmanaged = Vec::new();
     loop {
         match entries.next().await {
             Some(Ok(entry)) => {
@@ -506,20 +534,36 @@ pub async fn check_local_files(
                     let path = entry.path();
                     let path = path.to_str().context("PATH_TO_STRING_ERR")?;
                     let size = entry.metadata().await.context("GET_METADATA_ERR")?.len();
-                    file_list.iter().for_each(|file| {
-                        if path
-                            .to_lowercase()
-                            .replace("\\", "/")
-                            .ends_with(&file.to_lowercase().replace("\\", "/"))
-                        {
-                            files.push(Metadata {
-                                file_name: path.to_string(),
-                                hash: "".to_string(),
-                                size,
-                                unwritable: false,
-                            });
+                    let normalized = normalize_for_match(path);
+                    // 按路径组件逐级去掉前缀做后缀匹配：清单里的 `d.dll` 只认名为
+                    // `d.dll` 的文件，不再被 `.../ad.dll` 这种字符串后缀命中
+                    // （旧写法会让前端拿到一个哈希对不上的假条目）。
+                    let mut matched = false;
+                    let mut cursor = normalized.as_str();
+                    loop {
+                        if wanted.contains(cursor) {
+                            matched = true;
+                            break;
                         }
-                    });
+                        match cursor.find('/') {
+                            Some(idx) => cursor = &cursor[idx + 1..],
+                            None => break,
+                        }
+                    }
+                    if matched {
+                        files.push(Metadata {
+                            file_name: path.to_string(),
+                            hash: "".to_string(),
+                            size,
+                            unwritable: false,
+                        });
+                    } else {
+                        let rel = normalized
+                            .strip_prefix(source_norm)
+                            .map(|s| s.trim_start_matches('/').to_string())
+                            .unwrap_or_else(|| normalized.clone());
+                        unmanaged.push(rel);
+                    }
                 }
             }
             Some(Err(e)) => {
@@ -549,11 +593,18 @@ pub async fn check_local_files(
                 file.unwritable = true;
             }
             let res = run_hash(&hash_algorithm, &file.file_name).await;
-            if res.is_err() && writable {
-                return Err(res.err().unwrap());
-            }
-            let hash = res.unwrap();
-            file.hash = hash;
+            // 读不动又写不动（被占用 / 权限不足）时只标记 `unwritable`：以前这里会
+            // `res.unwrap()` 直接 panic 在 blocking 线程上，整次扫描以 HASH_THREAD_ERR
+            // 收场，前端连「哪些文件被占用」都拿不到。
+            file.hash = match res {
+                Ok(hash) => hash,
+                Err(e) => {
+                    if writable {
+                        return Err(e);
+                    }
+                    String::new()
+                }
+            };
 
             Ok(file)
         });
@@ -569,7 +620,10 @@ pub async fn check_local_files(
         notify(serde_json::json!((finished, len)));
         finished_hashes.push(res);
     }
-    Ok(finished_hashes)
+    Ok(LocalScan {
+        files: finished_hashes,
+        unmanaged,
+    })
 }
 
 #[tauri::command]
@@ -832,6 +886,11 @@ pub async fn create_local_stream(
     Ok(Box::new(decoder))
 }
 
+/// 目标就是正在运行的 exe 时，把它改名成 `<exe>.instbak` 腾出原名，返回这份备份的路径。
+///
+/// 这里**不登记**退出自删：此刻磁盘上原名文件已经不存在，而备份是旧版本的最后一份
+/// 拷贝，调用方后面任何一步失败都不该把它删掉。调用方必须把返回值交给
+/// [`commit_self_update_backup`]（成功）或 [`rollback_self_update_backup`]（失败）收尾。
 pub async fn prepare_target(target: &str) -> Result<Option<PathBuf>, anyhow::Error> {
     let target = Path::new(&target);
     if !target.is_absolute()
@@ -857,10 +916,6 @@ pub async fn prepare_target(target: &str) -> Result<Option<PathBuf>, anyhow::Err
             .await
             .context("RENAME_EXE_ERR")?;
         override_path = Some(old_exe.clone());
-        DELETE_SELF_ON_EXIT_PATH
-            .write()
-            .unwrap()
-            .replace(old_exe.to_string_lossy().to_string());
     }
 
     // 确保 目录
@@ -869,6 +924,34 @@ pub async fn prepare_target(target: &str) -> Result<Option<PathBuf>, anyhow::Err
         .await
         .context("CREATE_PARENT_DIR_ERR")?;
     Ok(override_path)
+}
+
+/// 自更新成功：新文件已经就位，登记进程退出时清理改名后的旧副本。
+pub fn commit_self_update_backup(backup: &Path) {
+    crate::installer::uninstall::schedule_delete_on_exit(backup);
+}
+
+/// 自更新失败：删掉可能只写了一半的目标文件，把备份改回原名。
+///
+/// 调用前磁盘状态可能是「原名缺失 + 半截新文件」（直写模式）或「原名缺失」
+/// （patch 模式在 `.patching` 上失败）。两种都还原成「旧版本原地可用」。
+pub fn rollback_self_update_backup_sync(target: &Path, backup: &Path) {
+    if let Err(e) = std::fs::remove_file(target) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!("自更新回滚：删除半成品目标失败（继续还原备份）: {e}");
+        }
+    }
+    if let Err(e) = std::fs::rename(backup, target) {
+        // 还原不了就把备份留在磁盘上：更新器仍然可用，只是名字带 .instbak。
+        tracing::error!("自更新回滚失败，旧安装器保留在 {}: {e}", backup.display());
+    }
+}
+
+pub async fn rollback_self_update_backup(target: &str, backup: &Path) {
+    let target = PathBuf::from(target);
+    let backup = backup.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || rollback_self_update_backup_sync(&target, &backup))
+        .await;
 }
 
 pub async fn create_target_file(target: &str) -> Result<impl AsyncWrite, anyhow::Error> {
@@ -976,6 +1059,16 @@ where
     let old_target_old = target_cl.with_extension("patchold");
     // 尝试 移除 old_target_old, do 不 throw 错误 如果 失败
     let _ = tokio::fs::remove_file(old_target_old).await;
+    // 上次在换文件的中途被结束进程：目标缺失而 `.old` 还在 —— 那是旧版本唯一的一份
+    // 拷贝，先还原回原名；两份都在说明 `.old` 是上次没删掉的残留，清掉。
+    let stale_old = target_cl.with_extension("old");
+    if stale_old.exists() {
+        if target_cl.exists() {
+            let _ = tokio::fs::remove_file(&stale_old).await;
+        } else if let Err(e) = tokio::fs::rename(&stale_old, target_cl).await {
+            tracing::warn!("还原上次中断留下的 {} 失败: {e}", stale_old.display());
+        }
+    }
     let new_target = target_cl.with_extension("patching");
     let target_size = target_cl.metadata().context("GET_TARGET_SIZE_ERR")?;
     let target_file = std::fs::File::create(new_target.clone()).context("CREATE_NEW_TARGET_ERR")?;
@@ -1004,6 +1097,9 @@ where
         let old_target = target_cl.with_extension("old");
         let exe_path = std::env::current_exe().context("GET_EXE_PATH_ERR")?;
         let target_path_ori = PathBuf::from(target_ori);
+        // 下面这串 rename 是「换文件」的全部窗口：任一步失败都必须把目标还原成旧文件。
+        // 中间态是「目标缺失 + 旧文件在 .old + 新文件在 .patching」——此时进程被结束
+        // 或安装器报错退出，用户手上就只剩一个文件名不对的旧文件和一份半成品。
         // 如果 旧 文件 是 不 self
         if exe_path != target_cl && exe_path != target_path_ori {
             // 重命名为 .old
@@ -1011,30 +1107,45 @@ where
                 .await
                 .context("RENAME_TARGET_ERR")?;
             // 将新文件重命名为原文件名
-            tokio::fs::rename(new_target, target_cl)
-                .await
-                .context("RENAME_NEW_TARGET_ERR")?;
-            // 删除 旧 文件
-            tokio::fs::remove_file(old_target)
-                .await
-                .context("REMOVE_OLD_TARGET_ERR")?;
+            if let Err(e) = tokio::fs::rename(new_target.clone(), target_cl).await {
+                // 还原旧文件、丢掉半成品
+                if let Err(e2) = tokio::fs::rename(old_target.clone(), target_cl).await {
+                    tracing::error!(
+                        "换文件失败且还原失败，旧文件仍在 {}: {e2}",
+                        old_target.display()
+                    );
+                }
+                let _ = tokio::fs::remove_file(&new_target).await;
+                return Err(anyhow::Error::new(e).context("RENAME_NEW_TARGET_ERR"));
+            }
+            // 删除 旧 文件：新文件已经就位，这里失败只留一份垃圾，不该让整次安装报错
+            if let Err(e) = tokio::fs::remove_file(old_target.clone()).await {
+                tracing::warn!("清理旧目标失败，保留 {}: {e}", old_target.display());
+            }
         } else {
-            if override_old_path.is_none() {
+            let moved_old = if override_old_path.is_none() {
                 // 重命名为 .old
                 tokio::fs::rename(target_cl, old_target.clone())
                     .await
                     .context("RENAME_TARGET_ERR")?;
-            }
+                true
+            } else {
+                false
+            };
             // 当前程序已重命名且无法删除，只需用新文件替换
-            tokio::fs::rename(new_target, target_path_ori)
-                .await
-                .context("RENAME_NEW_TARGET_ERR")?;
+            if let Err(e) = tokio::fs::rename(new_target.clone(), target_path_ori).await {
+                if moved_old {
+                    let _ = tokio::fs::rename(old_target.clone(), target_cl).await;
+                }
+                let _ = tokio::fs::remove_file(&new_target).await;
+                return Err(anyhow::Error::new(e).context("RENAME_NEW_TARGET_ERR"));
+            }
         }
     } else {
-        // 删除 新 目标
-        tokio::fs::remove_file(new_target)
-            .await
-            .context("REMOVE_NEW_TARGET_ERR")?;
+        // 目标从未被动过：删掉半成品，把 patch 自身的错误码报出去
+        if let Err(e) = tokio::fs::remove_file(new_target.clone()).await {
+            tracing::warn!("清理补丁半成品失败，保留 {}: {e}", new_target.display());
+        }
         return Err(anyhow::Error::new(std::io::Error::other(format!(
             "Patch failed with code {res}"
         ))))

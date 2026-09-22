@@ -44,7 +44,9 @@ impl Default for ManagedElevate {
 
 impl ManagedElevate {
     pub fn new() -> Self {
-        let (broadcast_tx, _broadcast_rx) = tokio::sync::broadcast::channel(100);
+        // 进度与结果共用这条广播。容量越小越容易在文件数多的安装里落到 `Lagged`
+        // 分支（见 `run` 里的处理），这里给到 256 条冗余。
+        let (broadcast_tx, _broadcast_rx) = tokio::sync::broadcast::channel(256);
         let (mpsc_tx, mpsc_rx) = tokio::sync::mpsc::channel(100);
         let pipe_id = format!("{}", uuid::Uuid::new_v4());
         Self {
@@ -196,7 +198,19 @@ pub async fn managed_operation(
                 .into());
         }
         let mut rx = mgr.broadcast_tx.subscribe();
-        while let Ok(v) = rx.recv().await {
+        loop {
+            let v = match rx.recv().await {
+                Ok(v) => v,
+                // 这个广播同时承载进度与结果：文件多、界面线程慢时进度会把通道填满，
+                // `recv()` 于是返回 `Lagged`。丢掉的全是进度，结果还在后面 ——
+                // 以前 `while let Ok` 会在这里直接退出循环、把整次操作报成 IPC_ERR，
+                // 而提权进程其实还在正常干活。
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!("提权 IPC 广播落后 {skipped} 条消息，继续接收");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
             let msgid = v["id"].as_str();
             if let Some(msgid) = msgid {
                 if msgid == id {

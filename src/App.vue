@@ -1160,21 +1160,28 @@ async function runInstall(): Promise<void> {
   }
   subStep.value = 1;
   percent.value = 5;
-  const local_meta = (
-    await ipcCheckLocalFiles(
-      {
-        source: source.value,
-        hash_algorithm: hashKey,
-        file_list: latest_meta.hashed.map((e) => e.file_name),
-      },
-      ({ payload }) => {
-        const [currentValue, total] = payload;
-        current.value = `${currentValue} / ${total}`;
-        percent.value = 5 + (currentValue / total) * 15;
-      },
-      needElevate.value,
-    )
-  ).map((e) => {
+  const local_scan = await ipcCheckLocalFiles(
+    {
+      source: source.value,
+      hash_algorithm: hashKey,
+      file_list: latest_meta.hashed.map((e) => e.file_name),
+    },
+    ({ payload }) => {
+      const [currentValue, total] = payload;
+      current.value = `${currentValue} / ${total}`;
+      percent.value = 5 + (currentValue / total) * 15;
+    },
+    needElevate.value,
+  );
+  // 安装目录里不受本次清单管理的文件（旧版本残留、用户自己放进去的东西）。
+  // 它们不参与本次下载计划，但用户报「装完还剩奇怪文件」时这份清单就是线索。
+  if (local_scan.unmanaged.length > 0) {
+    warn(
+      `安装目录内有 ${local_scan.unmanaged.length} 个不受本次安装清单管理的文件（保留不动）`,
+      local_scan.unmanaged.slice(0, 20),
+    );
+  }
+  const local_meta = local_scan.files.map((e) => {
     return {
       ...e,
       file_name: e.file_name.replace(source.value, ''),
@@ -1679,6 +1686,7 @@ async function runMirrorcInstall() {
   await ipcRunMirrorcDownload(
     mirrorc_zip_url,
     mirrorc_zip_path,
+    mirrorc_status.data.sha256,
     ({ payload }) => {
       if (payload.type === 'download') {
         const { downloaded, total } = payload;

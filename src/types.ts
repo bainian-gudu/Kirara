@@ -154,12 +154,19 @@ export type InvokeGetDfsMetadataRes = {
   deletes?: string[];
 };
 
-export type InvokeDeepReaddirWithMetadataRes = Array<{
+export type LocalFileMetadata = {
   file_name: string;
   size: number;
   hash: string;
   unwritable: boolean;
-}>;
+};
+
+export type InvokeDeepReaddirWithMetadataRes = {
+  /** 元数据清单里、本地存在的文件（`file_name` 是绝对路径） */
+  files: Array<LocalFileMetadata>;
+  /** 本地存在但不在清单里的文件：相对安装目录、小写、`/` 分隔 */
+  unmanaged: Array<string>;
+};
 
 export type InvokeGetDfsRes = {
   url?: string;

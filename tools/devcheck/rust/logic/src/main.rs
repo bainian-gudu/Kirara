@@ -1331,7 +1331,7 @@ fn builder_pack_cases() {
 }
 
 fn hash_reader_cases() {
-    println!("[22] 文件哈希：md5 / xxh 摘要与分块边界");
+    println!("[22] 文件哈希：md5 / xxh / sha256 摘要与分块边界");
 
     let hello = hash_reader("md5", &b"hello"[..]).expect("md5 hello");
     check(
@@ -1368,6 +1368,25 @@ fn hash_reader_cases() {
         "xxh：与直接哈希一致",
         got_xxh == expected_xxh,
         format!("got {got_xxh} want {expected_xxh}"),
+    );
+
+    // Mirror酱 归档校验用的就是这条分支：摘要算错等于校验形同虚设。
+    let got_sha_hello = hash_reader("sha256", &b"hello"[..]).expect("sha256 hello");
+    check(
+        "sha256：已知摘要",
+        got_sha_hello
+            == "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+        format!("got {got_sha_hello}"),
+    );
+    use sha2::Digest as _;
+    let mut sha_big = sha2::Sha256::new();
+    sha_big.update(&big);
+    let expected_sha = format!("{:x}", sha_big.finalize());
+    let got_sha_big = hash_reader("sha256", &big[..]).expect("sha256 big");
+    check(
+        "sha256：跨 1 MB 分块与一次性哈希一致",
+        got_sha_big == expected_sha,
+        format!("got {got_sha_big} want {expected_sha}"),
     );
 
     check(

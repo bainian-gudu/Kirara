@@ -32,6 +32,8 @@ pub enum IpcOperation {
     RunMirrorcDownload {
         zip_path: String,
         url: String,
+        #[serde(default)]
+        sha256: Option<String>,
     },
     RunMirrorcInstall {
         zip_path: String,
@@ -109,8 +111,18 @@ pub async fn run_opr(
         } => Ok(serde_json::json!(
             crate::fs::check_local_files(source, hash_algorithm, file_list, notify).await?
         )),
-        IpcOperation::RunMirrorcDownload { zip_path, url } => {
-            crate::thirdparty::mirrorc::run_mirrorc_download(&zip_path, &url, notify).await?;
+        IpcOperation::RunMirrorcDownload {
+            zip_path,
+            url,
+            sha256,
+        } => {
+            crate::thirdparty::mirrorc::run_mirrorc_download(
+                &zip_path,
+                &url,
+                sha256.as_deref(),
+                notify,
+            )
+            .await?;
             Ok(serde_json::Value::Null)
         }
         IpcOperation::RunMirrorcInstall {

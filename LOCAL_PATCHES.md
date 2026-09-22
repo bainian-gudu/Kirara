@@ -33,6 +33,7 @@
 - [16. 停更依赖换成系统 API](#16-停更依赖换成系统-api)
 - [17. 同步上游 0.5.1 之后的打包器修复](#17-同步上游-051-之后的打包器修复)
 - [18. 同步上游最新的安装行为测试与 unit-test job](#18-同步上游最新的安装行为测试与-unit-test-job)
+- [19. 第四轮加固：自更新失败路径、换文件回滚、归档摘要、提权进度洪水、本地扫描](#19-第四轮加固自更新失败路径换文件回滚归档摘要提权进度洪水本地扫描)
 - [升级上游时的套用顺序](#升级上游时的套用顺序)
 
 | # | 需求 | 涉及文件 |
@@ -56,6 +57,8 @@
 | 15 | H3 传输层改用 `quinn` + `rustls`，去掉 `h3-msquic-async` / `msquic-async` fork | `src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`、`src-tauri/src/capabilities/h3.rs`、`src-tauri/src/capabilities/mod.rs`、`tools/devcheck/` |
 | 16 | 停更依赖换成系统 API（`mslnk` → Shell Link、`nt_version` → ntdll），补齐 vendored 源码许可证 | `src-tauri/src/installer/lnk.rs`、`src-tauri/src/utils/os_version.rs`（新增）、`src-tauri/src/utils/mod.rs`、`src-tauri/src/capabilities/mod.rs`、`src-tauri/src/main.rs`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`、`src-tauri/libs/`、`tools/devcheck/` |
 | 17 | 同步上游 0.5.1 之后的打包器修复（包体 PE 识别、嵌入名规则、抽取路径越界、临时文件与摘要） | `src-tauri/src/builder/local.rs`、`builder/append.rs`、`builder/extract.rs`、`builder/pack.rs`、`src-tauri/src/utils/hash.rs`、`tools/devcheck/` |
+| 18 | 同步上游 0.5.1 之后的安装行为测试与 Rust 单元测试 job | `tests/`（新增 5 组）、`.github/workflows/build.yml`、`package.json` |
+| 19 | 第四轮加固：自更新失败不再丢更新器、补丁换文件回滚、Mirror酱归档摘要、提权进度洪水、本地扫描 | `src-tauri/src/fs.rs`、`ipc/install_file.rs`、`ipc/manager.rs`、`ipc/operation.rs`、`thirdparty/mirrorc.rs`、`installer/uninstall.rs`、`utils/hash.rs`、`src/App.vue`、`src/api/ipc.ts`、`src/types.ts` |
 
 ---
 
@@ -1071,8 +1074,11 @@ Tauri → 原生 Win32 的重写（`dfs2`、`updater-survival`、`plugin-stub`�
 
 ### 有意未移植
 
-- `dfs2`、`plugin-stub`、`updater-survival`、`dump-offline-install`：依赖上游新架构的
-  DFS 会话 / 插件系统 / staging 提交，当前快照没有对应落点；
+- `dfs2`、`plugin-stub`、`dump-offline-install`：依赖上游新架构的 DFS 会话 / 插件系统
+  / staging 提交，当前快照没有对应落点；
+- `updater-survival`：上游版本断言的是「staging 目录被清空、journal 可前滚」，本仓库
+  没有 staging 提交。改写成 `interrupted-download`（见第 19 节），断言当前模型能保证
+  的那部分——中断后旧版本与更新器都还在、没有 `.instbak` / `.patching` 残留、重跑能装完；
 - Sentry 上传：本仓库继续物理移除遥测，Release 只挂产物。
 
 ### 复核方式
@@ -1080,6 +1086,70 @@ Tauri → 原生 Win32 的重写（`dfs2`、`updater-survival`、`plugin-stub`�
 `pwsh tools/devcheck/devcheck.ps1`（含 `-SelfTest`）与 CI 的 `Build` 全绿：
 `test` job 九组行为测试与 `unit-test` job 均通过。本机没有 MSVC 时，Rust 单元测试
 只能在 Windows runner 上执行。
+
+---
+
+## 19. 第四轮加固：自更新失败路径、换文件回滚、归档摘要、提权进度洪水、本地扫描
+
+五处互相独立的缺陷，都在「安装/更新失败或中断」这条路径上。逐条的决策、比较过的方案
+与验收结果见 `docs/notes/implemented/` 下同名的 note（本轮起引入 note 体裁，规范见
+`docs/notes/AGENTS.md`）。
+
+### 19a. 自更新失败不再丢更新器
+
+`fs.rs::prepare_target` 把正在运行的 exe 改名成 `.instbak` 之后**立即**登记退出自删，
+而此刻磁盘上已无原名文件。随后任何失败（网络中断、哈希不符、占用）都只是把错误往上抛，
+用户关窗时 `delete_self_on_exit()` 把备份也删掉——更新器与旧版本同时消失。
+
+现在改名与登记分离：`prepare_target` 只返回备份路径，`ipc/install_file.rs` 的两条入口
+拆成「外层收尾 + 内层干活」，只有内层整体成功才 `commit_self_update_backup`，失败则
+`rollback_self_update_backup`（删半成品、把备份改回原名）。Mirror酱 解压路径
+（`thirdparty/mirrorc.rs`）同样处理。静态量的唯一写入函数是
+`installer/uninstall.rs::schedule_delete_on_exit`。
+
+note：[自更新失败不再丢更新器](docs/notes/implemented/2026-09-22-self-update-failure-keeps-updater.md)
+
+### 19b. 补丁换文件的三步 rename 补回滚
+
+`fs.rs::progressed_hpatch` 的 `rename(target → .old)` / `rename(.patching → target)` /
+`remove_file(.old)` 之间没有回滚，第二步失败会让目标永久缺失。现在第二步失败立刻还原
+`.old`、第三步与「补丁返回非 1」的清理都降级为 warn，并在函数开头恢复上次中断留下的
+`.old`。
+
+note：[补丁换文件的三步 rename 补回滚](docs/notes/implemented/2026-09-22-patch-swap-rollback.md)
+
+### 19c. Mirror酱归档校验下载内容摘要
+
+接口返回的 `sha256` 此前只用来拼文件名。现在 `hash_reader` 增加 `sha256` 分支，
+`run_mirrorc_download` 多一个 `sha256: Option<&str>`，不符就删归档并以
+`MIRRORC_HASH_ERR` 失败；提权 IPC 变体加 `#[serde(default)]` 字段，前端同步传值。
+
+note：[Mirror酱归档校验下载内容摘要](docs/notes/implemented/2026-09-22-mirrorc-archive-digest.md)
+
+### 19d. 提权管道进度洪水不再中断整次操作
+
+`ipc/manager.rs` 的接收循环 `while let Ok(v) = rx.recv().await` 把 `Lagged` 当成断连，
+进度填满通道就报 `IPC_ERR`。现在显式区分 `Lagged`（warn 后继续）与 `Closed`，
+通道容量 100 → 256。
+
+note：[提权管道进度洪水不再中断整次操作](docs/notes/implemented/2026-09-22-elevated-ipc-progress-flood.md)
+
+### 19e. 本地扫描改单趟枚举并看见不受管文件
+
+`fs.rs::check_local_files` 此前对每个目录项线性扫一遍清单并各自 `to_lowercase()` 分配，
+比对用整串 `ends_with`（`d.dll` 会被 `ad.dll` 命中），不受管文件完全不可见，且
+「读不动又写不动」时会 `unwrap()` panic。现在改成归一化 HashSet + 按组件后缀查表，
+返回 `LocalScan { files, unmanaged }`，前端读 `files` 并把 `unmanaged` 记进日志。
+
+note：[本地扫描改单趟枚举并看见不受管文件](docs/notes/implemented/2026-09-22-local-scan-sees-unmanaged-files.md)
+
+### 复核方式
+
+`pwsh tools/devcheck/devcheck.ps1`（含 `-SelfTest`）与 CI 的 `Build` / `unit-test`
+两个 job，`test` 矩阵新增第 10 组 `interrupted-download`（见 19a 的失败语义：
+中断后旧版本与更新器都还在、无临时残留、重跑装完，并断言更新期间没有逐个文件的下载
+请求）。`hash_reader` 的 sha256 分支由 devcheck logic 层 [22] 组断言覆盖；
+`fs.rs` / `ipc/` / `thirdparty/` 的类型检查只能在 Windows runner 上做。
 
 ---
 
@@ -1149,8 +1219,19 @@ Tauri → 原生 Win32 的重写（`dfs2`、`updater-survival`、`plugin-stub`�
    测试不搬；`tests/prepare.mjs` 的 builder 路径按本仓库布局
    （`src-tauri/target/...`）改，夹具打包去掉 `--icon`，失败要
    `process.exitCode = 1`；`.github/workflows/build.yml` 的 `test` 矩阵与
-   `unit-test` job 同步更新；新测试若暴露 `replace-bin` 解析或 `userDataPath`
-   匹配问题，按 18c / 18d 修掉；
+  `unit-test` job 同步更新；新测试若暴露 `replace-bin` 解析或 `userDataPath`
+  匹配问题，按 18c / 18d 修掉；
+3m. **重做第 19 节的五处加固**：`fs.rs`（`prepare_target` 不写登记、
+   `commit_self_update_backup` / `rollback_self_update_backup`、
+   `progressed_hpatch` 的回滚与 `.old` 恢复、`check_local_files` 的
+   `LocalScan`）→ `ipc/install_file.rs`（两条入口拆成外层收尾 + 内层干活）→
+   `thirdparty/mirrorc.rs`（解压同样收尾、下载校验 sha256）→
+   `installer/uninstall.rs`（`schedule_delete_on_exit` 成为唯一写入点）→
+   `ipc/manager.rs`（`Lagged` 继续接收、容量 256）→ `utils/hash.rs`
+   （`hash_reader` 的 sha256 分支，**要同步 `tools/devcheck` 的 [22] 组断言**）→
+   前端 `src/App.vue` / `src/api/ipc.ts` / `src/types.ts`（`LocalScan` 与
+   `sha256` 字段）。注意上游若已把这三条路径改成 staging 提交，本节的做法与它
+   冲突：那时应以 staging 方案为准，只保留「失败不丢更新器」这条验收判据；
 4. `npx tsc --noEmit -p tsconfig.json`（上游本身有 3 个 `noUnusedLocals` 报错，
    只要没有新增报错即可）+ 用 `@vue/compiler-sfc` 编译 `src/App.vue` 自检；
 5. Windows 上 `pnpm build` 出 `kachina-builder.exe`，跑一次
