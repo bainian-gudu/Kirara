@@ -68,6 +68,10 @@ Status: implemented
 全部提交完成后删除 journal；若本次换掉了正在运行的安装器，保留暂存目录，把退出自删
 登记到暂存根，避免在自更新成功前删掉唯一旧镜像。其他情况立即清理暂存。
 
+提权模式下提交跑在 `headless-uac` helper 里，helper 没有 Tauri 窗口，不会触发
+`WindowEvent::CloseRequested`。`uac_ipc_main` 在管道线程结束后主动调用一次
+`delete_self_on_exit`，让已登记的暂存根由提权 cmd 在 helper 退出后删除。
+
 ### 前端流程
 
 `src/App.vue` 在 metadata 和哈希算法确定后 `OpenStaging`；有 journal 时先
@@ -99,6 +103,7 @@ Status: implemented
 | 版本不符丢弃暂存 | PASS：`recover_discards_when_version_differs` |
 | 暂存锁不会抢占活进程 | PASS（结构）：`staging::open` 使用 `OpenProcess` + `GetExitCodeProcess`，无 journal 的残留才清空 |
 | 前端恢复不继续使用已删除路径 | PASS：恢复未完成时重新 `OpenStaging`；回滚失败时保留 staging |
+| 提权 helper 退出清理 | PASS（结构）：`uac_ipc_main` 退出时调用 `delete_self_on_exit`，devcheck [26] 同时断言主窗口与 helper 两条路径都在 |
 | 本地类型检查 | PASS：`bash tools/devcheck/check-installer.sh --tests` |
 | 前端 SFC / tsc | PASS：`devcheck -Layer front` |
 | Windows 真实文件单测 | 待 CI `cargo test --bin kachina-installer --locked` |

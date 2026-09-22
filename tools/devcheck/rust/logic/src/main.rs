@@ -1479,6 +1479,37 @@ fn unattended_dialog_cases() {
     );
 }
 
+/// [26] 提权 helper 退出自删接线：C9 自更新把旧安装器留在暂存目录的 `old\`，
+/// helper 没有 Tauri 窗口，不主动执行的话这份旧镜像只能等下次 `OpenStaging` 清掉。
+fn uac_cleanup_wiring_case() {
+    println!("[26] 提权 helper 退出自删接线（本仓库文件）");
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(4)
+        .expect("repo root")
+        .to_path_buf();
+
+    let manager = std::fs::read_to_string(repo.join("src-tauri/src/ipc/manager.rs"))
+        .expect("read ipc/manager.rs");
+    let uac_body = manager
+        .split("pub async fn uac_ipc_main")
+        .nth(1)
+        .expect("uac_ipc_main exists");
+    check(
+        "uac_ipc_main 退出时调用 delete_self_on_exit",
+        uac_body.contains("delete_self_on_exit()"),
+        "",
+    );
+
+    let main_rs =
+        std::fs::read_to_string(repo.join("src-tauri/src/main.rs")).expect("read main.rs");
+    check(
+        "主窗口 CloseRequested 仍调用 delete_self_on_exit",
+        main_rs.contains("delete_self_on_exit();"),
+        "",
+    );
+}
+
 #[tokio::main]
 async fn main() {
     reg_target_cases();
@@ -1504,6 +1535,7 @@ async fn main() {
     hash_reader_cases();
     rollback_self_update_cases();
     unattended_dialog_cases();
+    uac_cleanup_wiring_case();
     let (pass, fail) = (PASS.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed));
     println!("\n==== PASS {pass} / FAIL {fail} ====");
     if fail > 0 {

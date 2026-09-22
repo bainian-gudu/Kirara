@@ -1206,7 +1206,9 @@ note：[无人值守运行不弹模态框](docs/notes/implemented/2026-09-22-una
   干净目录，下载完成后提交；`src/api/ipc.ts`、`installFile.ts`、`dfs.ts`、
   `downloadTaskManager.ts` 同步传递暂存目标与补丁旧路径。
 - 自更新换掉正在运行的 exe 时保留暂存根，退出时用 `delete_self_on_exit` 删除整个
-  暂存目录；`delete_self_on_exit` 现在先 `rmdir /s /q` 再尝试 `del`，兼容目录路径。
+  暂存目录；提权 helper 没有 Tauri 窗口，`uac_ipc_main` 退出时也会主动执行一次，
+  不再只依赖主窗口的 `CloseRequested`。删除命令先 `rmdir /s /q` 再尝试 `del`，
+  兼容目录路径。
 
 有意保留的边界：没有目录单元、没有运行中取消按钮、暂存根没有放到 `%TEMP%`。这些是
 优化或后续架构问题，不影响当前「阶段一不触碰安装目录、阶段二可回滚、恢复可前滚」的

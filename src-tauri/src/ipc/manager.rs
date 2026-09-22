@@ -385,4 +385,10 @@ pub async fn uac_ipc_main(args: crate::cli::arg::UacArgs) {
             tracing::info!("Write thread finished");
         }
     }
+
+    // 提权 helper 没有 Tauri 窗口，`WindowEvent::CloseRequested` 那条退出自删路径
+    // 不会触发。C9 的提交在换掉正在运行的安装器时把旧镜像留在暂存目录的 `old\`，
+    // 并在这里的进程里登记退出自删；helper 退出时必须自己执行一次，否则暂存目录
+    // 只能等下一次 `OpenStaging` 才被清掉。非自更新的 helper 退出时这里是空操作。
+    crate::installer::uninstall::delete_self_on_exit();
 }
