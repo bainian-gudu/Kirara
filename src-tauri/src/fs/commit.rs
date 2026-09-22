@@ -1,96 +1,1064 @@
-use anyhow::{Context, Result};
-use std::collections::HashSet;
-use std::io::Write;
+//! Phase two of the file commit protocol: swap the files produced under the
+//! staging directory's `new\` into the install directory with same-volume
+//! renames, journaled so an interrupted swap can be finished (or undone) by
+//! the next run.
+//!
+//! Units are the granularity of the swap: a file, a whole directory subtree,
+//! a deletion, or a copy (files under a reparse point, where rename would
+//! cross volumes). Every unit records the hash it expects before and after
+//! so recovery can tell "not swapped yet", "already swapped" and "someone
+//! changed this" apart.
+
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
-use super::staging::{self, JOURNAL_VERSION, NEW_DIR, OLD_DIR};
+use anyhow::Context;
+use serde::{Deserialize, Serialize};
 
-const HASH_ALGORITHM: &str = "sha256";
+use crate::fs::staging::{is_safe_rel, join_rel, normalize_full, remove_tree, Staging};
+use crate::utils::code::{code_for_local_io, Attach, FILE_IO_FAILED};
+use crate::utils::hash::hash_file;
 
-#[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
+pub const JOURNAL_VERSION: &str = "kachina-journal 1";
+const BACKOFF_MS: &[u64] = &[50, 100, 200, 400, 800];
+const ROOT_OLD_NAME: &str = "~root";
+const COPY_TMP: &str = ".kachina-tmp";
+const COPY_OLD: &str = ".kachina-old";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Progress {
+    CountOf { done: u64, total: u64 },
+}
+
+pub type ProgressNotify = Arc<dyn Fn(Progress) + Send + Sync>;
+
+pub fn progress_noop() -> ProgressNotify {
+    Arc::new(|_| {})
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct FileEntry {
+    /// Relative path with `/` separators.
+    pub rel: String,
+    /// Hash of the file the target held before the swap; `None` when it did
+    /// not exist (or is unknown, Mirror酱 path).
+    pub old: Option<String>,
+    pub new: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum Unit {
+    File(FileEntry),
+    /// Whole subtree swap; `rel` empty means the install directory itself.
+    Dir {
+        rel: String,
+        files: Vec<FileEntry>,
+    },
+    Del {
+        rel: String,
+        old: Option<String>,
+    },
+    Copy(FileEntry),
+}
+
+impl Unit {
+    pub fn rel(&self) -> &str {
+        match self {
+            Unit::File(f) | Unit::Copy(f) => &f.rel,
+            Unit::Dir { rel, .. } | Unit::Del { rel, .. } => rel,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Journal {
+    /// Kirara keeps the version gate used by the existing frontend protocol.
+    /// Upstream journals simply omit this line and remain readable.
+    pub version: Option<String>,
+    pub hash_algorithm: String,
+    /// Mirror酱 archive digest; `None` for DFS commits.
+    pub archive: Option<String>,
+    pub units: Vec<Unit>,
+}
+
+fn opt(h: &Option<String>) -> &str {
+    h.as_deref().unwrap_or("-")
+}
+
+fn parse_opt(s: &str) -> Option<String> {
+    if s == "-" {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+fn rel_under(rel: &str, dir: &str) -> bool {
+    dir.is_empty() || rel.starts_with(&format!("{dir}/"))
+}
+
+impl Journal {
+    pub fn to_text(&self) -> String {
+        let mut out = String::new();
+        out.push_str(JOURNAL_VERSION);
+        out.push('\n');
+        if let Some(version) = &self.version {
+            out.push_str(&format!("version\t{version}\n"));
+        }
+        out.push_str(&format!("hash\t{}\n", self.hash_algorithm));
+        if let Some(a) = &self.archive {
+            out.push_str(&format!("archive\t{a}\n"));
+        }
+        for unit in &self.units {
+            match unit {
+                Unit::File(f) => {
+                    out.push_str(&format!("file\t{}\t{}\t{}\n", f.rel, opt(&f.old), f.new))
+                }
+                Unit::Copy(f) => {
+                    out.push_str(&format!("copy\t{}\t{}\t{}\n", f.rel, opt(&f.old), f.new))
+                }
+                Unit::Del { rel, old } => out.push_str(&format!("del\t{rel}\t{}\n", opt(old))),
+                Unit::Dir { rel, files } => {
+                    out.push_str(&format!("dir\t{rel}\n"));
+                    for f in files {
+                        out.push_str(&format!("file\t{}\t{}\t{}\n", f.rel, opt(&f.old), f.new));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// `None` when the version line does not match or a line is malformed:
+    /// the caller drops the staging directory in both cases.
+    pub fn parse(text: &str) -> Option<Journal> {
+        let mut lines = text.lines();
+        if lines.next()?.trim_end() != JOURNAL_VERSION {
+            return None;
+        }
+        let mut hash_algorithm = None;
+        let mut archive = None;
+        let mut version = None;
+        let mut units: Vec<Unit> = Vec::new();
+        let mut open_dir: Option<usize> = None;
+        for line in lines {
+            let line = line.trim_end_matches('\r');
+            if line.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = line.split('\t').collect();
+            match parts.as_slice() {
+                ["version", value] => version = Some(value.to_string()),
+                ["hash", algo] => hash_algorithm = Some(algo.to_string()),
+                ["archive", digest] => archive = Some(digest.to_string()),
+                ["dir", rel] => {
+                    if !is_safe_rel(rel) {
+                        return None;
+                    }
+                    units.push(Unit::Dir {
+                        rel: rel.to_string(),
+                        files: Vec::new(),
+                    });
+                    open_dir = Some(units.len() - 1);
+                }
+                ["file", rel, old, new] => {
+                    if !is_safe_rel(rel) {
+                        return None;
+                    }
+                    let entry = FileEntry {
+                        rel: rel.to_string(),
+                        old: parse_opt(old),
+                        new: new.to_string(),
+                    };
+                    let mut attached = false;
+                    if let Some(idx) = open_dir {
+                        if let Unit::Dir { rel: dir, files } = &mut units[idx] {
+                            if rel_under(&entry.rel, dir) {
+                                files.push(entry.clone());
+                                attached = true;
+                            }
+                        }
+                    }
+                    if !attached {
+                        open_dir = None;
+                        units.push(Unit::File(entry));
+                    }
+                }
+                ["copy", rel, old, new] => {
+                    if !is_safe_rel(rel) {
+                        return None;
+                    }
+                    open_dir = None;
+                    units.push(Unit::Copy(FileEntry {
+                        rel: rel.to_string(),
+                        old: parse_opt(old),
+                        new: new.to_string(),
+                    }));
+                }
+                ["del", rel, old] => {
+                    if !is_safe_rel(rel) {
+                        return None;
+                    }
+                    open_dir = None;
+                    units.push(Unit::Del {
+                        rel: rel.to_string(),
+                        old: parse_opt(old),
+                    });
+                }
+                _ => return None,
+            }
+        }
+        Some(Journal {
+            version,
+            hash_algorithm: hash_algorithm?,
+            archive,
+            units,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CommitArgs {
     pub staging_root: String,
     pub install_dir: String,
-    pub version: String,
-    #[serde(default)]
-    pub deletes: Vec<String>,
+    pub journal: Journal,
 }
 
-#[derive(serde::Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct CommitOutcome {
+    /// The running executable was among the swapped targets; the staging
+    /// directory still holds it under `old\` and must outlive the process.
     pub self_replaced: bool,
-    pub recovered: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct FileEntry {
-    rel: String,
-    old: Option<String>,
-    new: String,
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum RecoverOutcome {
+    /// Every pending unit was swapped; same follow-up as a fresh commit.
+    Completed { self_replaced: bool },
+    /// The directory no longer matched the journal; nothing was renamed and
+    /// the staging directory is gone.
+    Discarded,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Unit {
-    File(FileEntry),
-    Del { rel: String, old: Option<String> },
+fn is_transient(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(32) | Some(33) | Some(5))
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+fn rename_retry(from: &Path, to: &Path, backoff: &[u64]) -> std::io::Result<()> {
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut attempt = 0;
+    loop {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(err) if is_transient(&err) && attempt < backoff.len() => {
+                std::thread::sleep(Duration::from_millis(backoff[attempt]));
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn local_err(err: std::io::Error, rel: &str) -> anyhow::Error {
+    let code = code_for_local_io(&err);
+    anyhow::Error::new(err).attach_with(code, rel)
+}
+
+/// Files under `dir`, recursive, as (`rel` with `/`, absolute). `None` when
+/// a reparse point is encountered: such a tree is never a clean unit.
+fn list_tree(dir: &Path) -> std::io::Result<Option<Vec<(String, PathBuf)>>> {
+    let mut out = Vec::new();
+    let mut stack = vec![(dir.to_path_buf(), String::new())];
+    while let Some((path, prefix)) = stack.pop() {
+        for entry in std::fs::read_dir(&path)? {
+            let entry = entry?;
+            let meta = entry.metadata()?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            let rel = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if meta.file_type().is_symlink() || is_reparse(&meta) {
+                return Ok(None);
+            }
+            if meta.is_dir() {
+                stack.push((entry.path(), rel));
+            } else {
+                out.push((rel, entry.path()));
+            }
+        }
+    }
+    Ok(Some(out))
+}
+
+pub fn is_reparse(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+fn lower(s: &str) -> String {
+    s.to_lowercase()
+}
+
+fn listing_rel(dir: &str, sub: &str) -> String {
+    if dir.is_empty() {
+        lower(sub)
+    } else {
+        lower(&format!("{dir}/{sub}"))
+    }
+}
+
+/// The target directory holds exactly the unit's files (by name) and nothing
+/// else. A missing directory is clean. `dir` is the unit rel (`""` for root);
+/// listing paths from [`list_tree`] are relative to `target` and are prefixed
+/// before comparing to `FileEntry.rel`.
+fn dir_is_clean(target: &Path, dir: &str, files: &[FileEntry]) -> bool {
+    if !target.exists() {
+        return true;
+    }
+    let Ok(Some(listing)) = list_tree(target) else {
+        return false;
+    };
+    let want: std::collections::HashSet<String> = files.iter().map(|f| lower(&f.rel)).collect();
+    listing
+        .iter()
+        .all(|(rel, _)| want.contains(&listing_rel(dir, rel)))
+}
+
+#[derive(Default, Debug)]
 struct FileState {
     old_moved: bool,
     new_placed: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct DelState {
-    old_moved: bool,
-}
-
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 enum UnitState {
-    Skipped,
     File(FileState),
-    Del(DelState),
+    Copy(FileState),
+    Del {
+        old_moved: bool,
+    },
+    Dir {
+        old_moved: bool,
+        new_placed: bool,
+        removed_empty_root: bool,
+    },
+    Degraded(Vec<(FileEntry, FileState)>),
+    Skipped,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Ctx<'a> {
+    staging: &'a Staging,
+    install: &'a Path,
+    algo: &'a str,
+    current_exe: Option<PathBuf>,
+    backoff: &'a [u64],
+}
+
+impl Ctx<'_> {
+    fn target(&self, rel: &str) -> PathBuf {
+        if rel.is_empty() {
+            self.install.to_path_buf()
+        } else {
+            join_rel(self.install, rel)
+        }
+    }
+
+    fn new_of(&self, rel: &str) -> PathBuf {
+        if rel.is_empty() {
+            self.staging.new_dir()
+        } else {
+            self.staging.new_path(rel)
+        }
+    }
+
+    fn old_of(&self, rel: &str) -> PathBuf {
+        if rel.is_empty() {
+            self.staging.old_dir().join(ROOT_OLD_NAME)
+        } else {
+            self.staging.old_path(rel)
+        }
+    }
+
+    fn is_self(&self, target: &Path) -> bool {
+        self.current_exe
+            .as_ref()
+            .is_some_and(|exe| same_path(exe, target))
+    }
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    normalize_full(&a.to_string_lossy()) == normalize_full(&b.to_string_lossy())
+}
+
+fn apply_file(ctx: &Ctx, rel: &str, state: &mut FileState) -> anyhow::Result<()> {
+    let target = ctx.target(rel);
+    if !target.exists() && ctx.old_of(rel).exists() {
+        state.old_moved = true;
+    }
+    if target.exists() {
+        rename_retry(&target, &ctx.old_of(rel), ctx.backoff).map_err(|e| local_err(e, rel))?;
+        state.old_moved = true;
+    }
+    rename_retry(&ctx.new_of(rel), &target, ctx.backoff).map_err(|e| local_err(e, rel))?;
+    state.new_placed = true;
+    Ok(())
+}
+
+fn undo_file(ctx: &Ctx, rel: &str, state: &FileState) -> anyhow::Result<()> {
+    let target = ctx.target(rel);
+    let mut errors = Vec::new();
+    if state.new_placed {
+        if let Err(err) = rename_retry(&target, &ctx.new_of(rel), ctx.backoff) {
+            errors.push(format!("move new back failed: {err}"));
+        }
+    }
+    if state.old_moved {
+        if let Err(err) = rename_retry(&ctx.old_of(rel), &target, ctx.backoff) {
+            errors.push(format!("restore old failed: {err}"));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("{}", errors.join("; ")))
+    }
+}
+
+fn copy_paths(target: &Path) -> (PathBuf, PathBuf) {
+    let mut tmp = target.as_os_str().to_owned();
+    tmp.push(COPY_TMP);
+    let mut old = target.as_os_str().to_owned();
+    old.push(COPY_OLD);
+    (PathBuf::from(tmp), PathBuf::from(old))
+}
+
+fn apply_copy(ctx: &Ctx, entry: &FileEntry, state: &mut FileState) -> anyhow::Result<()> {
+    let target = ctx.target(&entry.rel);
+    let (tmp, old) = copy_paths(&target);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| local_err(e, &entry.rel))?;
+    }
+    std::fs::copy(ctx.new_of(&entry.rel), &tmp).map_err(|e| local_err(e, &entry.rel))?;
+    let got = hash_file(ctx.algo, &tmp.to_string_lossy())?;
+    if got != entry.new {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(
+            anyhow::anyhow!("copy verify mismatch").attach_with(FILE_IO_FAILED, entry.rel.clone())
+        );
+    }
+    if !target.exists() && old.exists() {
+        state.old_moved = true;
+    }
+    if target.exists() {
+        let _ = std::fs::remove_file(&old);
+        rename_retry(&target, &old, ctx.backoff).map_err(|e| local_err(e, &entry.rel))?;
+        state.old_moved = true;
+    }
+    rename_retry(&tmp, &target, ctx.backoff).map_err(|e| local_err(e, &entry.rel))?;
+    state.new_placed = true;
+    Ok(())
+}
+
+fn undo_copy(ctx: &Ctx, rel: &str, state: &FileState) -> anyhow::Result<()> {
+    let target = ctx.target(rel);
+    let (tmp, old) = copy_paths(&target);
+    let mut errors = Vec::new();
+    if state.new_placed {
+        if let Err(err) = std::fs::remove_file(&target) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                errors.push(format!("remove new copy failed: {err}"));
+            }
+        }
+    }
+    if let Err(err) = std::fs::remove_file(&tmp) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            errors.push(format!("remove temporary copy failed: {err}"));
+        }
+    }
+    if state.old_moved {
+        if let Err(err) = rename_retry(&old, &target, ctx.backoff) {
+            errors.push(format!("restore old copy failed: {err}"));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("{}", errors.join("; ")))
+    }
+}
+
+fn finish_copy(target: &Path) {
+    let (tmp, old) = copy_paths(target);
+    let _ = std::fs::remove_file(tmp);
+    let _ = std::fs::remove_file(old);
+}
+
+fn apply_unit(ctx: &Ctx, unit: &Unit) -> anyhow::Result<UnitState> {
+    match unit {
+        Unit::File(f) => {
+            let mut st = FileState::default();
+            match apply_file(ctx, &f.rel, &mut st) {
+                Ok(()) => Ok(UnitState::File(st)),
+                Err(e) => {
+                    let _ = undo_file(ctx, &f.rel, &st);
+                    Err(e)
+                }
+            }
+        }
+        Unit::Copy(f) => {
+            let mut st = FileState::default();
+            match apply_copy(ctx, f, &mut st) {
+                Ok(()) => Ok(UnitState::Copy(st)),
+                Err(e) => {
+                    let _ = undo_copy(ctx, &f.rel, &st);
+                    Err(e)
+                }
+            }
+        }
+        Unit::Del { rel, .. } => {
+            let target = ctx.target(rel);
+            if !target.exists() {
+                return Ok(UnitState::Del { old_moved: false });
+            }
+            rename_retry(&target, &ctx.old_of(rel), ctx.backoff).map_err(|e| local_err(e, rel))?;
+            Ok(UnitState::Del { old_moved: true })
+        }
+        Unit::Dir { rel, files } => apply_dir(ctx, rel, files),
+    }
+}
+
+fn apply_dir(ctx: &Ctx, rel: &str, files: &[FileEntry]) -> anyhow::Result<UnitState> {
+    let target = ctx.target(rel);
+    let mut old_moved = false;
+    let mut removed_empty_root = false;
+    if !target.exists() && ctx.old_of(rel).exists() {
+        old_moved = true;
+    }
+    if target.exists() {
+        let empty = std::fs::read_dir(&target)
+            .map(|mut it| it.next().is_none())
+            .unwrap_or(false);
+        if rel.is_empty() && empty {
+            std::fs::remove_dir(&target).map_err(|e| local_err(e, rel))?;
+            removed_empty_root = true;
+        } else {
+            match rename_retry(&target, &ctx.old_of(rel), ctx.backoff) {
+                Ok(()) => old_moved = true,
+                Err(err) => {
+                    tracing::warn!("dir unit {rel:?} rename failed ({err}), degrading to files");
+                    return apply_degraded(ctx, files);
+                }
+            }
+        }
+    }
+    match rename_retry(&ctx.new_of(rel), &target, ctx.backoff) {
+        Ok(()) => Ok(UnitState::Dir {
+            old_moved,
+            new_placed: true,
+            removed_empty_root,
+        }),
+        Err(err) => {
+            let st = UnitState::Dir {
+                old_moved,
+                new_placed: false,
+                removed_empty_root,
+            };
+            let _ = undo_unit(ctx, rel, &st);
+            Err(local_err(err, rel))
+        }
+    }
+}
+
+fn apply_degraded(ctx: &Ctx, files: &[FileEntry]) -> anyhow::Result<UnitState> {
+    let mut states: Vec<(FileEntry, FileState)> = Vec::new();
+    for f in files {
+        let mut st = FileState::default();
+        if let Err(err) = apply_file(ctx, &f.rel, &mut st) {
+            states.push((f.clone(), st));
+            let _ = undo_unit(ctx, "", &UnitState::Degraded(states));
+            return Err(err);
+        }
+        states.push((f.clone(), st));
+    }
+    Ok(UnitState::Degraded(states))
+}
+
+fn undo_unit(ctx: &Ctx, rel: &str, state: &UnitState) -> anyhow::Result<()> {
+    let mut errors = Vec::new();
+    match state {
+        UnitState::File(st) => {
+            if let Err(err) = undo_file(ctx, rel, st) {
+                errors.push(err.to_string());
+            }
+        }
+        UnitState::Copy(st) => {
+            if let Err(err) = undo_copy(ctx, rel, st) {
+                errors.push(err.to_string());
+            }
+        }
+        UnitState::Del { old_moved } => {
+            if *old_moved {
+                if let Err(err) = rename_retry(&ctx.old_of(rel), &ctx.target(rel), ctx.backoff) {
+                    errors.push(format!("rollback del {rel}: {err}"));
+                }
+            }
+        }
+        UnitState::Dir {
+            old_moved,
+            new_placed,
+            removed_empty_root,
+        } => {
+            let target = ctx.target(rel);
+            if *new_placed {
+                if let Err(err) = rename_retry(&target, &ctx.new_of(rel), ctx.backoff) {
+                    errors.push(format!("rollback dir {rel:?}: move new back failed: {err}"));
+                }
+            }
+            if *old_moved {
+                if let Err(err) = rename_retry(&ctx.old_of(rel), &target, ctx.backoff) {
+                    errors.push(format!("rollback dir {rel:?}: restore old failed: {err}"));
+                }
+            } else if *removed_empty_root {
+                if let Err(err) = std::fs::create_dir_all(&target) {
+                    errors.push(format!("recreate empty root failed: {err}"));
+                }
+            }
+        }
+        UnitState::Degraded(states) => {
+            for (f, st) in states.iter().rev() {
+                if let Err(err) = undo_file(ctx, &f.rel, st) {
+                    errors.push(err.to_string());
+                }
+            }
+        }
+        UnitState::Skipped => {}
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("{}", errors.join("; ")))
+    }
+}
+
+fn unit_touches_self(ctx: &Ctx, unit: &Unit) -> bool {
+    match unit {
+        Unit::File(f) | Unit::Copy(f) => ctx.is_self(&ctx.target(&f.rel)),
+        Unit::Del { rel, .. } => ctx.is_self(&ctx.target(rel)),
+        Unit::Dir { files, .. } => files.iter().any(|f| ctx.is_self(&ctx.target(&f.rel))),
+    }
+}
+
+/// Re-probe directory units right before the swap: anything the user dropped
+/// into a directory judged clean at plan time turns that unit into per-file
+/// units.
+fn degrade_dirty_dirs(ctx: &Ctx, units: Vec<Unit>) -> Vec<Unit> {
+    let mut out = Vec::with_capacity(units.len());
+    for unit in units {
+        match unit {
+            Unit::Dir { rel, files } if !dir_is_clean(&ctx.target(&rel), &rel, &files) => {
+                tracing::info!("dir unit {rel:?} no longer clean, committing per file");
+                out.extend(files.into_iter().map(Unit::File));
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn write_journal(staging: &Staging, journal: &Journal) -> anyhow::Result<()> {
+    let path = staging.journal_path();
+    let mut file = std::fs::File::create(&path).context("create journal")?;
+    std::io::Write::write_all(&mut file, journal.to_text().as_bytes()).context("write journal")?;
+    file.sync_all().context("sync journal")?;
+    Ok(())
+}
+
+fn run_units(
+    ctx: &Ctx,
+    units: &[Unit],
+    states: &mut Vec<UnitState>,
+    notify: &ProgressNotify,
+    stop_after: Option<usize>,
+) -> anyhow::Result<()> {
+    let total = units.len() as u64;
+    for (i, unit) in units.iter().enumerate().skip(states.len()) {
+        if stop_after.is_some_and(|n| i >= n) {
+            return Err(anyhow::anyhow!("commit interrupted (test hook)"));
+        }
+        let st = apply_unit(ctx, unit)?;
+        states.push(st);
+        notify(Progress::CountOf {
+            done: (i + 1) as u64,
+            total,
+        });
+    }
+    Ok(())
+}
+
+fn rollback_all(ctx: &Ctx, units: &[Unit], states: &[UnitState]) -> anyhow::Result<()> {
+    let mut errors = Vec::new();
+    for (unit, st) in units.iter().zip(states.iter()).rev() {
+        if let Err(err) = undo_unit(ctx, unit.rel(), st) {
+            errors.push(err.to_string());
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("{}", errors.join("; ")))
+    }
+}
+
+fn finish_copies(ctx: &Ctx, units: &[Unit]) {
+    for unit in units {
+        if let Unit::Copy(f) = unit {
+            finish_copy(&ctx.target(&f.rel));
+        }
+    }
+}
+
+fn commit_sync(
+    args: CommitArgs,
+    notify: ProgressNotify,
+    backoff: &[u64],
+    stop_after: Option<usize>,
+) -> anyhow::Result<CommitOutcome> {
+    let staging = Staging::at(&args.staging_root);
+    let install = PathBuf::from(&args.install_dir);
+    let algo = args.journal.hash_algorithm.clone();
+    let ctx = Ctx {
+        staging: &staging,
+        install: &install,
+        algo: &algo,
+        current_exe: std::env::current_exe().ok(),
+        backoff,
+    };
+    let units = degrade_dirty_dirs(&ctx, args.journal.units);
+    let journal = Journal {
+        version: args.journal.version,
+        hash_algorithm: algo.clone(),
+        archive: args.journal.archive,
+        units,
+    };
+    write_journal(&staging, &journal)?;
+    let mut states = Vec::with_capacity(journal.units.len());
+    match run_units(&ctx, &journal.units, &mut states, &notify, stop_after) {
+        Ok(()) => {}
+        Err(err) => {
+            if stop_after.is_some() {
+                // test hook: leave the half-committed state and the journal behind
+                return Err(err);
+            }
+            if let Err(rollback) = rollback_all(&ctx, &journal.units, &states) {
+                return Err(rollback
+                    .context("ROLLBACK_FAILED")
+                    .context(format!("{err:#}")));
+            }
+            let _ = std::fs::remove_file(staging.journal_path());
+            staging.discard();
+            return Err(err);
+        }
+    }
+    finish_copies(&ctx, &journal.units);
+    let _ = std::fs::remove_file(staging.journal_path());
+    let self_replaced = journal.units.iter().any(|u| unit_touches_self(&ctx, u));
+    Ok(CommitOutcome { self_replaced })
+}
+
+pub async fn commit(args: CommitArgs, notify: ProgressNotify) -> anyhow::Result<CommitOutcome> {
+    tokio::task::spawn_blocking(move || commit_sync(args, notify, BACKOFF_MS, None))
+        .await
+        .context("commit thread")?
+}
+
+#[derive(Debug, PartialEq, Eq)]
 enum Status {
     Done,
     Pending,
+    /// The target still holds the old content but `new\` lost the replacement:
+    /// the swap cannot be finished, only undone.
     Unrecoverable,
     Changed,
 }
 
-fn safe_rel(install_dir: &Path, rel: &str) -> bool {
-    !rel.is_empty() && crate::installer::uninstall::is_safe_relative_member(install_dir, rel)
+fn hash_opt(algo: &str, path: &Path) -> Option<String> {
+    if path.is_file() {
+        hash_file(algo, &path.to_string_lossy()).ok()
+    } else {
+        None
+    }
 }
 
-fn hash_opt(path: &Path) -> Result<Option<String>> {
-    if !path.exists() {
-        return Ok(None);
+fn classify_file(ctx: &Ctx, f: &FileEntry, parked: &Path) -> Status {
+    let target = ctx.target(&f.rel);
+    let got = hash_opt(ctx.algo, &target);
+    if got.as_deref() == Some(f.new.as_str()) {
+        Status::Done
+    } else if got == f.old || (!target.exists() && parked.exists()) {
+        if ctx.new_of(&f.rel).is_file() {
+            Status::Pending
+        } else {
+            Status::Unrecoverable
+        }
+    } else {
+        Status::Changed
     }
-    if !path.is_file() {
-        return Err(anyhow::anyhow!("Expected a file at {}", path.display())
-            .context("STAGING_PATH_INVALID"));
-    }
-    Ok(Some(
-        crate::utils::hash::hash_file(HASH_ALGORITHM, &path.to_string_lossy())
-            .context("STAGING_HASH_ERR")?,
-    ))
 }
 
-fn walk_files(root: &Path, current: &Path, out: &mut Vec<String>) -> Result<()> {
+fn classify(ctx: &Ctx, unit: &Unit) -> Status {
+    match unit {
+        Unit::File(f) => classify_file(ctx, f, &ctx.old_of(&f.rel)),
+        Unit::Copy(f) => classify_file(ctx, f, &copy_paths(&ctx.target(&f.rel)).1),
+        Unit::Del { rel, old } => {
+            let got = hash_opt(ctx.algo, &ctx.target(rel));
+            if got.is_none() {
+                Status::Done
+            } else if got == *old {
+                Status::Pending
+            } else {
+                Status::Changed
+            }
+        }
+        Unit::Dir { rel, files } => {
+            let target = ctx.target(rel);
+            let new_set: HashMap<String, String> = files
+                .iter()
+                .map(|f| (lower(&f.rel), f.new.clone()))
+                .collect();
+            let old_set: HashMap<String, String> = files
+                .iter()
+                .filter_map(|f| f.old.clone().map(|h| (lower(&f.rel), h)))
+                .collect();
+            let prefix = if rel.is_empty() {
+                String::new()
+            } else {
+                format!("{rel}/")
+            };
+            let current: Option<HashMap<String, String>> = if target.exists() {
+                match list_tree(&target) {
+                    Ok(Some(list)) => Some(
+                        list.into_iter()
+                            .filter_map(|(sub, path)| {
+                                let full = lower(&format!("{prefix}{sub}"));
+                                hash_opt(ctx.algo, &path).map(|h| (full, h))
+                            })
+                            .collect(),
+                    ),
+                    _ => return Status::Changed,
+                }
+            } else {
+                None
+            };
+            let pending = |has_new: bool| {
+                if has_new {
+                    Status::Pending
+                } else {
+                    Status::Unrecoverable
+                }
+            };
+            match current {
+                Some(cur) if cur == new_set => Status::Done,
+                Some(cur) if cur == old_set => pending(ctx.new_of(rel).is_dir()),
+                None if old_set.is_empty() || ctx.old_of(rel).exists() => {
+                    pending(ctx.new_of(rel).is_dir())
+                }
+                _ => Status::Changed,
+            }
+        }
+    }
+}
+
+/// State to rebuild for a unit the previous run already swapped, so a failed
+/// forward roll can undo it too.
+fn done_state(ctx: &Ctx, unit: &Unit) -> UnitState {
+    match unit {
+        Unit::File(f) => UnitState::File(FileState {
+            old_moved: ctx.old_of(&f.rel).exists(),
+            new_placed: true,
+        }),
+        Unit::Copy(f) => UnitState::Copy(FileState {
+            old_moved: copy_paths(&ctx.target(&f.rel)).1.exists(),
+            new_placed: true,
+        }),
+        Unit::Del { rel, .. } => UnitState::Del {
+            old_moved: ctx.old_of(rel).exists(),
+        },
+        Unit::Dir { rel, .. } => UnitState::Dir {
+            old_moved: ctx.old_of(rel).exists(),
+            new_placed: true,
+            removed_empty_root: false,
+        },
+    }
+}
+
+fn recover_sync(
+    args: CommitArgs,
+    notify: ProgressNotify,
+    backoff: &[u64],
+) -> anyhow::Result<RecoverOutcome> {
+    let staging = Staging::at(&args.staging_root);
+    let install = PathBuf::from(&args.install_dir);
+    let ctx = Ctx {
+        staging: &staging,
+        install: &install,
+        algo: &args.journal.hash_algorithm,
+        current_exe: std::env::current_exe().ok(),
+        backoff,
+    };
+    let units = &args.journal.units;
+    let statuses: Vec<Status> = units.iter().map(|u| classify(&ctx, u)).collect();
+    if statuses.contains(&Status::Changed) {
+        tracing::info!(
+            "recovery: directory changed since the journal was written, dropping staging"
+        );
+        staging.discard();
+        return Ok(RecoverOutcome::Discarded);
+    }
+    if statuses.contains(&Status::Unrecoverable) {
+        tracing::info!("recovery: staged files missing, undoing the swapped units");
+        let done: Vec<UnitState> = units
+            .iter()
+            .zip(statuses.iter())
+            .map(|(u, s)| match s {
+                Status::Done => done_state(&ctx, u),
+                _ => UnitState::Skipped,
+            })
+            .collect();
+        if let Err(rollback) = rollback_all(&ctx, units, &done) {
+            return Err(rollback
+                .context("ROLLBACK_FAILED")
+                .context("STAGING_RECOVER_ERR"));
+        }
+        staging.discard();
+        return Ok(RecoverOutcome::Discarded);
+    }
+    let mut states: Vec<UnitState> = Vec::with_capacity(units.len());
+    let total = units.len() as u64;
+    for (i, (unit, status)) in units.iter().zip(statuses.iter()).enumerate() {
+        let st = match status {
+            Status::Done => done_state(&ctx, unit),
+            Status::Pending => match apply_unit(&ctx, unit) {
+                Ok(st) => st,
+                Err(err) => {
+                    if let Err(rollback) = rollback_all(&ctx, units, &states) {
+                        return Err(rollback
+                            .context("ROLLBACK_FAILED")
+                            .context(format!("{err:#}")));
+                    }
+                    let _ = std::fs::remove_file(staging.journal_path());
+                    staging.discard();
+                    return Err(err);
+                }
+            },
+            Status::Changed | Status::Unrecoverable => unreachable!(),
+        };
+        states.push(st);
+        notify(Progress::CountOf {
+            done: (i + 1) as u64,
+            total,
+        });
+    }
+    finish_copies(&ctx, units);
+    let _ = std::fs::remove_file(staging.journal_path());
+    let self_replaced = units.iter().any(|u| unit_touches_self(&ctx, u));
+    Ok(RecoverOutcome::Completed { self_replaced })
+}
+
+pub async fn recover(args: CommitArgs, notify: ProgressNotify) -> anyhow::Result<RecoverOutcome> {
+    tokio::task::spawn_blocking(move || recover_sync(args, notify, BACKOFF_MS))
+        .await
+        .context("recover thread")?
+}
+
+/// Whether the journal still describes what this session wants to install:
+/// every file unit's new hash equals the wanted hash for that path, every
+/// delete is still wanted, and (Mirror酱) the archive digest matches.
+/// `self_images` are the installer-generated files (uninstaller, updater)
+/// that never appear in the metadata; they pass on their own journal hash.
+pub fn journal_matches_target(
+    journal: &Journal,
+    hash_algorithm: &str,
+    wanted: &HashMap<String, String>,
+    deletes: &std::collections::HashSet<String>,
+    archive: Option<&str>,
+    self_images: &std::collections::HashSet<String>,
+) -> bool {
+    if journal.hash_algorithm != hash_algorithm {
+        return false;
+    }
+    if journal.archive.as_deref() != archive {
+        return false;
+    }
+    if journal.archive.is_some() {
+        return true;
+    }
+    let file_ok = |f: &FileEntry| {
+        let rel = lower(&f.rel);
+        self_images.contains(&rel) || wanted.get(&rel) == Some(&f.new)
+    };
+    for unit in &journal.units {
+        match unit {
+            Unit::File(f) | Unit::Copy(f) => {
+                if !file_ok(f) {
+                    return false;
+                }
+            }
+            Unit::Dir { files, .. } => {
+                if !files.iter().all(file_ok) {
+                    return false;
+                }
+            }
+            Unit::Del { rel, .. } => {
+                if !deletes.contains(&lower(rel)) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Drop a staging directory whose contents are no longer wanted.
+pub fn discard(staging_root: &str) {
+    remove_tree(Path::new(staging_root));
+}
+
+/// Delete `old\` after a successful commit that did not touch the running
+/// executable; the rest of the staging directory follows when the session
+/// ends.
+pub fn drop_old(staging_root: &str) {
+    remove_tree(&Staging::at(staging_root).old_dir());
+}
+
+fn dir_of(rel: &str) -> String {
+    rel.rsplit_once('/')
+        .map(|(dir, _)| dir.to_string())
+        .unwrap_or_default()
+}
+
+fn under_dir(rel_lower: &str, dir_lower: &str) -> bool {
+    dir_lower.is_empty() || rel_lower.starts_with(&format!("{dir_lower}/"))
+}
+
+fn walk_staged_files(root: &Path, current: &Path, out: &mut Vec<String>) -> anyhow::Result<()> {
     let entries = match std::fs::read_dir(current) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e).context("STAGING_WALK_ERR"),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).context("STAGING_WALK_ERR"),
     };
     for entry in entries {
         let entry = entry.context("STAGING_WALK_ERR")?;
-        let path = entry.path();
         let file_type = entry.file_type().context("STAGING_WALK_ERR")?;
+        let path = entry.path();
         if file_type.is_dir() {
-            walk_files(root, &path, out)?;
+            walk_staged_files(root, &path, out)?;
         } else if file_type.is_file() {
             let rel = path
                 .strip_prefix(root)
@@ -98,8 +1066,7 @@ fn walk_files(root: &Path, current: &Path, out: &mut Vec<String>) -> Result<()> 
                 .to_string_lossy()
                 .replace('\\', "/");
             if rel.contains('\t') || rel.contains('\n') || rel.contains('\r') {
-                return Err(anyhow::anyhow!("Unsupported staged path: {rel}")
-                    .context("STAGING_PATH_INVALID"));
+                return Err(anyhow::anyhow!("unsupported staged path: {rel}"));
             }
             out.push(rel);
         }
@@ -107,773 +1074,973 @@ fn walk_files(root: &Path, current: &Path, out: &mut Vec<String>) -> Result<()> 
     Ok(())
 }
 
-fn build_units(staging_root: &Path, install_dir: &Path, deletes: &[String]) -> Result<Vec<Unit>> {
-    let new_root = staging_root.join(NEW_DIR);
-    let mut files = Vec::new();
-    walk_files(&new_root, &new_root, &mut files)?;
-    files.sort();
+fn path_has_reparse_ancestor(install: &Path, rel: &str) -> bool {
+    let mut current = install.to_path_buf();
+    for part in rel.split('/') {
+        current.push(part);
+        let Ok(meta) = std::fs::symlink_metadata(&current) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() || is_reparse(&meta) {
+            return true;
+        }
+    }
+    false
+}
+
+fn target_dir_is_clean(
+    target: &Path,
+    dir: &str,
+    wanted: &std::collections::HashSet<String>,
+) -> bool {
+    if !target.exists() {
+        return true;
+    }
+    let Ok(Some(listing)) = list_tree(target) else {
+        return false;
+    };
+    let prefix = if dir.is_empty() {
+        String::new()
+    } else {
+        format!("{dir}/")
+    };
+    listing
+        .iter()
+        .all(|(rel, _)| wanted.contains(&lower(&format!("{prefix}{rel}"))))
+}
+
+fn build_units_from_staging(
+    staging: &Staging,
+    install: &Path,
+    deletes: &[String],
+) -> anyhow::Result<Vec<Unit>> {
+    let mut rels = Vec::new();
+    walk_staged_files(&staging.new_dir(), &staging.new_dir(), &mut rels)?;
+    rels.sort_by_key(|rel| lower(rel));
+
+    let mut installing: HashMap<String, FileEntry> = HashMap::new();
+    for rel in rels {
+        if !is_safe_rel(&rel) {
+            return Err(anyhow::anyhow!("unsafe staged path: {rel}"));
+        }
+        let rel = rel.replace('\\', "/");
+        let new = hash_opt("sha256", &staging.new_path(&rel))
+            .ok_or_else(|| anyhow::anyhow!("staged file disappeared: {rel}"))?;
+        let old = hash_opt("sha256", &join_rel(install, &rel));
+        installing.insert(lower(&rel), FileEntry { rel, old, new });
+    }
+
+    let wanted: std::collections::HashSet<String> = installing.keys().cloned().collect();
+    let mut all_dirs = std::collections::BTreeSet::new();
+    for rel in installing.keys() {
+        let mut dir = dir_of(rel);
+        loop {
+            all_dirs.insert(dir.clone());
+            if dir.is_empty() {
+                break;
+            }
+            dir = dir_of(&dir);
+        }
+    }
+
+    let mut candidates: Vec<String> = all_dirs
+        .into_iter()
+        .filter(|dir| target_dir_is_clean(&join_rel(install, dir), dir, &wanted))
+        .filter(|dir| {
+            installing
+                .keys()
+                .filter(|rel| under_dir(rel, dir))
+                .all(|rel| !path_has_reparse_ancestor(install, rel))
+        })
+        .collect();
+    candidates.sort_by_key(|dir| dir.matches('/').count() + usize::from(!dir.is_empty()));
+
+    let mut chosen = Vec::new();
+    for dir in candidates {
+        if !chosen
+            .iter()
+            .any(|parent: &String| parent == &dir || under_dir(&dir, parent))
+        {
+            chosen.push(dir);
+        }
+    }
 
     let mut units = Vec::new();
-    let mut file_rels = HashSet::new();
-    for rel in files {
-        if !safe_rel(install_dir, &rel) {
-            return Err(
-                anyhow::anyhow!("Unsafe staged file path: {rel}").context("STAGING_PATH_INVALID")
-            );
+    let mut covered = std::collections::HashSet::new();
+    for dir in &chosen {
+        let mut files: Vec<FileEntry> = installing
+            .iter()
+            .filter(|(rel, _)| under_dir(rel, dir))
+            .map(|(rel, entry)| {
+                covered.insert(rel.clone());
+                entry.clone()
+            })
+            .collect();
+        files.sort_by(|a, b| lower(&a.rel).cmp(&lower(&b.rel)));
+        units.push(Unit::Dir {
+            rel: dir.clone(),
+            files,
+        });
+    }
+
+    let mut rest: Vec<FileEntry> = installing
+        .into_iter()
+        .filter(|(rel, _)| !covered.contains(rel))
+        .map(|(_, entry)| entry)
+        .collect();
+    rest.sort_by(|a, b| lower(&a.rel).cmp(&lower(&b.rel)));
+    for entry in rest {
+        if path_has_reparse_ancestor(install, &entry.rel) {
+            units.push(Unit::Copy(entry));
+        } else {
+            units.push(Unit::File(entry));
         }
-        let new_path = new_root.join(&rel);
-        let new_hash = hash_opt(&new_path)?
-            .ok_or_else(|| anyhow::anyhow!("Staged file disappeared: {rel}"))?;
-        let old_hash = hash_opt(&install_dir.join(&rel))?;
-        file_rels.insert(rel.replace('\\', "/").to_ascii_lowercase());
-        units.push(Unit::File(FileEntry {
-            rel,
-            old: old_hash,
-            new: new_hash,
-        }));
     }
 
     for rel in deletes {
         let rel = rel.replace('\\', "/");
-        if !safe_rel(install_dir, &rel) {
+        if !is_safe_rel(&rel) {
             tracing::warn!("跳过不安全的删除路径: {rel}");
             continue;
         }
-        if file_rels.contains(&rel.to_ascii_lowercase()) {
-            tracing::warn!("删除路径同时存在于本次文件清单，按文件更新处理: {rel}");
+        if chosen.iter().any(|dir| under_dir(&lower(&rel), dir)) {
             continue;
         }
-        let target = install_dir.join(&rel);
-        let old = if target.exists() {
-            if !target.is_file() {
-                tracing::warn!("跳过删除非文件目标: {rel}");
-                continue;
-            }
-            hash_opt(&target)?
-        } else {
-            None
-        };
-        units.push(Unit::Del { rel, old });
+        let target = join_rel(install, &rel);
+        if target.exists() && !target.is_file() {
+            tracing::warn!("跳过删除非文件目标: {rel}");
+            continue;
+        }
+        units.push(Unit::Del {
+            rel,
+            old: hash_opt("sha256", &target),
+        });
     }
     Ok(units)
 }
 
-fn journal_text(version: &str, units: &[Unit]) -> String {
-    let mut text = String::new();
-    text.push_str(JOURNAL_VERSION);
-    text.push('\n');
-    text.push_str("version\t");
-    text.push_str(version);
-    text.push('\n');
-    text.push_str("hash\t");
-    text.push_str(HASH_ALGORITHM);
-    text.push('\n');
-    for unit in units {
-        match unit {
-            Unit::File(entry) => {
-                text.push_str("file\t");
-                text.push_str(&entry.rel);
-                text.push('\t');
-                text.push_str(entry.old.as_deref().unwrap_or("-"));
-                text.push('\t');
-                text.push_str(&entry.new);
-                text.push('\n');
-            }
-            Unit::Del { rel, old } => {
-                text.push_str("del\t");
-                text.push_str(rel);
-                text.push('\t');
-                text.push_str(old.as_deref().unwrap_or("-"));
-                text.push('\n');
-            }
-        }
-    }
-    text
-}
-
-fn parse_opt_hash(value: &str) -> Option<String> {
-    if value == "-" {
-        None
-    } else {
-        Some(value.to_string())
-    }
-}
-
-fn parse_journal(text: &str) -> Result<(String, Vec<Unit>)> {
-    let mut lines = text.lines();
-    if lines.next().map(str::trim_end) != Some(JOURNAL_VERSION) {
-        return Err(anyhow::anyhow!("Unsupported journal version").context("STAGING_JOURNAL_ERR"));
-    }
-    let mut version = None;
-    let mut hash_algorithm = None;
-    let mut units = Vec::new();
-    for line in lines {
-        let line = line.trim_end_matches('\r');
-        if line.is_empty() {
-            continue;
-        }
-        let mut parts = line.splitn(4, '\t');
-        let kind = parts.next().context("STAGING_JOURNAL_ERR")?;
-        match kind {
-            "version" => {
-                version = Some(parts.next().context("STAGING_JOURNAL_ERR")?.to_string());
-            }
-            "hash" => {
-                hash_algorithm = Some(parts.next().context("STAGING_JOURNAL_ERR")?.to_string());
-            }
-            "file" => {
-                let rel = parts
-                    .next()
-                    .context("STAGING_JOURNAL_ERR")?
-                    .replace('\\', "/");
-                let old = parse_opt_hash(parts.next().context("STAGING_JOURNAL_ERR")?);
-                let new = parts.next().context("STAGING_JOURNAL_ERR")?.to_string();
-                units.push(Unit::File(FileEntry { rel, old, new }));
-            }
-            "del" => {
-                let rel = parts
-                    .next()
-                    .context("STAGING_JOURNAL_ERR")?
-                    .replace('\\', "/");
-                let old = parse_opt_hash(parts.next().context("STAGING_JOURNAL_ERR")?);
-                units.push(Unit::Del { rel, old });
-            }
-            _ => return Err(anyhow::anyhow!("Unknown journal unit").context("STAGING_JOURNAL_ERR")),
-        }
-    }
-    let version = version.context("STAGING_JOURNAL_ERR")?;
-    if hash_algorithm.as_deref() != Some(HASH_ALGORITHM) {
-        return Err(anyhow::anyhow!("Unsupported journal hash").context("STAGING_JOURNAL_ERR"));
-    }
-    Ok((version, units))
-}
-
-fn ensure_parent(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).context("STAGING_CREATE_ERR")?;
-    }
-    Ok(())
-}
-
-fn rename_retry(from: &Path, to: &Path) -> std::io::Result<()> {
-    ensure_parent(to).map_err(|e| std::io::Error::other(format!("{e:#}")))?;
-    let mut delay = std::time::Duration::from_millis(50);
-    let mut last = None;
-    for _ in 0..5 {
-        match std::fs::rename(from, to) {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                last = Some(e);
-                std::thread::sleep(delay);
-                delay *= 2;
-            }
-        }
-    }
-    Err(last.unwrap_or_else(|| std::io::Error::other("rename failed")))
-}
-
-fn remove_if_exists(path: &Path) -> Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e).context("STAGING_ROLLBACK_ERR"),
-    }
-}
-
-fn target_path(install_dir: &Path, rel: &str) -> PathBuf {
-    install_dir.join(rel)
-}
-
-fn new_path(staging_root: &Path, rel: &str) -> PathBuf {
-    staging_root.join(NEW_DIR).join(rel)
-}
-
-fn old_path(staging_root: &Path, rel: &str) -> PathBuf {
-    staging_root.join(OLD_DIR).join(rel)
-}
-
-fn undo_file(staging_root: &Path, install_dir: &Path, rel: &str, state: FileState) -> Result<()> {
-    let target = target_path(install_dir, rel);
-    let new = new_path(staging_root, rel);
-    let old = old_path(staging_root, rel);
-    if state.new_placed && target.exists() {
-        rename_retry(&target, &new).context("STAGING_ROLLBACK_ERR")?;
-    }
-    if state.old_moved && old.exists() {
-        remove_if_exists(&target)?;
-        rename_retry(&old, &target).context("STAGING_ROLLBACK_ERR")?;
-    }
-    Ok(())
-}
-
-fn undo_del(staging_root: &Path, install_dir: &Path, rel: &str, state: DelState) -> Result<()> {
-    if !state.old_moved {
-        return Ok(());
-    }
-    let target = target_path(install_dir, rel);
-    let old = old_path(staging_root, rel);
-    if target.exists() {
-        return Err(
-            anyhow::anyhow!("Cannot restore deleted target: {}", target.display())
-                .context("STAGING_ROLLBACK_ERR"),
-        );
-    }
-    if old.exists() {
-        rename_retry(&old, &target).context("STAGING_ROLLBACK_ERR")?;
-    }
-    Ok(())
-}
-
-fn undo_unit(staging_root: &Path, install_dir: &Path, unit: &Unit, state: UnitState) -> Result<()> {
-    match (unit, state) {
-        (_, UnitState::Skipped) => Ok(()),
-        (Unit::File(entry), UnitState::File(state)) => {
-            undo_file(staging_root, install_dir, &entry.rel, state)
-        }
-        (Unit::Del { rel, .. }, UnitState::Del(state)) => {
-            undo_del(staging_root, install_dir, rel, state)
-        }
-        _ => Err(anyhow::anyhow!("Journal state mismatch").context("STAGING_ROLLBACK_ERR")),
-    }
-}
-
-fn rollback_units(
-    staging_root: &Path,
-    install_dir: &Path,
-    units: &[Unit],
-    states: &[UnitState],
-) -> Result<()> {
-    let mut errors = Vec::new();
-    for (unit, state) in units.iter().zip(states.iter()).rev() {
-        if let Err(e) = undo_unit(staging_root, install_dir, unit, *state) {
-            errors.push(format!("{e:#}"));
-        }
-    }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("rollback failed: {}", errors.join("; ")))
-    }
-}
-
-fn apply_file(staging_root: &Path, install_dir: &Path, entry: &FileEntry) -> Result<FileState> {
-    let target = target_path(install_dir, &entry.rel);
-    let new = new_path(staging_root, &entry.rel);
-    let old = old_path(staging_root, &entry.rel);
-    let mut state = FileState::default();
-
-    if target.is_dir() {
-        return Err(
-            anyhow::anyhow!("Target is a directory: {}", target.display())
-                .context("STAGING_PATH_INVALID"),
-        );
-    }
-    if hash_opt(&target)?.as_deref() == Some(entry.new.as_str()) {
-        state.new_placed = true;
-        state.old_moved = old.exists();
-        return Ok(state);
-    }
-    if target.exists() && old.exists() {
-        return Err(anyhow::anyhow!("Staging conflict for {}", target.display())
-            .context("STAGING_PATH_INVALID"));
-    }
-    if target.exists() {
-        ensure_parent(&old)?;
-        rename_retry(&target, &old).context("FILE_IN_USE")?;
-        state.old_moved = true;
-    } else if old.exists() {
-        state.old_moved = true;
-    }
-    if !new.is_file() {
-        let undo = undo_file(staging_root, install_dir, &entry.rel, state);
-        if let Err(undo_err) = undo {
-            return Err(undo_err
-                .context("ROLLBACK_FAILED")
-                .context(format!("staged file missing: {}", entry.rel)));
-        }
-        return Err(
-            anyhow::anyhow!("Staged file missing: {}", entry.rel).context("STAGING_FILE_MISSING")
-        );
-    }
-    if let Err(e) = rename_retry(&new, &target) {
-        let undo = undo_file(staging_root, install_dir, &entry.rel, state);
-        if let Err(undo_err) = undo {
-            return Err(undo_err
-                .context("ROLLBACK_FAILED")
-                .context(format!("{e:#}")));
-        }
-        return Err(anyhow::Error::new(e).context("FILE_IN_USE"));
-    }
-    state.new_placed = true;
-    Ok(state)
-}
-
-fn apply_del(staging_root: &Path, install_dir: &Path, rel: &str) -> Result<DelState> {
-    let target = target_path(install_dir, rel);
-    if !target.exists() {
-        return Ok(DelState::default());
-    }
-    if !target.is_file() {
-        return Err(
-            anyhow::anyhow!("Target is not a file: {}", target.display())
-                .context("STAGING_PATH_INVALID"),
-        );
-    }
-    let old = old_path(staging_root, rel);
-    ensure_parent(&old)?;
-    remove_if_exists(&old)?;
-    rename_retry(&target, &old).context("FILE_IN_USE")?;
-    Ok(DelState { old_moved: true })
-}
-
-fn apply_unit(staging_root: &Path, install_dir: &Path, unit: &Unit) -> Result<UnitState> {
-    match unit {
-        Unit::File(entry) => apply_file(staging_root, install_dir, entry).map(UnitState::File),
-        Unit::Del { rel, .. } => apply_del(staging_root, install_dir, rel).map(UnitState::Del),
-    }
-}
-
-fn apply_units(staging_root: &Path, install_dir: &Path, units: &[Unit]) -> Result<()> {
-    let mut states = Vec::with_capacity(units.len());
-    for unit in units {
-        match apply_unit(staging_root, install_dir, unit) {
-            Ok(state) => states.push(state),
-            Err(e) => {
-                if let Err(rb) = rollback_units(staging_root, install_dir, units, &states) {
-                    return Err(rb.context("ROLLBACK_FAILED").context(format!("{e:#}")));
-                }
-                return Err(e);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn classify_file(staging_root: &Path, install_dir: &Path, entry: &FileEntry) -> Result<Status> {
-    let target = target_path(install_dir, &entry.rel);
-    let new = new_path(staging_root, &entry.rel);
-    let old = old_path(staging_root, &entry.rel);
-    let target_hash = hash_opt(&target)?;
-    if target_hash.as_deref() == Some(entry.new.as_str()) {
-        return Ok(Status::Done);
-    }
-    if target_hash == entry.old {
-        return Ok(if new.is_file() {
-            Status::Pending
-        } else {
-            Status::Changed
-        });
-    }
-    if !target.exists() && old.exists() {
-        let old_hash = hash_opt(&old)?;
-        if old_hash == entry.old && new.is_file() {
-            return Ok(Status::Pending);
-        }
-        return Ok(Status::Unrecoverable);
-    }
-    if !target.exists() && !old.exists() && entry.old.is_none() && new.is_file() {
-        return Ok(Status::Pending);
-    }
-    Ok(Status::Changed)
-}
-
-fn classify_del(install_dir: &Path, rel: &str, old: Option<&str>) -> Result<Status> {
-    let target_hash = hash_opt(&target_path(install_dir, rel))?;
-    if target_hash.is_none() {
-        return Ok(Status::Done);
-    }
-    if target_hash.as_deref() == old {
-        return Ok(Status::Pending);
-    }
-    Ok(Status::Changed)
-}
-
-fn classify(staging_root: &Path, install_dir: &Path, unit: &Unit) -> Result<Status> {
-    match unit {
-        Unit::File(entry) => classify_file(staging_root, install_dir, entry),
-        Unit::Del { rel, old } => classify_del(install_dir, rel, old.as_deref()),
-    }
-}
-
-fn done_state(staging_root: &Path, unit: &Unit) -> UnitState {
-    match unit {
-        Unit::File(entry) => UnitState::File(FileState {
-            old_moved: old_path(staging_root, &entry.rel).exists(),
-            new_placed: true,
-        }),
-        Unit::Del { rel, .. } => UnitState::Del(DelState {
-            old_moved: old_path(staging_root, rel).exists(),
-        }),
-    }
-}
-
-fn self_replaced(install_dir: &Path, units: &[Unit]) -> bool {
-    let Ok(current) = std::env::current_exe() else {
-        return false;
-    };
-    units.iter().any(|unit| match unit {
-        Unit::File(entry) => {
-            crate::installer::uninstall::path_eq(&current, &install_dir.join(&entry.rel))
-        }
-        Unit::Del { rel, .. } => {
-            crate::installer::uninstall::path_eq(&current, &install_dir.join(rel))
-        }
+/// Build the journal for the frontend-driven protocol: the frontend has
+/// already written every produced file under `new\`, and passes only the
+/// metadata version and delete list.
+pub fn build_journal(
+    staging_root: &str,
+    install_dir: &str,
+    version: String,
+    deletes: &[String],
+) -> anyhow::Result<Journal> {
+    let staging = Staging::at(staging_root);
+    let units = build_units_from_staging(&staging, Path::new(install_dir), deletes)?;
+    Ok(Journal {
+        version: Some(version),
+        hash_algorithm: "sha256".to_string(),
+        archive: None,
+        units,
     })
 }
 
-fn finish(staging_root: &Path, self_replaced: bool, recovered: bool) -> CommitOutcome {
-    if self_replaced {
-        crate::installer::uninstall::schedule_delete_on_exit(staging_root);
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct FrontendCommitArgs {
+    pub staging_root: String,
+    pub install_dir: String,
+    pub version: String,
+    #[serde(default)]
+    pub deletes: Vec<String>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct FrontendCommitOutcome {
+    pub self_replaced: bool,
+    pub recovered: bool,
+}
+
+pub async fn commit_frontend(
+    args: FrontendCommitArgs,
+    notify: ProgressNotify,
+) -> anyhow::Result<FrontendCommitOutcome> {
+    let staging_root = args.staging_root.clone();
+    let journal = build_journal(
+        &args.staging_root,
+        &args.install_dir,
+        args.version,
+        &args.deletes,
+    )?;
+    let outcome = commit(
+        CommitArgs {
+            staging_root: args.staging_root,
+            install_dir: args.install_dir,
+            journal,
+        },
+        notify,
+    )
+    .await?;
+    if outcome.self_replaced {
+        crate::installer::uninstall::schedule_delete_on_exit(Path::new(&staging_root));
     } else {
-        staging::discard(&staging_root.to_string_lossy());
+        discard(&staging_root);
     }
-    CommitOutcome {
-        self_replaced,
-        recovered,
-    }
+    Ok(FrontendCommitOutcome {
+        self_replaced: outcome.self_replaced,
+        recovered: false,
+    })
 }
 
-fn write_journal(path: &Path, version: &str, units: &[Unit]) -> Result<()> {
-    let mut file = std::fs::File::create(path).context("STAGING_JOURNAL_WRITE_ERR")?;
-    file.write_all(journal_text(version, units).as_bytes())
-        .context("STAGING_JOURNAL_WRITE_ERR")?;
-    file.sync_all().context("STAGING_JOURNAL_SYNC_ERR")?;
-    Ok(())
-}
-
-pub fn commit(args: CommitArgs) -> Result<CommitOutcome> {
-    let staging_root = PathBuf::from(&args.staging_root);
-    let install_dir = PathBuf::from(&args.install_dir);
-    let units = build_units(&staging_root, &install_dir, &args.deletes)?;
-    let journal = staging::journal_path(&staging_root);
-    write_journal(&journal, &args.version, &units)?;
-    if let Err(e) = apply_units(&staging_root, &install_dir, &units) {
-        if !format!("{e:#}").contains("ROLLBACK_FAILED") {
-            let _ = std::fs::remove_file(&journal);
-            staging::discard(&args.staging_root);
-        } else {
-            tracing::error!("提交回滚失败，保留 journal 与暂存目录以便下次恢复: {e:#}");
-        }
-        return Err(e);
-    }
-    let replaced = self_replaced(&install_dir, &units);
-    let _ = std::fs::remove_file(&journal);
-    Ok(finish(&staging_root, replaced, false))
-}
-
-pub fn recover(args: CommitArgs) -> Result<CommitOutcome> {
-    let staging_root = PathBuf::from(&args.staging_root);
-    let install_dir = PathBuf::from(&args.install_dir);
-    let journal = staging::journal_path(&staging_root);
-    let text = match std::fs::read_to_string(&journal) {
+pub async fn recover_frontend(
+    args: FrontendCommitArgs,
+    notify: ProgressNotify,
+) -> anyhow::Result<FrontendCommitOutcome> {
+    let staging_root = args.staging_root.clone();
+    let staging = Staging::at(&args.staging_root);
+    let text = match std::fs::read_to_string(staging.journal_path()) {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(CommitOutcome {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(FrontendCommitOutcome {
                 self_replaced: false,
                 recovered: false,
             })
         }
-        Err(e) => return Err(e).context("STAGING_JOURNAL_READ_ERR"),
+        Err(err) => return Err(err).context("STAGING_JOURNAL_READ_ERR"),
     };
-    let (version, units) = match parse_journal(&text) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!("忽略无法解析的 journal: {e:#}");
-            staging::discard(&args.staging_root);
-            return Ok(CommitOutcome {
-                self_replaced: false,
-                recovered: false,
-            });
-        }
+    let Some(journal) = Journal::parse(&text) else {
+        staging.discard();
+        return Ok(FrontendCommitOutcome {
+            self_replaced: false,
+            recovered: false,
+        });
     };
-    if version != args.version {
-        tracing::warn!("暂存目录版本不匹配（{version} != {}），丢弃", args.version);
-        staging::discard(&args.staging_root);
-        return Ok(CommitOutcome {
+    if journal.version.as_deref() != Some(args.version.as_str()) {
+        staging.discard();
+        return Ok(FrontendCommitOutcome {
             self_replaced: false,
             recovered: false,
         });
     }
-
-    for unit in &units {
-        let rel = match unit {
-            Unit::File(entry) => &entry.rel,
-            Unit::Del { rel, .. } => rel,
-        };
-        if !safe_rel(&install_dir, rel) {
-            tracing::warn!("journal 含不安全的相对路径，丢弃暂存目录");
-            staging::discard(&args.staging_root);
-            return Ok(CommitOutcome {
-                self_replaced: false,
-                recovered: false,
-            });
-        }
-    }
-
-    let mut statuses = Vec::with_capacity(units.len());
-    for unit in &units {
-        statuses.push(classify(&staging_root, &install_dir, unit)?);
-    }
-    if statuses.iter().any(|status| *status == Status::Changed) {
-        tracing::warn!("暂存目录与安装目录现状不一致，丢弃暂存目录");
-        staging::discard(&args.staging_root);
-        return Ok(CommitOutcome {
+    let outcome = recover(
+        CommitArgs {
+            staging_root: args.staging_root,
+            install_dir: args.install_dir,
+            journal,
+        },
+        notify,
+    )
+    .await?;
+    let result = match outcome {
+        RecoverOutcome::Completed { self_replaced } => FrontendCommitOutcome {
+            self_replaced,
+            recovered: true,
+        },
+        RecoverOutcome::Discarded => FrontendCommitOutcome {
             self_replaced: false,
             recovered: false,
-        });
-    }
-
-    let mut states = vec![UnitState::Skipped; units.len()];
-    for (i, (unit, status)) in units.iter().zip(statuses.iter()).enumerate() {
-        match status {
-            Status::Done => states[i] = done_state(&staging_root, unit),
-            Status::Pending => match apply_unit(&staging_root, &install_dir, unit) {
-                Ok(state) => states[i] = state,
-                Err(e) => {
-                    if let Err(rb) = rollback_units(&staging_root, &install_dir, &units, &states) {
-                        return Err(rb.context("ROLLBACK_FAILED").context(format!("{e:#}")));
-                    }
-                    let _ = std::fs::remove_file(&journal);
-                    staging::discard(&args.staging_root);
-                    return Err(e);
-                }
-            },
-            Status::Unrecoverable => {
-                for (i, status) in statuses.iter().enumerate() {
-                    match *status {
-                        Status::Done => states[i] = done_state(&staging_root, &units[i]),
-                        Status::Unrecoverable => {
-                            states[i] = match &units[i] {
-                                Unit::File(entry) => UnitState::File(FileState {
-                                    old_moved: old_path(&staging_root, &entry.rel).exists(),
-                                    new_placed: false,
-                                }),
-                                Unit::Del { rel, .. } => UnitState::Del(DelState {
-                                    old_moved: old_path(&staging_root, rel).exists(),
-                                }),
-                            };
-                        }
-                        _ => {}
-                    }
-                }
-                if let Err(rb) = rollback_units(&staging_root, &install_dir, &units, &states) {
-                    return Err(rb.context("ROLLBACK_FAILED").context("STAGING_RECOVER_ERR"));
-                }
-                staging::discard(&args.staging_root);
-                return Ok(CommitOutcome {
-                    self_replaced: false,
-                    recovered: false,
-                });
-            }
-            Status::Changed => unreachable!(),
+        },
+    };
+    if result.recovered {
+        if result.self_replaced {
+            crate::installer::uninstall::schedule_delete_on_exit(Path::new(&staging_root));
+        } else {
+            discard(&staging_root);
         }
     }
-
-    let replaced = self_replaced(&install_dir, &units);
-    let _ = std::fs::remove_file(&journal);
-    Ok(finish(&staging_root, replaced, true))
-}
-
-pub fn discard(staging_root: &str) {
-    staging::discard(staging_root);
+    Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Digest, Sha256};
+    use std::io::Write;
+    use std::os::windows::fs::OpenOptionsExt;
 
-    fn test_root(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "kirara-commit-{name}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        root
+    const FAST: &[u64] = &[0, 0];
+
+    fn tmp() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kachina-commit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
-    fn sha256(bytes: &[u8]) -> String {
-        format!("{:x}", Sha256::digest(bytes))
+    fn write(path: &Path, bytes: &[u8]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(bytes).unwrap();
     }
 
-    fn staged_file(rel: &str, new: &[u8]) -> Unit {
-        Unit::File(FileEntry {
-            rel: rel.to_string(),
-            old: None,
-            new: sha256(new),
-        })
+    fn md5(bytes: &[u8]) -> String {
+        chksum_md5::hash(bytes).to_hex_lowercase()
+    }
+
+    fn read(path: &Path) -> Option<Vec<u8>> {
+        std::fs::read(path).ok()
+    }
+
+    struct Fixture {
+        base: PathBuf,
+        install: PathBuf,
+        staging: Staging,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let base = tmp();
+            let install = base.join("app");
+            let staging = Staging::at(base.join("staged"));
+            staging.ensure_layout().unwrap();
+            Self {
+                base,
+                install,
+                staging,
+            }
+        }
+
+        fn args(&self, units: Vec<Unit>) -> CommitArgs {
+            CommitArgs {
+                staging_root: self.staging.root().to_string_lossy().to_string(),
+                install_dir: self.install.to_string_lossy().to_string(),
+                journal: Journal {
+                    version: None,
+                    hash_algorithm: "md5".into(),
+                    archive: None,
+                    units,
+                },
+            }
+        }
+
+        fn target(&self, rel: &str) -> PathBuf {
+            join_rel(&self.install, rel)
+        }
+
+        /// Three files: a.txt changes, b.txt is new, c.txt changes.
+        fn three_files(&self) -> Vec<Unit> {
+            write(&self.target("a.txt"), b"a-old");
+            write(&self.target("c.txt"), b"c-old");
+            write(&self.staging.new_path("a.txt"), b"a-new");
+            write(&self.staging.new_path("b.txt"), b"b-new");
+            write(&self.staging.new_path("c.txt"), b"c-new");
+            vec![
+                Unit::File(FileEntry {
+                    rel: "a.txt".into(),
+                    old: Some(md5(b"a-old")),
+                    new: md5(b"a-new"),
+                }),
+                Unit::File(FileEntry {
+                    rel: "b.txt".into(),
+                    old: None,
+                    new: md5(b"b-new"),
+                }),
+                Unit::File(FileEntry {
+                    rel: "c.txt".into(),
+                    old: Some(md5(b"c-old")),
+                    new: md5(b"c-new"),
+                }),
+            ]
+        }
+
+        fn assert_old(&self) {
+            assert_eq!(read(&self.target("a.txt")), Some(b"a-old".to_vec()));
+            assert_eq!(read(&self.target("b.txt")), None);
+            assert_eq!(read(&self.target("c.txt")), Some(b"c-old".to_vec()));
+        }
+
+        fn assert_new(&self) {
+            assert_eq!(read(&self.target("a.txt")), Some(b"a-new".to_vec()));
+            assert_eq!(read(&self.target("b.txt")), Some(b"b-new".to_vec()));
+            assert_eq!(read(&self.target("c.txt")), Some(b"c-new".to_vec()));
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    /// Open handle without FILE_SHARE_DELETE: reads and hashing still work,
+    /// rename / delete fail with a sharing violation.
+    fn lock(path: &Path) -> std::fs::File {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(path)
+            .unwrap()
     }
 
     #[test]
     fn journal_roundtrip_and_version_gate() {
+        let j = Journal {
+            version: Some("1.0.0".into()),
+            hash_algorithm: "xxh".into(),
+            archive: Some("abc".into()),
+            units: vec![
+                Unit::Dir {
+                    rel: "lib".into(),
+                    files: vec![FileEntry {
+                        rel: "lib/x y.dll".into(),
+                        old: None,
+                        new: "n1".into(),
+                    }],
+                },
+                Unit::File(FileEntry {
+                    rel: "app.exe".into(),
+                    old: Some("o".into()),
+                    new: "n".into(),
+                }),
+                Unit::Del {
+                    rel: "gone.txt".into(),
+                    old: Some("g".into()),
+                },
+                Unit::Copy(FileEntry {
+                    rel: "link/f".into(),
+                    old: None,
+                    new: "c".into(),
+                }),
+            ],
+        };
+        let text = j.to_text();
+        assert!(text.starts_with("kachina-journal 1\nversion\t1.0.0\nhash\txxh\narchive\tabc\n"));
+        assert_eq!(Journal::parse(&text), Some(j.clone()));
+        assert!(Journal::parse("kachina-journal 0\nhash\tmd5\n").is_none());
+        assert!(Journal::parse("").is_none());
+        assert!(Journal::parse("kachina-journal 1\nbogus\tline\n").is_none());
+    }
+
+    #[test]
+    fn frontend_journal_groups_a_clean_root() {
+        let fx = Fixture::new();
+        write(&fx.staging.new_path("app.exe"), b"new");
+        write(&fx.staging.new_path("lib/a.dll"), b"a");
+
+        let journal = build_journal(
+            &fx.staging.root().to_string_lossy(),
+            &fx.install.to_string_lossy(),
+            "1.0.0".into(),
+            &["gone.txt".into()],
+        )
+        .unwrap();
+
+        assert_eq!(journal.version.as_deref(), Some("1.0.0"));
+        assert_eq!(journal.units.len(), 1);
+        let Unit::Dir { rel, files } = &journal.units[0] else {
+            panic!("fresh install should be one root directory unit");
+        };
+        assert!(rel.is_empty());
+        assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn frontend_journal_keeps_dirty_root_per_file() {
+        let fx = Fixture::new();
+        write(&fx.target("user.txt"), b"keep");
+        write(&fx.staging.new_path("app.exe"), b"new");
+
+        let journal = build_journal(
+            &fx.staging.root().to_string_lossy(),
+            &fx.install.to_string_lossy(),
+            "1.0.0".into(),
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(journal.units.len(), 1);
+        assert!(matches!(journal.units[0], Unit::File(_)));
+        assert_eq!(read(&fx.target("user.txt")), Some(b"keep".to_vec()));
+    }
+
+    #[test]
+    fn commit_swaps_three_files_and_removes_journal() {
+        let fx = Fixture::new();
+        let units = fx.three_files();
+        let out = commit_sync(fx.args(units), progress_noop(), FAST, None).unwrap();
+        assert!(!out.self_replaced);
+        fx.assert_new();
+        assert!(!fx.staging.journal_path().exists());
+        assert_eq!(read(&fx.staging.old_path("a.txt")), Some(b"a-old".to_vec()));
+    }
+
+    #[test]
+    fn commit_rolls_back_when_second_unit_is_locked() {
+        let fx = Fixture::new();
+        let units = fx.three_files();
+        write(&fx.target("b.txt"), b"b-old");
+        let mut units = units;
+        if let Unit::File(f) = &mut units[1] {
+            f.old = Some(md5(b"b-old"));
+        }
+        let _hold = lock(&fx.target("b.txt"));
+        let err = commit_sync(fx.args(units), progress_noop(), FAST, None).unwrap_err();
+        assert!(matches!(
+            crate::utils::code::extract(&err),
+            crate::utils::code::Extracted::Coded { code, subject }
+                if code == crate::utils::code::FILE_IN_USE
+                    && subject.as_deref() == Some("b.txt")
+        ));
+        assert_eq!(read(&fx.target("a.txt")), Some(b"a-old".to_vec()));
+        assert_eq!(read(&fx.target("b.txt")), Some(b"b-old".to_vec()));
+        assert_eq!(read(&fx.target("c.txt")), Some(b"c-old".to_vec()));
+        assert!(!fx.staging.root().exists());
+    }
+
+    #[test]
+    fn interrupted_commit_recovers_forward() {
+        let fx = Fixture::new();
+        let units = fx.three_files();
+        let args = fx.args(units);
+        let err = commit_sync(args.clone(), progress_noop(), FAST, Some(2)).unwrap_err();
+        assert!(err.to_string().contains("interrupted"));
+        assert!(fx.staging.journal_path().exists());
+        assert_eq!(read(&fx.target("a.txt")), Some(b"a-new".to_vec()));
+        assert_eq!(read(&fx.target("c.txt")), Some(b"c-old".to_vec()));
+
+        let journal =
+            Journal::parse(&std::fs::read_to_string(fx.staging.journal_path()).unwrap()).unwrap();
+        let out = recover_sync(
+            CommitArgs {
+                journal,
+                ..args.clone()
+            },
+            progress_noop(),
+            FAST,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            RecoverOutcome::Completed {
+                self_replaced: false
+            }
+        );
+        fx.assert_new();
+        assert!(!fx.staging.journal_path().exists());
+    }
+
+    #[test]
+    fn recovery_discards_when_target_was_overwritten() {
+        let fx = Fixture::new();
+        let units = fx.three_files();
+        let args = fx.args(units);
+        let _ = commit_sync(args.clone(), progress_noop(), FAST, Some(2));
+        write(&fx.target("c.txt"), b"portable-build");
+        let journal =
+            Journal::parse(&std::fs::read_to_string(fx.staging.journal_path()).unwrap()).unwrap();
+        let out = recover_sync(CommitArgs { journal, ..args }, progress_noop(), FAST).unwrap();
+        assert_eq!(out, RecoverOutcome::Discarded);
+        assert_eq!(read(&fx.target("c.txt")), Some(b"portable-build".to_vec()));
+        assert_eq!(
+            read(&fx.target("a.txt")),
+            Some(b"a-new".to_vec()),
+            "already swapped unit left alone"
+        );
+        assert!(!fx.staging.root().exists());
+    }
+
+    #[test]
+    fn recovery_discards_when_swapped_unit_was_modified() {
+        let fx = Fixture::new();
+        let units = fx.three_files();
+        let args = fx.args(units);
+        let _ = commit_sync(args.clone(), progress_noop(), FAST, Some(2));
+        write(&fx.target("a.txt"), b"user-edit");
+        let journal =
+            Journal::parse(&std::fs::read_to_string(fx.staging.journal_path()).unwrap()).unwrap();
+        let out = recover_sync(CommitArgs { journal, ..args }, progress_noop(), FAST).unwrap();
+        assert_eq!(out, RecoverOutcome::Discarded);
+        assert!(!fx.staging.root().exists());
+    }
+
+    #[test]
+    fn recovery_failure_rolls_back_previously_swapped_units() {
+        let fx = Fixture::new();
+        let units = fx.three_files();
+        let args = fx.args(units);
+        let _ = commit_sync(args.clone(), progress_noop(), FAST, Some(2));
+        let _hold = lock(&fx.target("c.txt"));
+        let journal =
+            Journal::parse(&std::fs::read_to_string(fx.staging.journal_path()).unwrap()).unwrap();
+        let err = recover_sync(CommitArgs { journal, ..args }, progress_noop(), FAST).unwrap_err();
+        assert!(matches!(
+            crate::utils::code::extract(&err),
+            crate::utils::code::Extracted::Coded { code, .. }
+                if code == crate::utils::code::FILE_IN_USE
+        ));
+        drop(_hold);
+        fx.assert_old();
+        assert!(!fx.staging.root().exists());
+    }
+
+    #[test]
+    fn recovery_failure_rolls_back_unit_that_was_mid_swap() {
+        let fx = Fixture::new();
+        let mut units = fx.three_files();
+        write(&fx.target("b.txt"), b"b-old");
+        if let Unit::File(f) = &mut units[1] {
+            f.old = Some(md5(b"b-old"));
+        }
+        let args = fx.args(units);
+        let _ = commit_sync(args.clone(), progress_noop(), FAST, Some(0));
+        std::fs::rename(fx.target("a.txt"), fx.staging.old_path("a.txt")).unwrap();
+        let journal =
+            Journal::parse(&std::fs::read_to_string(fx.staging.journal_path()).unwrap()).unwrap();
+        let _hold = lock(&fx.target("b.txt"));
+        let err = recover_sync(CommitArgs { journal, ..args }, progress_noop(), FAST).unwrap_err();
+        assert!(matches!(
+            crate::utils::code::extract(&err),
+            crate::utils::code::Extracted::Coded { code, .. }
+                if code == crate::utils::code::FILE_IN_USE
+        ));
+        drop(_hold);
+        assert_eq!(read(&fx.target("a.txt")), Some(b"a-old".to_vec()));
+        assert_eq!(read(&fx.target("b.txt")), Some(b"b-old".to_vec()));
+        assert_eq!(read(&fx.target("c.txt")), Some(b"c-old".to_vec()));
+        assert!(!fx.staging.root().exists());
+    }
+
+    #[test]
+    fn recovery_with_new_dir_deleted_rolls_back_swapped_units() {
+        let fx = Fixture::new();
+        let units = fx.three_files();
+        let args = fx.args(units);
+        let _ = commit_sync(args.clone(), progress_noop(), FAST, Some(2));
+        std::fs::remove_dir_all(fx.staging.new_dir()).unwrap();
+        let journal =
+            Journal::parse(&std::fs::read_to_string(fx.staging.journal_path()).unwrap()).unwrap();
+        let out = recover_sync(CommitArgs { journal, ..args }, progress_noop(), FAST).unwrap();
+        // c.txt still holds the old bytes but its replacement is gone: the two
+        // swapped units are undone and the staging goes away
+        assert_eq!(out, RecoverOutcome::Discarded);
+        fx.assert_old();
+        assert!(!fx.staging.root().exists());
+    }
+
+    #[test]
+    fn delete_unit_moves_to_old_and_rolls_back() {
+        let fx = Fixture::new();
+        write(&fx.target("gone.txt"), b"bye");
         let units = vec![
-            staged_file("a.txt", b"new"),
             Unit::Del {
-                rel: "b.txt".to_string(),
-                old: Some(sha256(b"old-b")),
+                rel: "gone.txt".into(),
+                old: Some(md5(b"bye")),
+            },
+            Unit::Del {
+                rel: "never.txt".into(),
+                old: None,
             },
         ];
-        let text = journal_text("1.0.0", &units);
-        let (version, parsed) = parse_journal(&text).unwrap();
-        assert_eq!(version, "1.0.0");
-        assert_eq!(parsed, units);
-        assert!(parse_journal("kachina-journal 0\nversion\t1\nhash\tsha256\n").is_err());
-        assert!(parse_journal("kachina-journal 1\nversion\t1\nhash\tmd5\n").is_err());
-    }
+        commit_sync(fx.args(units.clone()), progress_noop(), FAST, None).unwrap();
+        assert!(!fx.target("gone.txt").exists());
+        assert_eq!(
+            read(&fx.staging.old_path("gone.txt")),
+            Some(b"bye".to_vec())
+        );
 
-    #[test]
-    fn commit_moves_new_files_and_deletes() {
-        let root = test_root("commit");
-        let install = root.join("install");
-        let staging = root.join("install.kachina-staged");
-        std::fs::create_dir_all(&install).unwrap();
-        std::fs::create_dir_all(staging.join(NEW_DIR)).unwrap();
-        std::fs::create_dir_all(staging.join(OLD_DIR)).unwrap();
-        std::fs::write(install.join("a.txt"), b"old").unwrap();
-        std::fs::write(install.join("gone.txt"), b"gone").unwrap();
-        std::fs::write(staging.join(NEW_DIR).join("a.txt"), b"new").unwrap();
-        std::fs::write(staging.join(NEW_DIR).join("b.txt"), b"new-b").unwrap();
-
-        let outcome = commit(CommitArgs {
-            staging_root: staging.to_string_lossy().to_string(),
-            install_dir: install.to_string_lossy().to_string(),
-            version: "1.0.0".to_string(),
-            deletes: vec!["gone.txt".to_string()],
-        })
-        .unwrap();
-
-        assert!(!outcome.self_replaced);
-        assert_eq!(std::fs::read(install.join("a.txt")).unwrap(), b"new");
-        assert_eq!(std::fs::read(install.join("b.txt")).unwrap(), b"new-b");
-        assert!(!install.join("gone.txt").exists());
-        assert!(!staging.exists());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn commit_rolls_back_when_later_unit_fails() {
-        let root = test_root("rollback");
-        let install = root.join("install");
-        let staging = root.join("install.kachina-staged");
-        std::fs::create_dir_all(&install).unwrap();
-        std::fs::create_dir_all(staging.join(NEW_DIR)).unwrap();
-        std::fs::create_dir_all(staging.join(OLD_DIR)).unwrap();
-        std::fs::create_dir_all(install.join("blocked.txt")).unwrap();
-        std::fs::write(install.join("a.txt"), b"old").unwrap();
-        std::fs::write(staging.join(NEW_DIR).join("a.txt"), b"new").unwrap();
-        std::fs::write(staging.join(NEW_DIR).join("blocked.txt"), b"new-blocked").unwrap();
-
+        // rollback path: a locked file after the delete forces undo
+        let fx2 = Fixture::new();
+        write(&fx2.target("gone.txt"), b"bye");
+        write(&fx2.target("locked.txt"), b"l");
+        write(&fx2.staging.new_path("locked.txt"), b"l2");
+        let _hold = lock(&fx2.target("locked.txt"));
         let units = vec![
+            Unit::Del {
+                rel: "gone.txt".into(),
+                old: Some(md5(b"bye")),
+            },
             Unit::File(FileEntry {
-                rel: "a.txt".to_string(),
-                old: Some(sha256(b"old")),
-                new: sha256(b"new"),
-            }),
-            Unit::File(FileEntry {
-                rel: "blocked.txt".to_string(),
-                old: None,
-                new: sha256(b"new-blocked"),
+                rel: "locked.txt".into(),
+                old: Some(md5(b"l")),
+                new: md5(b"l2"),
             }),
         ];
-        assert!(apply_units(&staging, &install, &units).is_err());
-        assert_eq!(std::fs::read(install.join("a.txt")).unwrap(), b"old");
-        assert!(staging.join(NEW_DIR).join("a.txt").is_file());
-        assert!(install.join("blocked.txt").is_dir());
-        let _ = std::fs::remove_dir_all(&root);
+        assert!(commit_sync(fx2.args(units), progress_noop(), FAST, None).is_err());
+        assert_eq!(read(&fx2.target("gone.txt")), Some(b"bye".to_vec()));
     }
 
     #[test]
-    fn recover_completes_journal_and_discards_staging() {
-        let root = test_root("recover");
-        let install = root.join("install");
-        let staging = root.join("install.kachina-staged");
-        std::fs::create_dir_all(&install).unwrap();
-        std::fs::create_dir_all(staging.join(NEW_DIR)).unwrap();
-        std::fs::create_dir_all(staging.join(OLD_DIR)).unwrap();
-        std::fs::write(staging.join(NEW_DIR).join("a.txt"), b"new").unwrap();
-        let units = vec![staged_file("a.txt", b"new")];
-        std::fs::write(
-            staging::journal_path(&staging),
-            journal_text("1.0.0", &units),
+    fn dir_unit_degrades_when_a_file_is_locked() {
+        let fx = Fixture::new();
+        write(&fx.target("lib/a.dll"), b"a1");
+        write(&fx.target("lib/b.dll"), b"b1");
+        write(&fx.staging.new_path("lib/a.dll"), b"a2");
+        write(&fx.staging.new_path("lib/b.dll"), b"b2");
+        let files = vec![
+            FileEntry {
+                rel: "lib/a.dll".into(),
+                old: Some(md5(b"a1")),
+                new: md5(b"a2"),
+            },
+            FileEntry {
+                rel: "lib/b.dll".into(),
+                old: Some(md5(b"b1")),
+                new: md5(b"b2"),
+            },
+        ];
+        // a read handle without FILE_SHARE_DELETE blocks renaming the parent dir
+        // but not the sibling file
+        let hold = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(fx.target("lib/a.dll"))
+            .unwrap();
+        let err = commit_sync(
+            fx.args(vec![Unit::Dir {
+                rel: "lib".into(),
+                files: files.clone(),
+            }]),
+            progress_noop(),
+            FAST,
+            None,
+        );
+        drop(hold);
+        // degraded: b.dll swapped, a.dll locked → whole thing rolled back
+        assert!(err.is_err());
+        assert_eq!(read(&fx.target("lib/a.dll")), Some(b"a1".to_vec()));
+        assert_eq!(read(&fx.target("lib/b.dll")), Some(b"b1".to_vec()));
+
+        // without the lock the directory swaps as one unit
+        let fx = Fixture::new();
+        write(&fx.target("lib/a.dll"), b"a1");
+        write(&fx.target("lib/b.dll"), b"b1");
+        write(&fx.staging.new_path("lib/a.dll"), b"a2");
+        write(&fx.staging.new_path("lib/b.dll"), b"b2");
+        commit_sync(
+            fx.args(vec![Unit::Dir {
+                rel: "lib".into(),
+                files,
+            }]),
+            progress_noop(),
+            FAST,
+            None,
         )
         .unwrap();
-
-        let outcome = recover(CommitArgs {
-            staging_root: staging.to_string_lossy().to_string(),
-            install_dir: install.to_string_lossy().to_string(),
-            version: "1.0.0".to_string(),
-            deletes: Vec::new(),
-        })
-        .unwrap();
-
-        assert!(outcome.recovered);
-        assert_eq!(std::fs::read(install.join("a.txt")).unwrap(), b"new");
-        assert!(!staging.exists());
-        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(read(&fx.target("lib/a.dll")), Some(b"a2".to_vec()));
+        assert_eq!(
+            read(&fx.staging.old_path("lib/a.dll")),
+            Some(b"a1".to_vec())
+        );
+        assert!(
+            !fx.staging.new_dir().join("lib").exists(),
+            "nested dir unit must rename new\\lib as a whole"
+        );
     }
 
     #[test]
-    fn recover_restores_old_file_when_new_file_is_missing() {
-        let root = test_root("unrecoverable");
-        let install = root.join("install");
-        let staging = root.join("install.kachina-staged");
-        std::fs::create_dir_all(&install).unwrap();
-        std::fs::create_dir_all(staging.join(OLD_DIR)).unwrap();
-        let old = b"old";
-        std::fs::write(staging.join(OLD_DIR).join("a.txt"), old).unwrap();
+    fn dir_unit_degrades_when_no_longer_clean() {
+        let fx = Fixture::new();
+        write(&fx.staging.new_path("lib/a.dll"), b"a2");
+        write(&fx.target("lib/user.txt"), b"mine");
+        let out = commit_sync(
+            fx.args(vec![Unit::Dir {
+                rel: "lib".into(),
+                files: vec![FileEntry {
+                    rel: "lib/a.dll".into(),
+                    old: None,
+                    new: md5(b"a2"),
+                }],
+            }]),
+            progress_noop(),
+            FAST,
+            None,
+        )
+        .unwrap();
+        assert!(!out.self_replaced);
+        assert_eq!(read(&fx.target("lib/a.dll")), Some(b"a2".to_vec()));
+        assert_eq!(read(&fx.target("lib/user.txt")), Some(b"mine".to_vec()));
+    }
+
+    #[test]
+    fn root_unit_missing_and_empty_install_dir() {
+        let fx = Fixture::new();
+        write(&fx.staging.new_path("app.exe"), b"exe");
+        write(&fx.staging.new_path("lib/a.dll"), b"a");
+        let files = vec![
+            FileEntry {
+                rel: "app.exe".into(),
+                old: None,
+                new: md5(b"exe"),
+            },
+            FileEntry {
+                rel: "lib/a.dll".into(),
+                old: None,
+                new: md5(b"a"),
+            },
+        ];
+        assert!(!fx.install.exists());
+        commit_sync(
+            fx.args(vec![Unit::Dir {
+                rel: String::new(),
+                files: files.clone(),
+            }]),
+            progress_noop(),
+            FAST,
+            None,
+        )
+        .unwrap();
+        assert_eq!(read(&fx.target("lib/a.dll")), Some(b"a".to_vec()));
+        assert!(!fx.staging.new_dir().exists());
+
+        let fx = Fixture::new();
+        std::fs::create_dir_all(&fx.install).unwrap();
+        write(&fx.staging.new_path("app.exe"), b"exe");
+        write(&fx.staging.new_path("lib/a.dll"), b"a");
+        commit_sync(
+            fx.args(vec![Unit::Dir {
+                rel: String::new(),
+                files,
+            }]),
+            progress_noop(),
+            FAST,
+            None,
+        )
+        .unwrap();
+        assert_eq!(read(&fx.target("app.exe")), Some(b"exe".to_vec()));
+    }
+
+    #[test]
+    fn copy_unit_via_junction() {
+        let fx = Fixture::new();
+        let real = fx.base.join("elsewhere");
+        std::fs::create_dir_all(&real).unwrap();
+        write(&real.join("f.txt"), b"old");
+        std::fs::create_dir_all(&fx.install).unwrap();
+        let link = fx.target("link");
+        let status = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &link.to_string_lossy(),
+                &real.to_string_lossy(),
+            ])
+            .output()
+            .unwrap();
+        assert!(status.status.success(), "mklink: {:?}", status);
+        write(&fx.staging.new_path("link/f.txt"), b"new");
+        let unit = Unit::Copy(FileEntry {
+            rel: "link/f.txt".into(),
+            old: Some(md5(b"old")),
+            new: md5(b"new"),
+        });
+        commit_sync(fx.args(vec![unit.clone()]), progress_noop(), FAST, None).unwrap();
+        assert_eq!(read(&real.join("f.txt")), Some(b"new".to_vec()));
+        assert!(!real.join("f.txt.kachina-tmp").exists());
+        assert!(!real.join("f.txt.kachina-old").exists());
+
+        // second rename failure → old content restored
+        write(&real.join("f.txt"), b"old");
+        write(&fx.staging.new_path("link/f.txt"), b"new");
+        write(&fx.staging.new_path("x.txt"), b"x");
+        write(&fx.target("x.txt"), b"x0");
+        let _hold = lock(&fx.target("x.txt"));
+        let err = commit_sync(
+            fx.args(vec![
+                unit,
+                Unit::File(FileEntry {
+                    rel: "x.txt".into(),
+                    old: Some(md5(b"x0")),
+                    new: md5(b"x"),
+                }),
+            ]),
+            progress_noop(),
+            FAST,
+            None,
+        );
+        assert!(err.is_err());
+        assert_eq!(read(&real.join("f.txt")), Some(b"old".to_vec()));
+        let _ = std::fs::remove_dir(&link);
+    }
+
+    #[test]
+    fn journal_target_check() {
+        let j = Journal {
+            version: None,
+            hash_algorithm: "md5".into(),
+            archive: None,
+            units: vec![
+                Unit::File(FileEntry {
+                    rel: "A.txt".into(),
+                    old: None,
+                    new: "1".into(),
+                }),
+                Unit::Del {
+                    rel: "gone".into(),
+                    old: None,
+                },
+            ],
+        };
+        let none = std::collections::HashSet::new();
+        let mut wanted = HashMap::new();
+        wanted.insert("a.txt".to_string(), "1".to_string());
+        let mut deletes = std::collections::HashSet::new();
+        deletes.insert("gone".to_string());
+        assert!(journal_matches_target(
+            &j, "md5", &wanted, &deletes, None, &none
+        ));
+        assert!(!journal_matches_target(
+            &j, "xxh", &wanted, &deletes, None, &none
+        ));
+        wanted.insert("a.txt".to_string(), "2".to_string());
+        assert!(!journal_matches_target(
+            &j, "md5", &wanted, &deletes, None, &none
+        ));
+        // an installer-generated file passes on its own hash
+        let mut selfs = std::collections::HashSet::new();
+        selfs.insert("a.txt".to_string());
+        assert!(journal_matches_target(
+            &j, "md5", &wanted, &deletes, None, &selfs
+        ));
+        wanted.insert("a.txt".to_string(), "1".to_string());
+        deletes.clear();
+        assert!(!journal_matches_target(
+            &j, "md5", &wanted, &deletes, None, &none
+        ));
+
+        let m = Journal {
+            version: None,
+            hash_algorithm: "md5".into(),
+            archive: Some("zip1".into()),
+            units: vec![],
+        };
+        assert!(journal_matches_target(
+            &m,
+            "md5",
+            &HashMap::new(),
+            &Default::default(),
+            Some("zip1"),
+            &none
+        ));
+        assert!(!journal_matches_target(
+            &m,
+            "md5",
+            &HashMap::new(),
+            &Default::default(),
+            Some("zip2"),
+            &none
+        ));
+    }
+
+    #[test]
+    fn recovery_finishes_file_after_old_was_moved() {
+        let fx = Fixture::new();
         let units = vec![Unit::File(FileEntry {
-            rel: "a.txt".to_string(),
-            old: Some(sha256(old)),
-            new: sha256(b"new"),
+            rel: "a.txt".into(),
+            old: Some(md5(b"a-old")),
+            new: md5(b"a-new"),
         })];
-        std::fs::write(
-            staging::journal_path(&staging),
-            journal_text("1.0.0", &units),
-        )
-        .unwrap();
-
-        let outcome = recover(CommitArgs {
-            staging_root: staging.to_string_lossy().to_string(),
-            install_dir: install.to_string_lossy().to_string(),
-            version: "1.0.0".to_string(),
-            deletes: Vec::new(),
-        })
-        .unwrap();
-
-        assert!(!outcome.recovered);
-        assert_eq!(std::fs::read(install.join("a.txt")).unwrap(), old);
-        assert!(!staging.exists());
-        let _ = std::fs::remove_dir_all(&root);
+        write(&fx.target("a.txt"), b"a-old");
+        write(&fx.staging.new_path("a.txt"), b"a-new");
+        let args = fx.args(units);
+        let _ = commit_sync(args.clone(), progress_noop(), FAST, Some(0));
+        std::fs::create_dir_all(fx.staging.old_dir()).unwrap();
+        std::fs::rename(fx.target("a.txt"), fx.staging.old_path("a.txt")).unwrap();
+        let journal =
+            Journal::parse(&std::fs::read_to_string(fx.staging.journal_path()).unwrap()).unwrap();
+        let out = recover_sync(CommitArgs { journal, ..args }, progress_noop(), FAST).unwrap();
+        assert_eq!(
+            out,
+            RecoverOutcome::Completed {
+                self_replaced: false
+            }
+        );
+        assert_eq!(read(&fx.target("a.txt")), Some(b"a-new".to_vec()));
     }
 
     #[test]
-    fn recover_discards_when_version_differs() {
-        let root = test_root("version");
-        let install = root.join("install");
-        let staging = root.join("install.kachina-staged");
-        std::fs::create_dir_all(&install).unwrap();
-        std::fs::create_dir_all(staging.join(NEW_DIR)).unwrap();
-        std::fs::write(staging.join(NEW_DIR).join("a.txt"), b"new").unwrap();
-        let units = vec![staged_file("a.txt", b"new")];
-        std::fs::write(
-            staging::journal_path(&staging),
-            journal_text("0.9.0", &units),
-        )
-        .unwrap();
-
-        let outcome = recover(CommitArgs {
-            staging_root: staging.to_string_lossy().to_string(),
-            install_dir: install.to_string_lossy().to_string(),
-            version: "1.0.0".to_string(),
-            deletes: Vec::new(),
-        })
-        .unwrap();
-
-        assert!(!outcome.recovered);
-        assert!(!install.join("a.txt").exists());
-        assert!(!staging.exists());
-        let _ = std::fs::remove_dir_all(&root);
+    fn journal_parse_rejects_parent_dir_rel() {
+        let text = "kachina-journal 1\nhash\tmd5\nfile\t../escape.txt\t-\tabc\n";
+        assert!(Journal::parse(text).is_none());
     }
 }

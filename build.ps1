@@ -101,6 +101,10 @@ $null = Require "node"   "请安装 Node.js 20+"
 Step "安装 Rust 工具链 $Toolchain"
 & rustup toolchain install $Toolchain --profile minimal
 if ($LASTEXITCODE -ne 0) { throw "rustup toolchain install $Toolchain 失败" }
+# `pnpm build` 在仓库根目录调用 cargo，而 rust-toolchain.toml 位于 src-tauri。
+# rustup 只从当前目录向上查找工具链文件，因此这里显式固定，避免 CI 落到 stable
+# 后在解析 `profile-rustflags` 时直接失败。
+$env:RUSTUP_TOOLCHAIN = $Toolchain
 
 # pnpm：优先 corepack（Node 自带），退回 npm 全局安装
 $pnpm = Get-Command pnpm -ErrorAction SilentlyContinue

@@ -53,6 +53,9 @@ DFS 会话拆分和 `vendor/rcedit-rs/` 副本；同时删除
 9. **原生宿主替换**（第 22 节）：去掉 Tauri / wry，改用仓库内的
    `src-tauri/src/host/` Win32 + WebView2 宿主；前端改成单文件内联 HTML，由
    `build.rs` 用 zstd 嵌入。保留本仓库 Vue 前端、前端驱动 JSON IPC 与 C9 暂存提交。
+10. **同步上游 staging / commit 内核**（第 21 节）：暂存选址、journal v1、目录/复制
+    单元、重试与恢复状态机参考上游 `main` commit `a52a4c66`；仍保留本仓库的
+    `version + deletes` 前端 IPC 兼容层，不整体移植 `native/session/`。
 
 逐文件的改动位置、原因与升级套用顺序见 [`LOCAL_PATCHES.md`](LOCAL_PATCHES.md)。
 第 1～6 项都是「加字段 / 加分支 / 加样式覆盖」，不写这些配置项时行为与上游完全一致；

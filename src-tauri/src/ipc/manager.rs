@@ -243,6 +243,11 @@ pub async fn managed_operation(
 }
 
 pub async fn uac_ipc_main(args: crate::cli::arg::UacArgs) {
+    // The elevated helper must not inherit a cwd inside the install directory:
+    // an open cwd pins that directory against rename and removal.
+    if let Err(error) = crate::fs::staging::enter_neutral_cwd() {
+        tracing::warn!("UAC helper could not enter the temp directory: {error:#}");
+    }
     let pipe_name = format!(r"\\.\pipe\Kachina-Elevate-{}", args.pipe_id);
     let mut try_times = 0;
     let client = loop {

@@ -18,11 +18,17 @@ Status: implemented
 
 ### 暂存目录
 
-`src-tauri/src/fs/staging.rs` 为每个安装目录使用同级目录
-`<安装目录>.kachina-staged`，保证所有换入换出都是同卷 rename：
+`src-tauri/src/fs/staging.rs` 已同步上游 `native/fs/staging.rs` 的选址与打开逻辑：
+
+- 与安装目录同卷时使用 `%TEMP%\kachina-staged\<路径哈希>`，避免用户在安装目录旁
+  看到暂存文件；跨卷时退回 `<安装目录>.kachina-staged`，保证 rename 不跨卷；
+- 打开时同时检查同级目录与 `%TEMP%` 候选，保留第一个带 journal 的目录，清理无
+  journal 的残留；旧版同级 `<安装目录>.kachina-staged` 仍能被发现并恢复；
+- `enter_neutral_cwd`、`same_volume`、`free_space`、`scratch_file` 与路径安全函数
+  `is_safe_rel` / `join_rel` 与上游一致。
 
 - `new\` 放阶段一产出，`old\` 放被换下的旧文件，`dl\` 放 Mirror酱归档；
-- `journal` 记录本次提交的版本、哈希算法和逐文件单元；
+- `journal` 记录哈希算法、可选归档摘要、Kirara 兼容版本行和上游单元格式；
 - `lock` 记录持有进程 pid；打开时通过 `OpenProcess` +
   `GetExitCodeProcess` 判断 pid 是否仍存活。
 
@@ -43,22 +49,26 @@ Status: implemented
 
 ### 阶段二：逐单元提交
 
-`src-tauri/src/fs/commit.rs` 在提交前扫描 `new\`，对每个文件计算 SHA-256，并记录
-安装目录中旧文件的 SHA-256（不存在则为空）；删除单元也记录旧摘要。journal 写盘并
-`sync_all` 后再开始 rename：
+`src-tauri/src/fs/commit.rs` 已同步上游的 journal v1、目录单元、复制单元、重试和恢复
+状态机。提交前扫描 `new\`，对每个文件计算 SHA-256，并记录安装目录中旧文件的
+SHA-256（不存在则为空）；删除单元也记录旧摘要。前端仍只传 `version + deletes`，
+后端兼容层据此构造与上游相同的 journal。journal 写盘并 `sync_all` 后再开始 rename：
 
 | 单元 | 动作 |
 |---|---|
 | `file` | 目标存在则先 rename 到 `old\`，再 rename `new\` 到目标 |
+| `dir` | 干净目录整体 rename 到 `old\`，再换入 `new\` 下同名目录；根目录支持不存在或为空 |
+| `copy` | 仅用于 reparse point 子树，在链接目标同卷内复制并校验，再改名换入 |
 | `del` | 目标存在则 rename 到 `old\` |
 
-每次 rename 对共享冲突、占用等瞬时错误做 5 次退避重试。进程内失败按逆序恢复已提交
-单元；恢复失败时保留 journal、`new\`、`old\` 并返回 `ROLLBACK_FAILED`，前端也不会再
-无条件删除暂存目录。
+每次 rename 对 os error 32 / 33 / 5 做 50、100、200、400、800 ms 退避重试。目录
+单元在提交前会重新检查干净度，用户在等待期间放入文件时降级为逐文件提交。进程内
+失败按逆序恢复已提交单元；恢复失败时保留 journal、`new\`、`old` 并返回
+`ROLLBACK_FAILED`，前端也不会再无条件删除暂存目录。
 
 ### 恢复与自更新
 
-`Recover` 先校验 journal 版本和哈希算法，再逐单元判断：
+`Recover` 先校验 journal 版本和哈希算法，再按上游状态机逐单元判断：
 
 - 目标已经是新摘要：已完成；
 - 目标仍是旧摘要且暂存新文件存在：前滚；
@@ -86,8 +96,10 @@ Status: implemented
   覆盖「一次更新整体生效」这条保证。
 - 使用 `Drop` 守卫清理：进程被任务管理器结束或断电时析构不会执行，正是要处理的场景。
 - 每个文件单独保留 `.bak`：安装目录会被临时文件污染，且删除清单仍不可回滚。
-- 继续沿用上游的 `%TEMP%` 暂存根：当前实现改为同级目录，少一次卷判定并保证所有
-  rename 同卷；代价是用户可能在安装目录旁看到 `.kachina-staged`，正常成功后会删除。
+- 不移植上游完整 `session` 层：Kirara 仍由 Vue 前端驱动 JSON IPC，直接覆盖
+  `native/session` 会同时改变 IPC、安装计划和恢复时机，风险远高于本次需要的内核同步。
+- 继续使用同级暂存根：跨卷场景仍需它保证 rename 同卷，但同卷时不再把暂存目录暴露在
+  安装目录旁。
 
 ## Verification
 
@@ -95,13 +107,12 @@ Status: implemented
 |---|---|
 | 安装路径不再直写目标 | PASS：运行路径已改用 `create_staged_file`，`prepare_target` / `create_target_file` 不再被安装流程调用 |
 | 阶段一产出统一落到 `new\` | PASS：Direct / Patch / HybridPatch / Mirror酱解压均传暂存路径 |
-| journal 版本门与逐文件摘要 | PASS：`fs/commit.rs` 单测 `journal_roundtrip_and_version_gate` 覆盖版本、算法与格式错误 |
-| 提交可换入、可删除 | PASS：`commit_moves_new_files_and_deletes` 用真实临时文件断言目标内容、删除结果和暂存清理 |
-| 后续单元失败可回滚已换文件 | PASS：`commit_rolls_back_when_later_unit_fails` 断言第一个文件恢复旧内容、暂存新文件保留、错误单元未被覆盖 |
-| 中断后可前滚 | PASS：`recover_completes_journal_and_discards_staging` 覆盖待前滚文件 |
-| 新文件丢失可恢复旧文件 | PASS：`recover_restores_old_file_when_new_file_is_missing` |
-| 版本不符丢弃暂存 | PASS：`recover_discards_when_version_differs` |
-| 暂存锁不会抢占活进程 | PASS（结构）：`staging::open` 使用 `OpenProcess` + `GetExitCodeProcess`，无 journal 的残留才清空 |
+| journal v1、目录/复制单元与摘要 | PASS：`fs/commit.rs` 单测 `journal_roundtrip_and_version_gate` 覆盖版本、算法、目录/复制单元与格式错误 |
+| 提交可换入、可删除、整目录替换 | PASS：上游 `commit_swaps_three_files_and_removes_journal`、`root_unit_missing_and_empty_install_dir`、`dir_unit_degrades_when_no_longer_clean`、`copy_unit_via_junction` 已保留 |
+| 后续单元失败可回滚已换文件 | PASS：`commit_rolls_back_when_second_unit_is_locked` 断言错误码、旧内容和暂存清理 |
+| 中断后可前滚 | PASS：`interrupted_commit_recovers_forward` 覆盖 journal 保留、前滚和暂存清理 |
+| 新文件丢失/目录被改可恢复或丢弃 | PASS：`recovery_with_new_dir_deleted_rolls_back_swapped_units`、`recovery_discards_when_target_was_overwritten` |
+| 暂存锁不会抢占活进程 | PASS（结构）：`Staging::open` 使用 `OpenProcess` + `GetExitCodeProcess`，无 journal 的残留才清空 |
 | 前端恢复不继续使用已删除路径 | PASS：恢复未完成时重新 `OpenStaging`；回滚失败时保留 staging |
 | 提权 helper 退出清理 | PASS（结构）：`uac_ipc_main` 退出时调用 `delete_self_on_exit`，devcheck [26] 同时断言主窗口与 helper 两条路径都在 |
 | 本地类型检查 | PASS：`bash tools/devcheck/check-installer.sh --tests` |
@@ -113,8 +124,9 @@ Status: implemented
 - 阶段一不再触碰安装目录；取消或下载失败只会留下可丢弃的暂存目录。
 - 提交阶段需要再次顺序读取暂存文件和旧目标来计算 SHA-256，换来恢复时能区分
   「已完成、待前滚、旧文件丢失、目标被改」四种状态；大安装的提交会多一轮本地 IO。
-- 暂存目录与安装目录同级，用户可能在安装失败时看到 `<安装目录>.kachina-staged`；
-  正常成功、明确失败和版本不符都会清理，回滚失败则有意保留给下一次恢复。
-- 仍没有目录单元优化和运行中取消按钮：本次只把文件提交协议和恢复闭环做完整。
-- 当前暂存目录不跨用户账户复用；不同账户的下一次运行会重新扫描并修复，旧目录可能
-  成为残留，后续可在打开时做跨账户清理。
+- 同卷安装的暂存目录不再出现在安装目录旁；跨卷安装仍使用同级目录，因为 rename 必须
+  同卷。正常成功、明确失败和版本不符都会清理，回滚失败则有意保留给下一次恢复。
+- 目录单元把全新安装和整目录替换从 N 次 rename 缩短为一次；散落更新仍是逐文件提交。
+- 复制单元只用于用户自行建立的 reparse point 子树，避免 rename 跨链接目标卷。
+- 当前仍不移植上游完整 session 层，因此取消按钮、Rust 状态机和安装计划仍由现有前端
+  负责；这不影响提交协议的正确性。

@@ -162,26 +162,34 @@ pub async fn run_opr(
             install_dir,
             version,
             deletes,
-        } => Ok(serde_json::json!(crate::fs::commit::commit(
-            crate::fs::commit::CommitArgs {
-                staging_root,
-                install_dir,
-                version,
-                deletes,
-            }
-        )?)),
+        } => Ok(serde_json::json!(
+            crate::fs::commit::commit_frontend(
+                crate::fs::commit::FrontendCommitArgs {
+                    staging_root,
+                    install_dir,
+                    version,
+                    deletes,
+                },
+                crate::fs::commit::progress_noop(),
+            )
+            .await?
+        )),
         IpcOperation::Recover {
             staging_root,
             install_dir,
             version,
-        } => Ok(serde_json::json!(crate::fs::commit::recover(
-            crate::fs::commit::CommitArgs {
-                staging_root,
-                install_dir,
-                version,
-                deletes: Vec::new(),
-            }
-        )?)),
+        } => Ok(serde_json::json!(
+            crate::fs::commit::recover_frontend(
+                crate::fs::commit::FrontendCommitArgs {
+                    staging_root,
+                    install_dir,
+                    version,
+                    deletes: Vec::new(),
+                },
+                crate::fs::commit::progress_noop(),
+            )
+            .await?
+        )),
         IpcOperation::DiscardStaging { staging_root } => {
             crate::fs::commit::discard(&staging_root);
             Ok(serde_json::Value::Null)

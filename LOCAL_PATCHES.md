@@ -37,6 +37,7 @@
 - [20. 静默 / 非交互失败路径不再弹模态框](#20-静默--非交互失败路径不再弹模态框)
 - [21. 暂存目录 + 两阶段提交](#21-暂存目录--两阶段提交)
 - [22. 原生 Win32 + WebView2 宿主替换 Tauri](#22-原生-win32--webview2-宿主替换-tauri)
+- [23. 构建入口固定 nightly 工具链](#23-构建入口固定-nightly-工具链)
 - [升级上游时的套用顺序](#升级上游时的套用顺序)
 
 | # | 需求 | 涉及文件 |
@@ -1192,14 +1193,16 @@ note：[无人值守运行不弹模态框](docs/notes/implemented/2026-09-22-una
 目录、中断留下混合版本、删除不可回滚的问题。本仓库没有 `session` 层，因此只把提交
 协议按现有前端驱动的 IPC 架构搬过来：
 
-- 新增 `src-tauri/src/fs/staging.rs`：同级暂存目录
-  `<安装目录>.kachina-staged`，含 `new/`、`old/`、`dl/`、`journal`、`lock`；
-  `lock` 里的 pid 通过 `OpenProcess` + `GetExitCodeProcess` 判断是否仍存活，
-  没有 journal 的残留目录在重新加锁后清空。
-- 新增 `src-tauri/src/fs/commit.rs`：提交前为每个暂存文件计算 SHA-256，journal
-  记录版本、算法、旧摘要和新摘要；逐文件先移目标到 `old/` 再换入 `new/`，删除单元
-  也移入 `old/`。失败按逆序回滚；回滚失败保留 journal 和暂存目录并报
-  `ROLLBACK_FAILED`。恢复按摘要区分已完成、待前滚、旧文件可恢复和目标已被改动。
+- `src-tauri/src/fs/staging.rs` 已同步上游 `native/fs/staging.rs`：同卷使用
+  `%TEMP%\kachina-staged\<路径哈希>`，跨卷使用同级 `<安装目录>.kachina-staged`；
+  打开时扫描同级与 `%TEMP%` 候选、清理无 journal 残留并保留可恢复目录。旧版同级
+  暂存目录仍可发现，`enter_neutral_cwd`、`same_volume`、`free_space`、`scratch_file`
+  和路径安全函数也已同步。
+- `src-tauri/src/fs/commit.rs` 已同步上游 journal v1、目录/复制单元、错误 32/33/5
+  退避重试、提交前目录重新探测和恢复状态机。Kirara 的前端协议不变，后端兼容层仍
+  接收 `version + deletes`，再根据 `new/` 产物构造上游 journal；版本行是本地兼容扩展。
+- 新增 `src-tauri/src/utils/code.rs`，只提供移植模块需要的最小错误码、`Attach` 和
+  `extract`；前端错误形状仍由现有 `TACommandError` 输出。
 - `fs.rs` 的 `create_target_file` / `prepare_target` 被 `create_staged_file` 取代，
   `progressed_hpatch` 只读旧文件并写暂存输出；Direct / Patch / HybridPatch /
   Mirror酱解压全部只写 `new/`，写完校验并 `sync_all`。
@@ -1212,8 +1215,8 @@ note：[无人值守运行不弹模态框](docs/notes/implemented/2026-09-22-una
   不再只依赖主窗口关闭路径。删除命令先 `rmdir /s /q` 再尝试 `del`，
   兼容目录路径。
 
-有意保留的边界：没有目录单元、没有运行中取消按钮、暂存根没有放到 `%TEMP%`。这些是
-优化或后续架构问题，不影响当前「阶段一不触碰安装目录、阶段二可回滚、恢复可前滚」的
+有意保留的边界：不移植上游完整 `session/`、Preact 和运行中取消状态机，仍由现有 Vue
+前端驱动 IPC。这个边界不影响「阶段一不触碰安装目录、阶段二可回滚、恢复可前滚」的
 正确性保证。
 
 note：[暂存目录 + 两阶段提交](docs/notes/implemented/2026-09-22-staged-two-phase-commit.md)
@@ -1223,7 +1226,7 @@ note：[暂存目录 + 两阶段提交](docs/notes/implemented/2026-09-22-staged
 `bash tools/devcheck/check-installer.sh --tests` 对整包与测试目标做 Windows 类型检查；
 `pwsh tools/devcheck/devcheck.ps1 -Layer front` 检查前端；CI 的 `unit-test` job 在
 Windows 上跑 `cargo test --bin kachina-installer --locked`，覆盖 journal 版本门、
-真实文件换入/删除、前滚和旧文件恢复。
+文件/目录/复制单元、真实文件换入/删除、前滚、回滚和旧文件恢复。
 
 ---
 
@@ -1265,6 +1268,24 @@ note：[原生 Win32 + WebView2 宿主替换 Tauri](docs/notes/implemented/2026-
 `bash tools/devcheck/check-installer.sh --bin kachina-installer` 与
 `pwsh tools/devcheck/devcheck.ps1 -Layer vendor,ps1,gen,rust,logic,front,ci` 全部通过。
 CI 的 Windows `Build` / `unit-test` / 行为测试仍需在真实 MSVC + WebView2 环境跑一次。
+
+---
+
+## 23. 构建入口固定 nightly 工具链
+
+`build.ps1` 在仓库根目录调用 `pnpm build`，而 `src-tauri/rust-toolchain.toml` 只在
+`src-tauri` 目录树下被 rustup 发现。CI 的 Build job 没有先安装 nightly，于是 Cargo
+落到 runner 默认 stable，在解析 `profile-rustflags` 时直接失败。
+
+构建脚本在 `rustup toolchain install $Toolchain` 之后显式设置
+`$env:RUSTUP_TOOLCHAIN = $Toolchain`，保证根目录、`src-tauri` 目录和 `pnpm` 子进程
+使用同一工具链。这样仍保留 `trim-paths` 与 `profile.rustflags`，不改变构建产物语义。
+
+### 复核方式
+
+`pwsh build.ps1 -Force` 在 Windows 上必须从 `pnpm build` 进入 nightly Cargo；CI 的
+Build job 不再出现 `the cargo feature profile-rustflags requires a nightly version`
+错误。
 
 ---
 
