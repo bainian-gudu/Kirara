@@ -2257,7 +2257,10 @@ async function dialog_error(message: string, title = '出错了'): Promise<void>
     message: message.replace(new RegExp(location.origin, 'g'), ''),
     title,
   });
-  if (INSTALLER_CONFIG.args.silent) {
+  if (
+    INSTALLER_CONFIG.args.silent ||
+    INSTALLER_CONFIG.args.non_interactive
+  ) {
     const win = getCurrentWindow();
     win.close();
   }

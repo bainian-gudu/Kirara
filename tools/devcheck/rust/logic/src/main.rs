@@ -1453,6 +1453,32 @@ fn rollback_self_update_cases() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// [25] 无人值守运行不得弹模态框：否则 CI / 静默安装在失败路径上永久等待。
+fn unattended_dialog_cases() {
+    println!("[25] 无人值守运行不弹模态框");
+
+    check(
+        "交互运行允许弹框",
+        should_show_dialog(false, false),
+        "应返回 true".to_string(),
+    );
+    check(
+        "静默运行禁止弹框",
+        !should_show_dialog(true, false),
+        "应返回 false".to_string(),
+    );
+    check(
+        "非交互运行禁止弹框",
+        !should_show_dialog(false, true),
+        "应返回 false".to_string(),
+    );
+    check(
+        "静默 + 非交互仍禁止弹框",
+        !should_show_dialog(true, true),
+        "应返回 false".to_string(),
+    );
+}
+
 #[tokio::main]
 async fn main() {
     reg_target_cases();
@@ -1477,6 +1503,7 @@ async fn main() {
     builder_pack_cases();
     hash_reader_cases();
     rollback_self_update_cases();
+    unattended_dialog_cases();
     let (pass, fail) = (PASS.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed));
     println!("\n==== PASS {pass} / FAIL {fail} ====");
     if fail > 0 {

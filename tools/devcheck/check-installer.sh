@@ -16,7 +16,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 stub_dir="$(mktemp -d "${TMPDIR:-/tmp}/kachina-msvc-stub.XXXXXX")"
-trap 'rm -rf "$stub_dir"' EXIT
+trap 'find "$stub_dir" -depth -delete' EXIT
 
 # 编译/归档/汇编 stub：解析出各自的输出参数，建一个空文件就算成功。
 cat > "$stub_dir/cl.exe" <<'STUB'

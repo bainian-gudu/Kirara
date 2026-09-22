@@ -1,9 +1,10 @@
-use tauri::{AppHandle, WebviewWindow};
+use tauri::{AppHandle, State, WebviewWindow};
 use windows::Win32::{
     Foundation::{CloseHandle, WAIT_FAILED, WAIT_TIMEOUT},
     System::Diagnostics::ToolHelp::PROCESSENTRY32W,
 };
 
+use crate::cli::arg::InstallArgs;
 use crate::utils::{
     dir::in_private_folder,
     error::{IntoTAResult, TAResult},
@@ -300,17 +301,36 @@ pub async fn get_exe_version(exe_name: String) -> TAResult<VersionInfo> {
 }
 
 #[tauri::command]
-pub async fn error_dialog(title: String, message: String, window: WebviewWindow) {
+pub async fn error_dialog(
+    title: String,
+    message: String,
+    args: State<'_, InstallArgs>,
+    window: WebviewWindow,
+) -> Result<(), String> {
+    if !should_show_dialog(args.silent, args.non_interactive) {
+        tracing::error!("{}: {}", title, message);
+        return Ok(());
+    }
     rfd::MessageDialog::new()
         .set_title(&title)
         .set_description(&message)
         .set_level(rfd::MessageLevel::Error)
         .set_parent(&window)
         .show();
+    Ok(())
 }
 
 #[tauri::command]
-pub async fn confirm_dialog(title: String, message: String, window: WebviewWindow) -> bool {
+pub async fn confirm_dialog(
+    title: String,
+    message: String,
+    args: State<'_, InstallArgs>,
+    window: WebviewWindow,
+) -> Result<bool, String> {
+    if !should_show_dialog(args.silent, args.non_interactive) {
+        tracing::warn!("{}: {}（无人值守运行，默认取消）", title, message);
+        return Ok(false);
+    }
     let ret = rfd::MessageDialog::new()
         .set_title(&title)
         .set_description(&message)
@@ -319,7 +339,13 @@ pub async fn confirm_dialog(title: String, message: String, window: WebviewWindo
         .set_buttons(rfd::MessageButtons::YesNo)
         .show();
 
-    matches!(ret, rfd::MessageDialogResult::Yes)
+    Ok(matches!(ret, rfd::MessageDialogResult::Yes))
+}
+
+/// 静默 / 非交互运行不能弹模态对话框：`rfd::MessageDialog::show()` 会一直等用户点击，
+/// CI、静默安装和控制面板调用会因此永久挂住。判定单独成纯函数，便于跨平台断言。
+pub fn should_show_dialog(silent: bool, non_interactive: bool) -> bool {
+    !silent && !non_interactive
 }
 
 #[tauri::command]

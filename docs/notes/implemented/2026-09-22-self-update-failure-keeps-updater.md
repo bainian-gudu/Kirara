@@ -58,7 +58,7 @@ Status: implemented
 | `DELETE_SELF_ON_EXIT_PATH` 的写入点全库唯一，且不在 `fs.rs` / `mirrorc.rs` 里 | PASS：`rg -n "DELETE_SELF_ON_EXIT_PATH" src-tauri/src` 只命中 `installer/uninstall.rs` 的静态量、`schedule_delete_on_exit`、`delete_self_on_exit` 与卸载流程内的两处读取 |
 | `prepare_target` 不再写登记 | PASS：函数体内已无 `DELETE_SELF_ON_EXIT_PATH`，改由调用方拿返回值收尾 |
 | 失败路径还原旧文件 | PASS（结构）：`finalize_self_update` 的 `Err` 分支调 `rollback_self_update_backup`；Mirror酱 路径的 `Err` 分支调 `rollback_self_update_backup_sync` |
-| 回滚语义（直写留下半截 / patch 目标缺失 / 备份不存在） | PASS：devcheck logic 层 [24] 组 4 条断言用真实临时文件跑过（`==== PASS 244 / FAIL 0 ====`） |
+| 回滚语义（直写留下半截 / patch 目标缺失 / 备份不存在） | PASS：devcheck logic 层 [24] 组 4 条断言用真实临时文件跑过（`==== PASS 248 / FAIL 0 ====`） |
 | 中断后旧版本与更新器都还在、重跑能装完 | 见 CI `test` 矩阵的 `interrupted-download` |
 | `cargo test --bin kachina-builder --locked` 与 e2e | 见 `tools/devcheck` 与 CI（Build / unit-test 两个 job） |
 

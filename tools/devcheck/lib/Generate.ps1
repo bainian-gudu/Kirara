@@ -92,6 +92,12 @@ $script:LogicHashItems = @(
     @{ Kind = 'fn'; Name = 'hash_reader' }
 )
 
+# installer/mod.rs 里抽「无人值守是否允许弹模态框」判定：静默 / 非交互下误弹
+# `rfd::MessageDialog::show()` 会让 CI 与自动化流程永久等待，必须在任意平台可断言。
+$script:LogicDialogItems = @(
+    @{ Kind = 'fn'; Name = 'should_show_dialog' }
+)
+
 # fs.rs 里只抽自更新回滚：它是「更新失败不许丢更新器」这条保证的落点，用真实临时文件
 # 就能断言。同文件的其余部分依赖 tokio / reqwest / tauri，塞不进最小 crate。
 $script:LogicFsItems = @(
@@ -164,13 +170,15 @@ function New-LogicGen {
     $builderExtract = Read-RustSource -Path (Join-Path $kachina 'builder/extract.rs')
     $hashRs = Read-RustSource -Path (Join-Path $kachina 'utils/hash.rs')
     $fsRs = Read-RustSource -Path (Join-Path $kachina 'fs.rs')
+    $installerMod = Read-RustSource -Path (Join-Path $kachina 'installer/mod.rs')
 
     $parts = [System.Collections.Generic.List[string]]::new()
     $parts.Add(@'
 // 生成物，勿手改：由 tools/devcheck/devcheck.ps1 按名字从
 // src-tauri/src/{installer/uninstall.rs, builder/pack.rs,
 // utils/secure_temp.rs, thirdparty/mirrorc.rs, capabilities/h3.rs,
-// builder/local.rs, builder/extract.rs, utils/hash.rs, fs.rs} 抽取。
+// builder/local.rs, builder/extract.rs, utils/hash.rs, fs.rs,
+// installer/mod.rs} 抽取。
 // 抽取规则见 tools/devcheck/lib/RustSource.ps1；找不到清单里的 item 会直接报错。
 // 本文件被 src/main.rs 用 include! 展开到 crate 根，Path/PathBuf 由 main.rs 引入。
 
@@ -222,6 +230,10 @@ fn is_under_system_root(path: &Path) -> bool {
     foreach ($item in $script:LogicHashItems) {
         $parts.Add((Get-RustItem -Text $hashRs.Text -Masked $hashRs.Masked `
                     -Kind $item.Kind -Name $item.Name -SourceName 'utils/hash.rs'))
+    }
+    foreach ($item in $script:LogicDialogItems) {
+        $parts.Add((Get-RustItem -Text $installerMod.Text -Masked $installerMod.Masked `
+                    -Kind $item.Kind -Name $item.Name -SourceName 'installer/mod.rs'))
     }
     foreach ($item in $script:LogicFsItems) {
         $parts.Add((Get-RustItem -Text $fsRs.Text -Masked $fsRs.Masked `
