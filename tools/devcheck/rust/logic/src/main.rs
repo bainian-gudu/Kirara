@@ -1396,6 +1396,63 @@ fn hash_reader_cases() {
     );
 }
 
+/// [24] 自更新回滚：更新失败时旧安装器必须原地回来。
+///
+/// 这条保证的另一半（「成功才登记退出自删」）只能靠 `DELETE_SELF_ON_EXIT_PATH` 的静态
+/// 写入点唯一来保证，见 `LOCAL_PATCHES.md` 第 19a 节与同名的 note。
+fn rollback_self_update_cases() {
+    println!("[24] 自更新回滚：失败路径还原旧安装器");
+
+    let dir = std::env::temp_dir().join(format!(
+        "kirara-rollback-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+
+    // 1) 直写模式失败：目标位置留下半截新文件，备份还在
+    let target = dir.join("updater.exe");
+    let backup = dir.join("updater.instbak");
+    std::fs::write(&target, b"NEW-PARTIAL").expect("write partial target");
+    std::fs::write(&backup, b"OLD").expect("write backup");
+    let res = rollback_self_update_backup_sync(&target, &backup);
+    check(
+        "直写模式失败：备份改回原名",
+        res.is_ok() && std::fs::read(&target).unwrap() == b"OLD",
+        format!("{res:?}"),
+    );
+    check(
+        "直写模式失败：半截新文件被丢掉、.instbak 不再存在",
+        !backup.exists(),
+        format!("backup exists = {}", backup.exists()),
+    );
+
+    // 2) patch 模式失败：目标根本不存在（失败在 .patching 上），备份同样要回来
+    let target2 = dir.join("app.dll");
+    let backup2 = dir.join("app.dll.instbak");
+    std::fs::write(&backup2, b"OLD-DLL").expect("write backup2");
+    let res2 = rollback_self_update_backup_sync(&target2, &backup2);
+    check(
+        "patch 模式失败：目标缺失也照样还原",
+        res2.is_ok() && std::fs::read(&target2).unwrap() == b"OLD-DLL",
+        format!("{res2:?}"),
+    );
+
+    // 3) 备份不存在：如实报错，调用方据此把备份路径写进日志
+    let res3 = rollback_self_update_backup_sync(
+        &dir.join("gone.exe"),
+        &dir.join("gone.exe.instbak"),
+    );
+    check(
+        "备份不存在时报错（不静默假装还原成功）",
+        res3.is_err(),
+        format!("{res3:?}"),
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::main]
 async fn main() {
     reg_target_cases();
@@ -1419,6 +1476,7 @@ async fn main() {
     h3_pin_cases();
     builder_pack_cases();
     hash_reader_cases();
+    rollback_self_update_cases();
     let (pass, fail) = (PASS.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed));
     println!("\n==== PASS {pass} / FAIL {fail} ====");
     if fail > 0 {

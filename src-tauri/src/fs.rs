@@ -935,23 +935,30 @@ pub fn commit_self_update_backup(backup: &Path) {
 ///
 /// 调用前磁盘状态可能是「原名缺失 + 半截新文件」（直写模式）或「原名缺失」
 /// （patch 模式在 `.patching` 上失败）。两种都还原成「旧版本原地可用」。
-pub fn rollback_self_update_backup_sync(target: &Path, backup: &Path) {
-    if let Err(e) = std::fs::remove_file(target) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!("自更新回滚：删除半成品目标失败（继续还原备份）: {e}");
-        }
+///
+/// 只做两条文件系统操作、不写日志，是为了让 `tools/devcheck` 的 logic 层能在任意平台
+/// 用真实临时文件断言它（见 [24] 组）；日志由调用方补。
+pub fn rollback_self_update_backup_sync(target: &Path, backup: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(target) {
+        Ok(()) => {}
+        // 半成品本来就不存在（patch 模式失败在 .patching 上）不算错误
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
-    if let Err(e) = std::fs::rename(backup, target) {
-        // 还原不了就把备份留在磁盘上：更新器仍然可用，只是名字带 .instbak。
-        tracing::error!("自更新回滚失败，旧安装器保留在 {}: {e}", backup.display());
-    }
+    std::fs::rename(backup, target)
 }
 
 pub async fn rollback_self_update_backup(target: &str, backup: &Path) {
     let target = PathBuf::from(target);
     let backup = backup.to_path_buf();
-    let _ = tokio::task::spawn_blocking(move || rollback_self_update_backup_sync(&target, &backup))
-        .await;
+    let res =
+        tokio::task::spawn_blocking(move || rollback_self_update_backup_sync(&target, &backup))
+            .await;
+    match res {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::error!("自更新回滚失败，旧安装器保留在 {}: {e}", backup.display()),
+        Err(e) => tracing::error!("自更新回滚任务失败: {e}"),
+    }
 }
 
 pub async fn create_target_file(target: &str) -> Result<impl AsyncWrite, anyhow::Error> {

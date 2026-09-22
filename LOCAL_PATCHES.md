@@ -1149,7 +1149,9 @@ note：[本地扫描改单趟枚举并看见不受管文件](docs/notes/implemen
 两个 job，`test` 矩阵新增第 10 组 `interrupted-download`（见 19a 的失败语义：
 中断后旧版本与更新器都还在、无临时残留、重跑装完，并断言更新期间没有逐个文件的下载
 请求）。`hash_reader` 的 sha256 分支由 devcheck logic 层 [22] 组断言覆盖；
-`fs.rs` / `ipc/` / `thirdparty/` 的类型检查只能在 Windows runner 上做。
+自更新回滚由 [24] 组断言用真实临时文件覆盖（`rollback_self_update_backup_sync` 是纯
+函数，为此不写日志、只返回 `io::Result`）；`fs.rs` / `ipc/` / `thirdparty/` 其余部分的
+类型检查只能在 Windows runner 上做。
 
 ---
 
@@ -1228,7 +1230,9 @@ note：[本地扫描改单趟枚举并看见不受管文件](docs/notes/implemen
    `thirdparty/mirrorc.rs`（解压同样收尾、下载校验 sha256）→
    `installer/uninstall.rs`（`schedule_delete_on_exit` 成为唯一写入点）→
    `ipc/manager.rs`（`Lagged` 继续接收、容量 256）→ `utils/hash.rs`
-   （`hash_reader` 的 sha256 分支，**要同步 `tools/devcheck` 的 [22] 组断言**）→
+   （`hash_reader` 的 sha256 分支，**要同步 `tools/devcheck` 的 [22] 组断言**；自更新
+   回滚要保持 `rollback_self_update_backup_sync` 为纯函数并同步 `LogicFsItems` 与
+   [24] 组断言）→ `docs/notes/`（决策记录整目录，规范见 `docs/notes/AGENTS.md`）→
    前端 `src/App.vue` / `src/api/ipc.ts` / `src/types.ts`（`LocalScan` 与
    `sha256` 字段）。注意上游若已把这三条路径改成 staging 提交，本节的做法与它
    冲突：那时应以 staging 方案为准，只保留「失败不丢更新器」这条验收判据；

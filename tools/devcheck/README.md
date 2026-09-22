@@ -294,6 +294,9 @@ Rust 类型/借用/生命周期错误（含 `std::os::windows`、`windows`、
   （PE 识别错了会拿安装器当 builder 用，打包出坏包）。
 - 改 `utils/hash.rs` 的摘要核心（`hash_reader`）→ 同步 `$script:LogicHashItems`
   清单与 [22] 组断言：分块边界算错等于所有更新校验一起失效。
+- 改 `fs.rs` 的自更新回滚（`rollback_self_update_backup_sync`）→ 同步
+  `$script:LogicFsItems` 清单与 [24] 组断言。这个函数**必须保持纯函数**（只用
+  `std::fs` + `std::io`，不写日志、不碰 tokio），否则抽不进最小 crate；日志由调用方补。
 - kachina 升级依赖版本（`Cargo.toml`）→ 同步 `rust/typecheck/Cargo.toml`，
   否则类型检查结论不可信。
 - 改 `installer/lnk.rs` 的 COM 调用（`IShellLinkW` / `IPersistFile`）、

@@ -58,10 +58,16 @@ pub fn run_mirrorc_install_sync(
             Ok(v)
         }
         (Err(e), Some(backup)) => {
-            crate::fs::rollback_self_update_backup_sync(
+            if let Err(e2) = crate::fs::rollback_self_update_backup_sync(
                 &std::path::PathBuf::from(target_path),
                 &backup,
-            );
+            ) {
+                // 还原不了就把备份留在磁盘上：更新器仍然可用，只是名字带 .instbak。
+                tracing::error!(
+                    "Mirror酱 自更新回滚失败，旧安装器保留在 {}: {e2}",
+                    backup.display()
+                );
+            }
             Err(e)
         }
         (res, None) => res,
