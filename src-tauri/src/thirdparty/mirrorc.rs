@@ -212,7 +212,6 @@ fn run_mirrorc_install_inner(
     Ok((metadata, changeset))
 }
 
-#[tauri::command]
 pub async fn get_mirrorc_status(
     resource_id: &str,
     current_version: &str,

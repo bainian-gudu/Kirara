@@ -1,6 +1,6 @@
 // devcheck 前端层：用 @vue/compiler-sfc 把仓库里所有 .vue 单文件组件编译一遍。
 //
-// 只装 @vue/compiler-sfc（不需要完整 node_modules，也不需要 vite/tauri），
+// 只装 @vue/compiler-sfc（不需要完整 node_modules，也不需要 vite/Tauri），
 // 就能抓住最常见的一类错误：template 语法错、<script setup> 里的语法错、
 // 以及 bindings 解析失败。类型错误交给 tsc --noEmit（见 tsconfig.json）。
 //

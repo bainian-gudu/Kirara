@@ -1,6 +1,6 @@
 # tools/devcheck — 不跑完整构建的本地体检
 
-本仓库是一个 **Tauri + Windows 专用** 的项目：完整构建要 nightly Rust、
+本仓库是一个 **Windows + WebView2 专用** 的项目：完整构建要 nightly Rust、
 标准 `x86_64-pc-windows-msvc` target（不再有 `-Z build-std`）、pnpm 全家桶，本地跑一次
 好几分钟，CI 更久。结果是「改一行 Rust / Vue，只能靠一次完整构建来发现写错了」。
 
@@ -11,7 +11,7 @@
 # 仓库根目录
 pwsh tools/devcheck/devcheck.ps1                 # 跑 all（vendor ps1 gen rust logic native front ci）
 pwsh tools/devcheck/devcheck.ps1 -Layer rust,logic
-pwsh tools/devcheck/devcheck.ps1 -SelfTest       # 自检：注入 15 个错误，确认每层都会报错
+pwsh tools/devcheck/devcheck.ps1 -SelfTest       # 自检：注入 16 个错误，确认每层都会报错
 pwsh tools/devcheck/devcheck.ps1 -Fix            # 只对我们维护的 .rs 跑 rustfmt
 ```
 
@@ -25,12 +25,12 @@ pwsh tools/devcheck/devcheck.ps1 -Fix            # 只对我们维护的 .rs 跑
 
 | 层 | 检查什么 | 需要的工具 | 热跑耗时 |
 | --- | --- | --- | --- |
-| `vendor` | **kachina 只用仓库内源码**：不是 submodule、快照完整、工作流与打包脚本里没有任何从上游拉源码/下二进制的动作、CI 确实走源码构建、git 依赖锁到 commit、npm 依赖全来自 registry、**遥测（Sentry / cocogoat 统计）没被加回来** | pwsh 7 | ~0.8s |
+| `vendor` | **kachina 只用仓库内源码**：不是 submodule、快照完整、工作流与打包脚本里没有任何从上游拉源码/下二进制的动作、CI 确实走源码构建、git 依赖锁到 commit、npm 依赖全来自 registry、**遥测（Sentry / cocogoat 统计）没被加回来**、**原生 WebView2 宿主没有回退 Tauri** | pwsh 7 | ~0.8s |
 | `ps1` | 仓库里全部 `.ps1` 的语法（PowerShell Parser） | pwsh 7 | <0.1s |
 | `gen` | 从 `src-tauri/`、`src/` 源码生成检查用的 Rust / TS 文件 | pwsh 7 | ~0.3s |
-| `rust` | **整份** `installer/uninstall.rs` + `installer/lnk.rs` + `utils/{error,dir,os_version}.rs` 的类型检查：塞进一个只有 11 个依赖的 crate，`cargo check --target x86_64-pc-windows-msvc`。不需要 tauri、不需要 Windows 机器 | cargo + `rustup target add x86_64-pc-windows-msvc` | 首次 ~30s，之后 ~0.6s |
+| `rust` | **整份** `installer/uninstall.rs` + `installer/lnk.rs` + `utils/{error,dir,os_version}.rs` 的类型检查：塞进一个只有 11 个依赖的 crate，`cargo check --target x86_64-pc-windows-msvc`。不需要 Tauri、不需要 Windows 机器 | cargo + `rustup target add x86_64-pc-windows-msvc` | 首次 ~30s，之后 ~0.6s |
 | `native` | vendored `rcedit-sys` 的 C++（`rescle.cc` / `librcedit.cpp`）真用 MSVC 编一遍。没有 `cl.exe` 的机器（Linux / 未进 VS 开发环境的 Windows）自动 SKIP | cargo + MSVC（`cl.exe` 在 PATH） | 首次 ~30s，之后 ~2s |
-| `logic` | 同一批函数的**行为断言**（248 条，含循环用例）：注册表 / 快捷方式 / 计划任务名 / 用户数据目录 / 安装目录内文件清单 / 旧版本残留清单安全阀、路径归一化与比较、微软签名判定、zip 条目名解码（替代 zip fork 的那条语义）、H3 证书固定值与 SPKI 哈希（用 openssl 算出的样例证书交叉验证）、打包器的包体 PE 识别 / 嵌入名规则 / 抽取路径越界防护、md5 / xxh / sha256 的分块摘要、自更新失败时把 `.instbak` 还原回原名的语义（真实临时文件）、静默 / 非交互运行不得弹模态框的判定，以及用**临时配置文件 + 临时协议正文**跑 `resolve_agreement`（下游应用侧的配置不在本仓库，所以这里不依赖它） | cargo | 首次 ~15s，之后 ~0.4s |
+| `logic` | 同一批函数的**行为断言**（250 条，含循环用例）：注册表 / 快捷方式 / 计划任务名 / 用户数据目录 / 安装目录内文件清单 / 旧版本残留清单安全阀、路径归一化与比较、微软签名判定、zip 条目名解码（替代 zip fork 的那条语义）、H3 证书固定值与 SPKI 哈希（用 openssl 算出的样例证书交叉验证）、打包器的包体 PE 识别 / 嵌入名规则 / 抽取路径越界防护、md5 / xxh / sha256 的分块摘要、自更新失败时把 `.instbak` 还原回原名的语义（真实临时文件）、静默 / 非交互运行不得弹模态框的判定、原生宿主关闭自删接线，以及用**临时配置文件 + 临时协议正文**跑 `resolve_agreement`（下游应用侧的配置不在本仓库，所以这里不依赖它） | cargo | 首次 ~15s，之后 ~0.4s |
 | `front` | `utils/agreement.ts` + `types.ts` 的 `tsc --strict`；`src` 下**全部** `.vue` 的 `@vue/compiler-sfc` 编译；`agreement.ts` 的 prettier 风格 | node + npm | 首次 ~10s，之后 ~2s |
 | `ci` | `tools/ci/Import-DevCmd.ps1` 的行为：用假 vcvarsall 输出跑一遍「生成 .cmd → 解析输出 → 注入环境 → 写 `GITHUB_ENV`」，并断言工作流里的 action 版本不低于 `README.md` 登记的下限 | pwsh 7 | ~1s |
 
@@ -73,7 +73,7 @@ bash tools/devcheck/check-installer.sh
 ## `vendor` 层：kachina 只从本仓库拉
 
 本仓库就是上游 kachina-installer 的**源码快照**（仓库根即源码），构建必须完全基于它。
-这一层把这条约束变成可执行的断言（十项，任何一项不满足就失败）：
+这一层把这条约束变成可执行的断言（十一项，任何一项不满足就失败）：
 
 1. 仓库根不存在 `.gitmodules`（kachina 不是 submodule）
 2. 快照完整：`package.json` / `pnpm-lock.yaml` / `src-tauri/Cargo.toml` /
@@ -125,6 +125,12 @@ bash tools/devcheck/check-installer.sh
    顺带断言 `src-tauri/libs/{THIRDPARTY.md,hdiff-sys/LICENSE,hpatch-sys/LICENSE}`
    都在 —— 那两份 vendored 的 HDiffPatch 源码是 MIT，许可证必须随源码分发。
 
+11. **C10 原生宿主不许回退到 Tauri**：`Cargo.toml` / `Cargo.lock` 不得出现
+   `tauri` / `wry`，`package.json` / `pnpm-lock.yaml` 不得出现 `@tauri-apps`；
+   `src/host.ts` 与 `src-tauri/src/host/{mod,assets,bridge,webview,window}.rs` 必须
+   存在，旧 `src/tauri.ts` / `tauri.conf.json` 必须不存在；`rsbuild.config.ts` 必须
+   保持 JS/CSS 内联与 `all-in-one` chunk。
+
 第 5、7、8 项扫 `Cargo.toml` / `rescle.cc` / 源码时都会**先剥掉注释**：这些文件里的注释
 本身就会写出「原为 `git = "...rcedit-rs.git"`」「原为 `std::locale::empty()`」
 「上游挂在 `utils/sentry.rs` 里」这类说明文字，不剥掉就会自己误报自己。第 8 项的域名
@@ -136,7 +142,7 @@ bash tools/devcheck/check-installer.sh
 ## `-SelfTest`：证明这套检查不是空壳
 
 检查工具最大的风险是「跑通了但其实什么都没查」。`-SelfTest` 会先正常生成一次，
-然后注入 15 个错误，逐个确认对应层会失败。其中 6 个只动**生成物**，9 个会临时创建/改写
+然后注入 16 个错误，逐个确认对应层会失败。其中 6 个只动**生成物**，10 个会临时创建/改写
 仓库内的文件（`.gitmodules`、一个假工作流、`registry.rs` 的 `QuietUninstallString`、
 `rescle.cc` 末尾一行、`utils/mod.rs` 末尾一行 `sentry::init`、`Cargo.toml` 末尾一行
 `sentry = {…}`、一个带 DSN 域名的临时 `.ts`、`tools/ci/Import-DevCmd.ps1` 的解析正则），
@@ -150,6 +156,7 @@ bash tools/devcheck/check-installer.sh
 | `rescle.cc` 末尾追加一行真代码 `std::locale(std::locale::empty())` | `vendor` 层报错（MSVC 14.51 编不过） |
 | `src-tauri/src/utils/mod.rs` 末尾追加 `fn _devcheck_selftest_telemetry() { sentry::init(…) }` | `vendor` 层报错（遥测不许回来） |
 | `src-tauri/Cargo.toml` 末尾追加 `sentry = { version = "0.37", … }` | `vendor` 层报错（遥测依赖不许回来） |
+| `src-tauri/Cargo.toml` 末尾追加 `tauri = "2"` | `vendor` 层报错（原生宿主不许回退 Tauri） |
 | 新建 `src/devcheck-selftest-telemetry.ts`，内含 `steambird.cocogoat.cn` 的 DSN | `vendor` 层报错（上报域名不许回来） |
 | `tools/devcheck/_selftest/broken.ps1`（`if` 少了右括号） | `ps1` 层报错 |
 | `gen/uninstall.rs` 末尾追加 `let _x: u32 = "不是数字";` | `rust` 层报错 |
@@ -176,13 +183,13 @@ tools/devcheck/
 │   ├── Cargo.toml          依赖版本与 kachina src-tauri/Cargo.toml 对齐
 │   └── src/lib.rs          把生成文件挂到上游的模块路径上 + 2 个最小桩
 ├── rust/logic/             行为断言 crate（mock windows-registry，跨平台）
-│   └── src/main.rs         248 条断言 + mock
+│   └── src/main.rs         250 条断言 + mock
 ├── front/                  package.json / tsconfig.json / sfccheck.mjs
 └── rust/native/target/     native 层的 CARGO_TARGET_DIR（运行时生成，已 gitignore）
 ```
 
-- **`typecheck`**：`gen/` 下的五个文件都是上游文件的**逐字节复制**，唯一改动是把
-  `#[tauri::command]` 那一行换成注释（本 crate 不依赖 tauri）：`uninstall.rs`、
+- **`typecheck`**：`gen/` 下的五个文件都是上游文件的**逐字节复制**；同步旧上游快照时
+  生成器会把 `#[tauri::command]` 换成注释（本 crate 不依赖 Tauri）：`uninstall.rs`、
   `utils/error.rs`、`installer/lnk.rs`、`utils/dir.rs`、`utils/os_version.rs`。
   `lnk.rs` 是「用系统 API 换掉 `mslnk`」那次重构的落点（`IShellLinkW` + `IPersistFile`，
   见 `LOCAL_PATCHES.md` 第 16 节），`utils/os_version.rs` 是换掉 `nt_version` 的
@@ -215,7 +222,7 @@ Rust 类型/借用/生命周期错误（含 `std::os::windows`、`windows`、
 
 **抓不到**（这些还得靠真实构建 / 实机）：
 
-- `#[tauri::command]` 宏展开、IPC 参数名与前端 `invoke` 的对齐
+- 原生 WebView2 bridge 的 JSON 参数名与前端 `invoke` 的对齐（实机 / 整包类型检查）
 - 上游 npm/cargo 依赖自身的供应链问题（只检查「来源形式」与「是否锁版本」）
 - `builder/pack.rs` 除 `resolve_agreement` 之外的部分（依赖 builder 的一大堆模块）
 - `utils/secure_temp.rs` 除签名判定之外的部分（落地目录、独占创建、PowerShell 验签

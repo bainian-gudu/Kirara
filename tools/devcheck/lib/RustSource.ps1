@@ -1,6 +1,6 @@
 # Rust 源码抽取工具（被 devcheck.ps1 dot-source）
 #
-# 目的：不启动 tauri / 不装 Windows 工具链，也能对 . 里被我们改过的
+# 目的：不启动 WebView2 宿主 / 不装 Windows 工具链，也能对 . 里被我们改过的
 # Rust 逻辑做「编译期检查」和「行为断言」。
 #
 # 做法有两种，分别对应 tools/devcheck/rust 下的两个 crate：
@@ -179,7 +179,7 @@ function Read-RustSource {
     }
 }
 
-# 去掉整行的 #[tauri::command]（typecheck crate 不依赖 tauri）
+# 兼容旧快照：去掉整行的 #[tauri::command]（C10 后本仓库源码已无这些属性）
 function Remove-TauriCommandAttr {
     param([Parameter(Mandatory)][string]$Text)
     $lines = $Text -split "(`r?`n)"

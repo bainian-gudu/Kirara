@@ -8,17 +8,15 @@ edition = "2021"
 default-run = "kachina-installer"
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+embed-resource = "3"
+zstd = { version = "0.13", default-features = false }
 
 [dependencies]
-tauri = { version = "2", default-features = false, features = [
-    "wry",
-    "devtools",
-] }
-tauri-utils = "2"
+webview2-com = "0.38"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 async-compression = { version = "0.4", features = ["tokio", "zstd", "zstdmt"] }
+zstd = { version = "0.13", default-features = false }
 tokio = { version = "1", features = [
     "rt",
     "rt-multi-thread",
@@ -48,8 +46,12 @@ futures = "0.3"
 tokio-util = { version = "0.7", features = ["io-util"] }
 async-walkdir = "2.0"
 windows = { version = "0.61.1", features = [
+    "Win32_System_DataExchange",
     "Win32_System_Com",
     "Win32_System_Console",
+    "Win32_System_Environment",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
     "Win32_Security",
     "Win32_System_Registry",
     "Win32_Security_Authorization",
@@ -58,8 +60,13 @@ windows = { version = "0.61.1", features = [
     "Security",
     "Win32_System_ProcessStatus",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_Controls",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
     "Win32_UI_Shell",
     "UI_ViewManagement",
 ] }
@@ -68,6 +75,7 @@ rfd = { version = "0.15", default-features = false, features = [
     "tokio",
     "common-controls-v6",
 ] }
+raw-window-handle = "0.6"
 lazy_static = "1.5"
 open = { version = "5.3.1", features = ["shellexecute-on-windows"] }
 twox-hash = "2.1.0"
@@ -138,7 +146,7 @@ path = "src/builder/main.rs"
 
 [profile.dev]
 incremental = true # 将编译拆成更小的步骤。
-rustflags = ["-Zthreads=8"] # 提高编译性能（Tauri 官方建议值；4 核 runner 上 16 会超订）。
+rustflags = ["-Zthreads=8"] # 提高编译性能；4 核 runner 上 16 会超订。
 
 [profile.release]
 debug = true
@@ -148,4 +156,4 @@ lto = true # 启用链接时优化。
 opt-level = "s" # 优先减小二进制体积；更重视速度时可改为 `3`。
 panic = "abort" # 禁用 panic 处理器以提高性能。
 trim-paths = "all" # 从二进制文件中移除可能包含特权信息的路径。
-rustflags = ["-Zthreads=8"] # 提高编译性能（Tauri 官方建议值；4 核 runner 上 16 会超订）。
+rustflags = ["-Zthreads=8"] # 提高编译性能；4 核 runner 上 16 会超订。

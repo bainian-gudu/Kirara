@@ -1,4 +1,3 @@
-use tauri::{AppHandle, State, WebviewWindow};
 use windows::Win32::{
     Foundation::{CloseHandle, WAIT_FAILED, WAIT_TIMEOUT},
     System::Diagnostics::ToolHelp::PROCESSENTRY32W,
@@ -17,15 +16,12 @@ pub mod registry;
 pub mod runtimes;
 pub mod uninstall;
 
-#[tauri::command]
 pub async fn launch(path: String) {
     let _ = open::that(path);
 }
 
-#[tauri::command]
-pub async fn launch_and_exit(path: String, app: AppHandle) {
+pub async fn launch_and_exit(path: String) {
     let _ = open::that(path);
-    app.exit(0);
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -43,23 +39,23 @@ pub struct SelectDirRes {
     pub upgrade: bool,
 }
 
-#[tauri::command]
 pub async fn select_dir(
     path: String,
     exe_name: String,
     legacy_exe_names: Vec<String>,
     silent: bool,
-    window: WebviewWindow,
+    parent: Option<&crate::host::DialogParent>,
 ) -> Option<SelectDirRes> {
     let pathstr = if silent {
         path.clone()
     } else {
-        let res = rfd::AsyncFileDialog::new()
+        let mut dialog = rfd::AsyncFileDialog::new()
             .set_directory(path)
-            .set_can_create_directories(true)
-            .set_parent(&window)
-            .pick_folder()
-            .await;
+            .set_can_create_directories(true);
+        if let Some(parent) = parent {
+            dialog = dialog.set_parent(parent);
+        }
+        let res = dialog.pick_folder().await;
         res.as_ref()?;
         let res = res.unwrap();
         res.path().to_str().map(|s| s.to_string())?
@@ -133,7 +129,6 @@ async fn probe_directory_writable(dir: &std::path::Path) -> bool {
     }
 }
 
-#[tauri::command]
 pub async fn kill_process(pid: u32) -> Result<()> {
     let ret = tokio::task::spawn_blocking(move || {
         // 使用 windows crate
@@ -207,7 +202,6 @@ fn get_process_path(pid: u32) -> Option<String> {
     Some(path)
 }
 
-#[tauri::command]
 pub async fn find_process_by_name(name: String) -> Result<Vec<(u32, String)>> {
     let mut processes = Vec::new();
     unsafe {
@@ -281,7 +275,6 @@ pub struct VersionInfo {
     pub special_build: String,
 }
 
-#[tauri::command]
 pub async fn get_exe_version(exe_name: String) -> TAResult<VersionInfo> {
     let info = win32_version_info::VersionInfo::from_file(exe_name).into_ta_result()?;
     Ok(VersionInfo {
@@ -300,44 +293,46 @@ pub async fn get_exe_version(exe_name: String) -> TAResult<VersionInfo> {
     })
 }
 
-#[tauri::command]
 pub async fn error_dialog(
     title: String,
     message: String,
-    args: State<'_, InstallArgs>,
-    window: WebviewWindow,
+    args: &InstallArgs,
+    parent: Option<&crate::host::DialogParent>,
 ) -> Result<(), String> {
     if !should_show_dialog(args.silent, args.non_interactive) {
         tracing::error!("{}: {}", title, message);
         return Ok(());
     }
-    rfd::MessageDialog::new()
+    let mut dialog = rfd::MessageDialog::new()
         .set_title(&title)
         .set_description(&message)
-        .set_level(rfd::MessageLevel::Error)
-        .set_parent(&window)
-        .show();
+        .set_level(rfd::MessageLevel::Error);
+    if let Some(parent) = parent {
+        dialog = dialog.set_parent(parent);
+    }
+    dialog.show();
     Ok(())
 }
 
-#[tauri::command]
 pub async fn confirm_dialog(
     title: String,
     message: String,
-    args: State<'_, InstallArgs>,
-    window: WebviewWindow,
+    args: &InstallArgs,
+    parent: Option<&crate::host::DialogParent>,
 ) -> Result<bool, String> {
     if !should_show_dialog(args.silent, args.non_interactive) {
         tracing::warn!("{}: {}（无人值守运行，默认取消）", title, message);
         return Ok(false);
     }
-    let ret = rfd::MessageDialog::new()
+    let mut dialog = rfd::MessageDialog::new()
         .set_title(&title)
         .set_description(&message)
         .set_level(rfd::MessageLevel::Info)
-        .set_parent(&window)
-        .set_buttons(rfd::MessageButtons::YesNo)
-        .show();
+        .set_buttons(rfd::MessageButtons::YesNo);
+    if let Some(parent) = parent {
+        dialog = dialog.set_parent(parent);
+    }
+    let ret = dialog.show();
 
     Ok(matches!(ret, rfd::MessageDialogResult::Yes))
 }
@@ -348,17 +343,14 @@ pub fn should_show_dialog(silent: bool, non_interactive: bool) -> bool {
     !silent && !non_interactive
 }
 
-#[tauri::command]
 pub fn log(data: String) {
     tracing::info!("{}", data);
 }
 
-#[tauri::command]
 pub fn warn(data: String) {
     tracing::warn!("{}", data);
 }
 
-#[tauri::command]
 pub fn error(data: String) {
     tracing::error!("{}", data);
 }

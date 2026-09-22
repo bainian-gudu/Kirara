@@ -299,6 +299,54 @@ function Test-VendoredSource {
     }
     $notes.Add('libs 下 vendored 源码带齐 LICENSE 与出处说明')
 
+    # 11) C10：Tauri 宿主替换后不许回归。宿主由 Win32 窗口 + WebView2 controller
+    #     直接实现，前端资源由 build.rs 压缩进 exe；把 Tauri 依赖或旧桥接文件加回来
+    #     会让体积、IPC 形状和窗口生命周期同时回到旧架构。
+    if ($cargoTomlCode -match '(?m)^\s*(tauri|tauri-build|tauri-utils)\s*=') {
+        throw 'kachina 的 Cargo.toml 又声明了 Tauri 依赖 —— C10 已换成原生 Win32 + WebView2 宿主'
+    }
+    if ($cargoLock -match '(?m)^name = "(tauri|tauri-build|tauri-utils|wry)"') {
+        throw 'Cargo.lock 里又出现 Tauri / wry —— 改完依赖要重新生成 Cargo.lock（cargo metadata）'
+    }
+    foreach ($section in @('dependencies', 'devDependencies')) {
+        $node = $pkg.$section
+        if (-not $node) { continue }
+        foreach ($prop in $node.PSObject.Properties) {
+            if ($prop.Name -eq '@tauri-apps/api' -or $prop.Name -eq '@tauri-apps/cli') {
+                throw "package.json 又声明了 $($prop.Name) —— 原生宿主不依赖 Tauri JS API"
+            }
+        }
+    }
+    $pnpmLockText = [System.IO.File]::ReadAllText((Join-Path $RepoRoot 'pnpm-lock.yaml'))
+    if ($pnpmLockText -match '@tauri-apps/') {
+        throw 'pnpm-lock.yaml 里还有 @tauri-apps/ 条目 —— package.json 改完要重新生成 lock'
+    }
+    foreach ($r in @(
+            'src/host.ts',
+            'src-tauri/src/host/mod.rs',
+            'src-tauri/src/host/assets.rs',
+            'src-tauri/src/host/bridge.rs',
+            'src-tauri/src/host/webview.rs',
+            'src-tauri/src/host/window.rs'
+        )) {
+        if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot $r))) {
+            throw "原生宿主文件缺失：$r"
+        }
+    }
+    if (Test-Path -LiteralPath (Join-Path $RepoRoot 'src/tauri.ts')) {
+        throw 'src/tauri.ts 又出现了 —— 前端 IPC 应走 src/host.ts 的 WebView2 桥'
+    }
+    if (Test-Path -LiteralPath (Join-Path $RepoRoot 'src-tauri/tauri.conf.json')) {
+        throw 'src-tauri/tauri.conf.json 又出现了 —— C10 已删除 Tauri 配置'
+    }
+    $rsbuild = [System.IO.File]::ReadAllText((Join-Path $RepoRoot 'rsbuild.config.ts'))
+    foreach ($token in @('inlineScripts: true', 'inlineStyles: true', "strategy: 'all-in-one'")) {
+        if ($rsbuild -notmatch [regex]::Escape($token)) {
+            throw "rsbuild.config.ts 缺少「$token」—— 前端必须保持单文件内联产物"
+        }
+    }
+    $notes.Add('Tauri 宿主未回归(原生 host / 单文件前端 / 无 @tauri-apps)')
+
     return ($notes -join '；')
 }
 

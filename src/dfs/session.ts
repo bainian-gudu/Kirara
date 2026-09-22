@@ -6,7 +6,7 @@
  */
 import { log, warn } from '../api/ipc';
 import { clearNetworkInsights } from '../networkInsights';
-import { invoke } from '../tauri';
+import { invoke } from '../host';
 import { Dfs2SessionResponse, InsightItem } from '../types';
 
 // 判断错误是否为应重试的网络错误

@@ -5,6 +5,7 @@ pub mod capabilities;
 pub mod cli;
 pub mod dfs;
 pub mod fs;
+pub mod host;
 pub mod installer;
 pub mod ipc;
 pub mod local;
@@ -13,10 +14,7 @@ pub mod thirdparty;
 pub mod utils;
 use clap::Parser;
 use cli::arg::{Command, InstallArgs};
-use installer::uninstall::delete_self_on_exit;
 use std::{sync::atomic::AtomicBool, time::Duration};
-use tauri::{window::Color, WindowEvent};
-use tauri_utils::{config::WindowEffectsConfig, WindowEffect};
 use tracing_subscriber::prelude::*;
 
 fn windows_text_scale_factor() -> f64 {
@@ -100,7 +98,7 @@ fn main() {
 
     let cli = cli::Cli::parse();
     let mut command = cli.command();
-    let wv2ver = tauri::webview_version();
+    let wv2ver = host::webview_version();
     if wv2ver.is_err() {
         command = Command::InstallWebview2;
     }
@@ -170,7 +168,7 @@ fn main() {
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(tauri_main(install));
+                .block_on(native_main(install));
         }
         Command::Other(_str) => {
             tracing::info!("KachinaInstaller started");
@@ -178,7 +176,7 @@ fn main() {
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(tauri_main(InstallArgs {
+                .block_on(native_main(InstallArgs {
                     target: None,
                     non_interactive: false,
                     silent: false,
@@ -192,14 +190,7 @@ fn main() {
     }
 }
 
-async fn tauri_main(args: InstallArgs) {
-    tauri::async_runtime::set(tokio::runtime::Handle::current());
-    let (major, minor, build) = crate::utils::os_version::get();
-    // 使用 22000 作为 Windows 11 的构建号
-    let is_win11 = major == 10 && minor == 0 && build >= 22000;
-    let is_win11_ = is_win11;
-
-    // 将当前工作目录设置为临时目录
+async fn native_main(args: InstallArgs) {
     let temp_dir = std::env::temp_dir();
     let res = std::env::set_current_dir(&temp_dir);
     if res.is_err() {
@@ -209,140 +200,12 @@ async fn tauri_main(args: InstallArgs) {
             .show();
         return;
     }
-    tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![
-            // 可直接运行的Command
-            fs::is_dir_empty,
-            dfs::get_dfs,
-            dfs::get_http_with_range,
-            dfs::http_get_request,
-            // DFS2 命令
-            dfs::get_dfs2_metadata,
-            dfs::create_dfs2_session,
-            dfs::get_dfs2_chunk_url,
-            dfs::get_dfs2_batch_chunk_urls,
-            dfs::end_dfs2_session,
-            dfs::solve_dfs2_challenge,
-            installer::log,
-            installer::warn,
-            installer::error,
-            installer::launch,
-            installer::launch_and_exit,
-            installer::config::get_installer_config,
-            installer::lnk::get_dirs,
-            installer::registry::read_uninstall_metadata,
-            installer::select_dir,
-            installer::error_dialog,
-            installer::confirm_dialog,
-            installer::get_exe_version,
-            // 相关实现：wincred
-            utils::wincred::wincred_write,
-            utils::wincred::wincred_read,
-            utils::wincred::wincred_delete,
-            // 相关实现：mirrorc
-            thirdparty::mirrorc::get_mirrorc_status,
-            // 新的托管操作
-            ipc::manager::managed_operation,
-        ])
-        .manage(args)
-        .manage(ipc::manager::ManagedElevate::new())
-        .setup(move |app| {
-            // 等待 5 秒检查窗口是否仍存活
-            tokio::spawn({
-                async move {
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    if APP_BOOT_SIGNAL.load(std::sync::atomic::Ordering::SeqCst) {
-                        tracing::info!("Webview2 is alive");
-                        return;
-                    }
-                    rfd::MessageDialog::new()
-                        .set_title("Kachina Installer")
-                        .set_description("Initialization failed due to webview2 fault")
-                        .set_level(rfd::MessageLevel::Error)
-                        .show();
-                    tracing::error!("Webview2 fault detected");
-                    std::process::exit(1);
-                }
-            });
-            let temp_dir_for_data = temp_dir.join("KachinaInstaller");
-
-            let text_scale = windows_text_scale_factor();
-            let base_width = 520.0;
-            let base_height = 250.0;
-            let scaled_width = base_width * text_scale;
-            let scaled_height = base_height * text_scale;
-
-            // 创建基础窗口构建器的辅助函数
-            let create_window_builder = || {
-                tauri::WebviewWindowBuilder::new(
-                    app,
-                    "main",
-                    tauri::WebviewUrl::App("index.html".into()),
-                )
-                .title(" ")
-                .resizable(false)
-                .maximizable(false)
-                .transparent(true)
-                .inner_size(scaled_width, scaled_height)
-                .center()
-            };
-
-            // 从当前 exe 提取图标
-            let window_icon = utils::icon::get_exe_icon_for_tauri();
-
-            // 创建构建器，并在提供图标时应用图标
-            let mut main_window = create_window_builder();
-            if let Some(icon) = window_icon {
-                main_window = main_window.icon(icon).unwrap_or_else(|e| {
-                    tracing::warn!("Failed to set window icon: {:?}", e);
-                    create_window_builder()
-                });
-            }
-
-            if !cfg!(debug_assertions) {
-                main_window = main_window.data_directory(temp_dir_for_data).visible(false);
-            }
-            let main_window = main_window.build().unwrap();
-            #[cfg(debug_assertions)]
-            {
-                let window = tauri::Manager::get_webview_window(app, "main");
-                if let Some(window) = window {
-                    window.open_devtools();
-                }
-            }
-            if is_win11 {
-                let _ = main_window.set_effects(Some(WindowEffectsConfig {
-                    effects: vec![WindowEffect::Mica],
-                    ..Default::default()
-                }));
-            } else {
-                // mica 不可用时使用纯色背景。
-                let _ = if utils::gui::is_dark_mode().unwrap_or(false) {
-                    main_window.set_background_color(Some(Color(0, 0, 0, 255)))
-                } else {
-                    main_window.set_background_color(Some(Color(255, 255, 255, 255)))
-                };
-            }
-            Ok(())
-        })
-        .on_window_event(move |window, event| {
-            if let WindowEvent::ThemeChanged(theme) = event {
-                if !is_win11_ {
-                    match theme {
-                        tauri::Theme::Dark => {
-                            let _ = window.set_background_color(Some(Color(0, 0, 0, 255)));
-                        }
-                        tauri::Theme::Light => {
-                            let _ = window.set_background_color(Some(Color(255, 255, 255, 255)));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            if let WindowEvent::CloseRequested { .. } = event {
-                delete_self_on_exit();
-            }
-        })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+    if let Err(error) = host::run(args) {
+        tracing::error!("native host failed: {error:#}");
+        rfd::MessageDialog::new()
+            .set_title("Kachina Installer")
+            .set_description(format!("Native host failed: {error:#}"))
+            .set_level(rfd::MessageLevel::Error)
+            .show();
+    }
 }

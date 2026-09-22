@@ -1,0 +1,348 @@
+use std::mem::size_of;
+use std::os::windows::ffi::OsStrExt;
+
+use anyhow::Context;
+use windows::core::{s, w, HRESULT, PCSTR, PCWSTR};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Dwm::{
+    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_SYSTEMBACKDROP_TYPE,
+    DWMWA_USE_IMMERSIVE_DARK_MODE, DWM_SYSTEMBACKDROP_TYPE,
+};
+use windows::Win32::Graphics::Gdi::{
+    GetDC, GetDeviceCaps, MonitorFromPoint, ReleaseDC, UpdateWindow, HBRUSH, HMONITOR, LOGPIXELSX,
+    MONITOR_DEFAULTTOPRIMARY,
+};
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
+use windows::Win32::UI::Controls::MARGINS;
+use windows::Win32::UI::Shell::ExtractIconExW;
+use windows::Win32::UI::WindowsAndMessaging::{
+    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect,
+    GetSystemMetrics, GetWindowLongPtrW, LoadCursorW, PostMessageW, PostQuitMessage,
+    RegisterClassExW, SendMessageW, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
+    GWL_STYLE, HICON, ICON_BIG, ICON_SMALL, IDC_ARROW, SM_CXSCREEN, SM_CYSCREEN, SWP_FRAMECHANGED,
+    SWP_NOMOVE, SWP_NOZORDER, SW_HIDE, SW_MINIMIZE, SW_SHOW, WM_APP, WM_CLOSE, WM_DESTROY,
+    WM_SETICON, WM_SETTINGCHANGE, WNDCLASSEXW, WS_CAPTION, WS_EX_NOREDIRECTIONBITMAP, WS_MAXIMIZE,
+    WS_MINIMIZE, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_POPUP, WS_SYSMENU, WS_VISIBLE,
+};
+
+use crate::installer::uninstall::delete_self_on_exit;
+use crate::utils::gui::is_dark_mode;
+
+const CLASS: PCWSTR = w!("KachinaInstaller");
+pub const WM_THEME_BACKGROUND: u32 = WM_APP + 1;
+
+pub fn is_win11() -> bool {
+    let (major, minor, build) = crate::utils::os_version::get();
+    major == 10 && minor == 0 && (build & 0xffff) >= 22000
+}
+
+const PROCESS_PER_MONITOR_DPI_AWARE: i32 = 2;
+const MDT_EFFECTIVE_DPI: i32 = 0;
+
+pub fn enable_dpi_awareness() {
+    unsafe {
+        if let Some(set) =
+            shcore_proc::<unsafe extern "system" fn(i32) -> HRESULT>(s!("SetProcessDpiAwareness"))
+        {
+            if set(PROCESS_PER_MONITOR_DPI_AWARE).is_ok() {
+                return;
+            }
+        }
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetProcessDPIAware();
+    }
+}
+
+pub fn primary_dpi() -> u32 {
+    unsafe {
+        let monitor = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        if let Some(get) = shcore_proc::<
+            unsafe extern "system" fn(HMONITOR, i32, *mut u32, *mut u32) -> HRESULT,
+        >(s!("GetDpiForMonitor"))
+        {
+            let mut dpi_x = 96u32;
+            let mut dpi_y = 96u32;
+            if get(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y).is_ok() {
+                return dpi_x.max(1);
+            }
+        }
+        system_dpi()
+    }
+}
+
+pub fn dpi_scale() -> f64 {
+    primary_dpi() as f64 / 96.0
+}
+
+fn system_dpi() -> u32 {
+    unsafe {
+        let hdc = GetDC(None);
+        if hdc.is_invalid() {
+            return 96;
+        }
+        let dpi = GetDeviceCaps(Some(hdc), LOGPIXELSX);
+        let _ = ReleaseDC(None, hdc);
+        if dpi > 0 {
+            dpi as u32
+        } else {
+            96
+        }
+    }
+}
+
+unsafe fn shcore_proc<T: Copy>(name: PCSTR) -> Option<T> {
+    let module = LoadLibraryW(w!("shcore.dll")).ok()?;
+    let proc = GetProcAddress(module, name)?;
+    Some(std::mem::transmute_copy(&proc))
+}
+
+pub fn create(client_w: i32, client_h: i32) -> anyhow::Result<HWND> {
+    let hinstance = unsafe { GetModuleHandleW(None) }?.into();
+    let (h_icon, h_icon_sm) = load_exe_icons().unwrap_or_default();
+    let class = WNDCLASSEXW {
+        cbSize: size_of::<WNDCLASSEXW>() as u32,
+        lpfnWndProc: Some(wndproc),
+        hInstance: hinstance,
+        lpszClassName: CLASS,
+        hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }?,
+        hbrBackground: HBRUSH::default(),
+        hIcon: h_icon,
+        hIconSm: h_icon_sm,
+        ..Default::default()
+    };
+    unsafe { RegisterClassExW(&class) };
+
+    let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    let ex_style = WS_EX_NOREDIRECTIONBITMAP;
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: client_w,
+        bottom: client_h,
+    };
+    unsafe { AdjustWindowRectEx(&mut rect, style, false, ex_style)? };
+    let win_w = rect.right - rect.left;
+    let win_h = rect.bottom - rect.top;
+    let x = (unsafe { GetSystemMetrics(SM_CXSCREEN) } - win_w) / 2;
+    let y = (unsafe { GetSystemMetrics(SM_CYSCREEN) } - win_h) / 2;
+
+    let hwnd = unsafe {
+        CreateWindowExW(
+            ex_style,
+            CLASS,
+            w!(" "),
+            style,
+            x,
+            y,
+            win_w,
+            win_h,
+            None,
+            None,
+            Some(hinstance),
+            None,
+        )
+    }
+    .context("CreateWindowExW")?;
+
+    apply_mica(hwnd);
+    apply_icon(hwnd);
+    unsafe {
+        let _ = UpdateWindow(hwnd);
+    }
+    Ok(hwnd)
+}
+
+pub fn apply_mica(hwnd: HWND) {
+    if is_win11() {
+        let backdrop = DWM_SYSTEMBACKDROP_TYPE(2);
+        let _ = unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_SYSTEMBACKDROP_TYPE,
+                &backdrop as *const _ as *const _,
+                size_of::<DWM_SYSTEMBACKDROP_TYPE>() as u32,
+            )
+        };
+        let margins = MARGINS {
+            cxLeftWidth: -1,
+            cxRightWidth: -1,
+            cyTopHeight: -1,
+            cyBottomHeight: -1,
+        };
+        let _ = unsafe { DwmExtendFrameIntoClientArea(hwnd, &margins) };
+    }
+    let dark = is_dark_mode().unwrap_or(false) as i32;
+    let _ = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &dark as *const _ as *const _,
+            size_of::<i32>() as u32,
+        )
+    };
+}
+
+fn post_theme_background(hwnd: HWND) {
+    unsafe {
+        let _ = PostMessageW(Some(hwnd), WM_THEME_BACKGROUND, WPARAM(0), LPARAM(0));
+    }
+}
+
+pub fn apply_icon(hwnd: HWND) {
+    let Some((large, small)) = load_exe_icons() else {
+        return;
+    };
+    unsafe {
+        let _ = SendMessageW(
+            hwnd,
+            WM_SETICON,
+            Some(WPARAM(ICON_BIG as usize)),
+            Some(LPARAM(large.0 as isize)),
+        );
+        let _ = SendMessageW(
+            hwnd,
+            WM_SETICON,
+            Some(WPARAM(ICON_SMALL as usize)),
+            Some(LPARAM(small.0 as isize)),
+        );
+    }
+}
+
+fn load_exe_icons() -> Option<(HICON, HICON)> {
+    let exe = std::env::current_exe().ok()?;
+    let path: Vec<u16> = exe
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut large = HICON::default();
+    let mut small = HICON::default();
+    let n = unsafe {
+        ExtractIconExW(
+            PCWSTR(path.as_ptr()),
+            0,
+            Some(&mut large),
+            Some(&mut small),
+            1,
+        )
+    };
+    if n == 0 {
+        return None;
+    }
+    match (large.is_invalid(), small.is_invalid()) {
+        (true, true) => None,
+        (false, false) => Some((large, small)),
+        (true, false) => Some((small, small)),
+        (false, true) => Some((large, large)),
+    }
+}
+
+pub fn set_visible(hwnd: HWND, visible: bool) {
+    unsafe {
+        let _ = ShowWindow(hwnd, if visible { SW_SHOW } else { SW_HIDE });
+    }
+}
+
+pub fn set_title(hwnd: HWND, title: &str) {
+    let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let _ = SetWindowTextW(hwnd, PCWSTR(wide.as_ptr()));
+    }
+}
+
+pub fn minimize(hwnd: HWND) {
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_MINIMIZE);
+    }
+}
+
+pub fn set_decorations(hwnd: HWND, decorated: bool) {
+    let current = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32;
+    if decorated == (current & WS_CAPTION.0 != 0) {
+        return;
+    }
+    let mut rect = RECT::default();
+    unsafe {
+        let _ = GetClientRect(hwnd, &mut rect);
+    }
+    let keep = current & (WS_VISIBLE.0 | WS_MINIMIZE.0 | WS_MAXIMIZE.0);
+    let new_style = if decorated {
+        (WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX).0
+    } else {
+        (WS_POPUP | WS_SYSMENU).0
+    } | keep;
+    let win_style = windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(new_style);
+    unsafe {
+        SetWindowLongPtrW(hwnd, GWL_STYLE, new_style as isize);
+        let mut outer = RECT {
+            left: 0,
+            top: 0,
+            right: rect.right - rect.left,
+            bottom: rect.bottom - rect.top,
+        };
+        let _ = AdjustWindowRectEx(&mut outer, win_style, false, WS_EX_NOREDIRECTIONBITMAP);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            outer.right - outer.left,
+            outer.bottom - outer.top,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED,
+        );
+    }
+}
+
+pub fn client_size(hwnd: HWND) -> (i32, i32) {
+    let mut rect = RECT::default();
+    unsafe {
+        let _ = GetClientRect(hwnd, &mut rect);
+    }
+    (rect.right - rect.left, rect.bottom - rect.top)
+}
+
+fn is_color_theme_change(lparam: LPARAM) -> bool {
+    if lparam.0 == 0 {
+        return false;
+    }
+    let name = PCWSTR(lparam.0 as *const u16);
+    if name.is_null() {
+        return false;
+    }
+    let mut buf = [0u16; 64];
+    unsafe {
+        for i in 0..buf.len() {
+            let c = *name.as_ptr().add(i);
+            if c == 0 {
+                return i > 0
+                    && String::from_utf16_lossy(&buf[..i])
+                        .eq_ignore_ascii_case("ImmersiveColorSet");
+            }
+            buf[i] = c;
+        }
+    }
+    false
+}
+
+extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_CLOSE => {
+            delete_self_on_exit();
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            unsafe { PostQuitMessage(0) };
+            LRESULT(0)
+        }
+        WM_SETTINGCHANGE => {
+            if is_color_theme_change(lparam) {
+                apply_mica(hwnd);
+                post_theme_background(hwnd);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}

@@ -17,7 +17,7 @@ CI 上超时，测试进程和更新器一直留在运行中。
 在静默或非交互模式下关闭窗口，保证失败后进程能退出。
 
 判定单独抽成纯函数，是为了让 `tools/devcheck` 的 logic 层能在任意平台断言，而不必
-启动 Tauri 或显示真实窗口。
+启动 WebView2 宿主或显示真实窗口。
 
 ## Alternatives considered
 

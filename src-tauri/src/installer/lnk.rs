@@ -18,7 +18,6 @@ pub async fn create_lnk_with_args(args: CreateLnkArgs) -> Result<()> {
     create_lnk(args.target, args.lnk).await.into_anyhow()
 }
 
-#[tauri::command]
 pub async fn create_lnk(target: String, lnk: String) -> TAResult<()> {
     let target = Path::new(&target);
     let lnk = Path::new(&lnk);
@@ -126,7 +125,6 @@ fn write_shortcut_blocking(target: &Path, lnk: &Path) -> Result<()> {
     result
 }
 
-#[tauri::command]
 pub async fn get_dirs(elevated: bool) -> TAResult<(String, String)> {
     if elevated {
         Ok((

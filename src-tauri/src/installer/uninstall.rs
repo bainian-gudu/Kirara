@@ -1006,7 +1006,6 @@ pub fn clean_extra_registry(items: &[RegistryCleanupItem]) {
     }
 }
 
-#[tauri::command]
 pub async fn run_uninstall(
     source: String,
     files: Vec<String>,
@@ -1213,7 +1212,6 @@ pub async fn create_uninstaller_with_args(args: CreateUninstallerArgs) -> TAResu
     create_uninstaller(args.source, args.uninstaller_name, args.updater_name).await
 }
 
-#[tauri::command]
 pub async fn create_uninstaller(
     source: String,
     uninstaller_name: String,

@@ -1,6 +1,6 @@
 # 生成式「类型检查」crate：把 kachina 的真实源码塞进一个只有最小依赖的 crate 里，
 # 用 `cargo check --target x86_64-pc-windows-msvc` 快速发现编译错误，
-# 不需要 tauri / 完整依赖树 / Windows 机器。
+# 不需要 Tauri / 完整依赖树 / Windows 机器。
 #
 # 依赖版本与 src-tauri/Cargo.toml 对齐（大版本一致即可），
 # 否则检查结论不可信 —— 改上游依赖时记得同步这里。

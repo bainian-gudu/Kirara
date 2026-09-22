@@ -33,7 +33,6 @@ pub async fn write_registry_with_params(params: WriteRegistryParams) -> TAResult
     .await
 }
 
-#[tauri::command]
 pub async fn write_registry(
     reg_name: String,
     name: String,
@@ -109,7 +108,6 @@ pub async fn write_registry_raw(
     .context("WRITE_REG_ERR")
 }
 
-#[tauri::command]
 pub async fn read_uninstall_metadata(reg_name: String) -> TAResult<Value> {
     let key_path = format!("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{reg_name}");
 

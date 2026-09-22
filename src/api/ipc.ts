@@ -1,5 +1,4 @@
-import type { Event } from '@tauri-apps/api/event';
-import { invoke, listen } from '../tauri';
+import { invoke, listen, type Event } from '../host';
 import { v4 as uuid } from 'uuid';
 import { addNetworkInsight } from '../networkInsights';
 import {

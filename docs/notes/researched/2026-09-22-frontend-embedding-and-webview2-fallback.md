@@ -2,6 +2,11 @@
 
 Status: researched
 
+> 2026-09-22 更新：C10 已按
+> [原生 Win32 + WebView2 宿主替换 Tauri](../implemented/2026-09-22-native-host-replacing-tauri.md)
+> 实施，`dist/index.html` 已由 `src-tauri/build.rs` 用 zstd 嵌入。以下正文保留当时在
+> Tauri 宿主下的调研结论，其中「暂不做」只代表当时状态。
+
 ## Problem
 
 上游 `build.rs` 做两件与本仓库体积/健壮性有关的事，评估其中哪些能在当前（Tauri 宿主）
@@ -26,7 +31,7 @@ Status: researched
   `zstd`（`async-compression` 的 zstd 用于 DFS 负载）。用 zstd 替掉 Tauri 的资源
   服务等于自己实现一套 `Assets`，与框架正面冲突；只开 brotli 又不一定净减体积。
 - 结论：这一步不是「小件」，它属于宿主替换（见
-  [自研宿主替换 Tauri](../proposed/2026-09-22-native-host-replacing-tauri.md)）的
+  [自研宿主替换 Tauri](../implemented/2026-09-22-native-host-replacing-tauri.md)）的
   一部分——只有不再用 Tauri 服务前端时，才轮到「压成一个文件自己 `include_bytes!`」。
 
 **2. WebView2 兜底已经在本仓库里。** `main.rs` 在 `tauri::webview_version()` 失败时把
@@ -46,6 +51,6 @@ Status: researched
 本调研只做了分析，未规划也未实施任何修改。
 
 - 第 1 项（zstd 内嵌 HTML）不做：它的前提是自研宿主，归入
-  [自研宿主替换 Tauri](../proposed/2026-09-22-native-host-replacing-tauri.md) 的前置条件。
+  [自研宿主替换 Tauri](../implemented/2026-09-22-native-host-replacing-tauri.md) 的前置条件。
 - 第 2 项（WebView2 兜底）已经满足，无需改动；若将来把 `rfd` 依赖去掉，需确认替代的
   错误呈现同样不依赖 WebView。

@@ -751,7 +751,7 @@ import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
 import Checkbox from './Checkbox.vue';
 import CircleSuccess from './CircleSuccess.vue';
 import IconEdit from './IconEdit.vue';
-import { getCurrentWindow, invoke, sep } from './tauri';
+import { getCurrentWindow, invoke, sep } from './host';
 import {
   getDfsMetadata,
   cleanupAllDfs2Sessions,

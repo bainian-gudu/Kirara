@@ -25,7 +25,7 @@
   right: 16px;
   bottom: 0;
   /* 纵向 flex：正文吃掉剩余高度、footer 永远占自己那一份。
-     安装窗口只有 520x250（见 src-tauri/src/main.rs 的 base_width/height），
+     安装窗口只有 520x250（见 src-tauri/src/host/mod.rs 的窗口尺寸），
      靠绝对定位摆按钮很容易压到正文上。 */
   display: flex;
   flex-direction: column;

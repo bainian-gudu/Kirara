@@ -10,7 +10,7 @@
 
     这是本仓库唯一的构建入口；产物供下游项目（HoYoEnhance）打包安装包时使用。
 
-    仅在 Windows 上可运行（上游依赖 MSVC、windows crate、Tauri/WebView2）。
+    仅在 Windows 上可运行（依赖 MSVC、windows crate 与 WebView2）。
 
 .PARAMETER Force
     即使 tools\kirara-builder.exe 已存在也重新构建。
@@ -73,7 +73,7 @@ function Require([string]$name, [string]$hint) {
 }
 
 if ($env:OS -ne "Windows_NT") {
-    throw "kirara-builder 只能在 Windows 上构建（Tauri + MSVC + windows crate）。"
+    throw "kirara-builder 只能在 Windows 上构建（MSVC + windows crate + WebView2）。"
 }
 
 if (-not (Test-Path (Join-Path $RepoRoot "package.json"))) {
@@ -135,7 +135,7 @@ try {
         $env:CMAKE_BUILD_PARALLEL_LEVEL = [string][Environment]::ProcessorCount
     }
 
-    Step "pnpm build（tauri build → $TargetTriple，LTO；首次冷构建较慢）"
+    Step "pnpm build（原生宿主 + $TargetTriple，LTO；首次冷构建较慢）"
     # 上游 build 脚本内部用 cmd 内建 ren/del/copy /b 拼接 builder + installer，
     # 必须经由 pnpm 走 cmd.exe 执行，这里不要自己重排命令。
     & pnpm build
@@ -145,7 +145,7 @@ try {
 }
 
 if (-not (Test-Path $BuiltBuilder)) {
-    # 兜底：个别环境下 tauri 会落到不带三元组的 target\release
+    # 兜底：兼容历史上不带三元组的 target\release
     $alt = Join-Path $RepoRoot "src-tauri\target\release\kachina-builder.exe"
     if (Test-Path $alt) { $BuiltBuilder = $alt }
 }

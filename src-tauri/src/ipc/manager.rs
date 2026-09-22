@@ -8,7 +8,6 @@ use crate::utils::uac::SendableHandle;
 use anyhow::Context;
 use std::ffi::c_void;
 use std::time::Duration;
-use tauri::Emitter;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::windows::named_pipe::ClientOptions;
@@ -162,18 +161,18 @@ pub async fn handle_pipe(
         }
     });
 }
-#[tracing::instrument(skip(ipc, mgr, window))]
-#[tauri::command]
+#[tracing::instrument(skip(ipc, mgr, host))]
 pub async fn managed_operation(
     ipc: IpcOperation,
     id: String,
     elevate: bool,
-    mgr: tauri::State<'_, ManagedElevate>,
-    window: tauri::WebviewWindow,
+    mgr: &ManagedElevate,
+    host: &crate::host::HostHandle,
 ) -> TAResult<serde_json::Value> {
     if !elevate || mgr.already_elevated {
+        let host = host.clone();
         run_opr(ipc, move |opr| {
-            let _ = window.emit(&id, opr);
+            host.emit(&id, opr);
         })
         .await
     } else {
@@ -219,7 +218,7 @@ pub async fn managed_operation(
                             return Ok(v["data"].clone());
                         }
                     }
-                    let _ = window.emit(&id, v["data"].clone());
+                    host.emit(&id, v["data"].clone());
                 }
             }
             let pipeerr = v["PipeErr"].as_str();
@@ -386,8 +385,8 @@ pub async fn uac_ipc_main(args: crate::cli::arg::UacArgs) {
         }
     }
 
-    // 提权 helper 没有 Tauri 窗口，`WindowEvent::CloseRequested` 那条退出自删路径
-    // 不会触发。C9 的提交在换掉正在运行的安装器时把旧镜像留在暂存目录的 `old\`，
+    // 提权 helper 没有 UI 窗口，主窗口的 WM_CLOSE 退出自删路径不会触发。C9 的提交
+    // 在换掉正在运行的安装器时把旧镜像留在暂存目录的 `old\`，
     // 并在这里的进程里登记退出自删；helper 退出时必须自己执行一次，否则暂存目录
     // 只能等下一次 `OpenStaging` 才被清掉。非自更新的 helper 退出时这里是空操作。
     crate::installer::uninstall::delete_self_on_exit();

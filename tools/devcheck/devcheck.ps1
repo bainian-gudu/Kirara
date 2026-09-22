@@ -14,7 +14,7 @@
       gen    从仓库根目录的源码生成检查用的 Rust/TS 源（秒级，无依赖）
       rust   kachina 卸载器逻辑的**类型检查**：整份 uninstall.rs + utils/error.rs 塞进
              一个最小依赖 crate，cargo check --target x86_64-pc-windows-msvc。
-             不需要 tauri、不需要 Windows 机器，能抓到绝大多数 Rust 编译错误。
+             不需要 Tauri、不需要 Windows 机器，能抓到绝大多数 Rust 编译错误。
       logic  同一批函数的**行为断言**（mock windows-registry），任意平台可跑。
       native vendored rcedit-sys 的 C++（rescle.cc / librcedit.cpp）真用 MSVC 编一遍。
              只在有 cl.exe 的机器上跑，其它平台 SKIP。

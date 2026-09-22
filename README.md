@@ -7,7 +7,7 @@ HoYoEnhance 的安装 / 更新 / 卸载**只有 Kachina 一种实现**，本仓�
 ```text
 Kirara/                        仓库根目录就是安装器源码
 ├── src/                       Vue 3 前端（安装 / 卸载 / 更新界面）
-├── src-tauri/                 Rust 侧（packer CLI + installer GUI 模板 + 卸载器）
+├── src-tauri/                 Rust 侧（原生 WebView2 宿主 + packer CLI + 卸载器）
 ├── vendor/rcedit-rs/          vendored cargo 依赖（上游 rcedit-rs + 1 行 C++ 修复）
 ├── public/                   图标等静态资源
 ├── tests/                    安装 / 更新行为测试（offline / online × install / update）
@@ -27,7 +27,7 @@ Release 的 `kirara-builder.exe`，本地开发才按需调用本仓库的 `buil
 
 ## 构建
 
-只在 Windows 上可构建（Tauri + MSVC + `windows` crate）：
+只在 Windows 上可构建（MSVC + `windows` / `webview2-com` crate）：
 
 ```powershell
 pwsh build.ps1            # 源码 → tools\kirara-builder.exe
@@ -48,9 +48,9 @@ pwsh build.ps1 -Force     # 忽略「产物比源码新」的判断，强制重�
 ## 相对上游的改动
 
 本仓库**不是纯净快照**：卸载器安全加固、卸载残留清理、可配置用户协议、MSVC 14.51
-兼容（vendored `rcedit-rs`）、**物理移除全部遥测**（上游的 Sentry 上报与前端使用统计）
-等改动都在里面，逐处说明见 [`LOCAL_PATCHES.md`](LOCAL_PATCHES.md)，上游版本与快照
-来源见 [`UPSTREAM.md`](UPSTREAM.md)。
+兼容（vendored `rcedit-rs`）、**物理移除全部遥测**（上游的 Sentry 上报与前端使用统计）、
+以及第 22 节的 Tauri → 原生 Win32 + WebView2 宿主替换都在里面，逐处说明见
+[`LOCAL_PATCHES.md`](LOCAL_PATCHES.md)，上游版本与快照来源见 [`UPSTREAM.md`](UPSTREAM.md)。
 
 ## 检查
 
@@ -83,7 +83,6 @@ pwsh tools/devcheck/devcheck.ps1 -Fix         # 只对我们维护的两个 .rs 
 | 字样 | 来源 |
 | --- | --- |
 | `warning: the following packages contain code that will be rejected by a future version of Rust: russh v0.54.5` | 上游依赖的 future-incompat 提示，升级 `russh` 才会消失 |
-| `Could Not Find ...\target\x86_64-pc-windows-msvc\release\kachina-builder...` | tauri CLI 自己探测产物路径的输出；产物落在不带三元组的 `target\release\`，`build.ps1` 有兜底分支 |
 | `NODE_NO_WARNINGS` 静音掉的 `DEP0040` / `DEP0169` | `actions/setup-node` 等 action 自己依赖的旧 API 告警，与本仓库无关 |
 
 ## workflow 里那些看着多余的设置

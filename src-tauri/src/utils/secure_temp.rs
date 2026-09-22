@@ -12,7 +12,7 @@
 //!
 //! 这里三条一起堵：管理员专属目录 + 随机文件名 + 独占创建 + 执行前验微软签名。
 //!
-//! 详见 `installer/kachina/LOCAL_PATCHES.md` 第 8、9 节。
+//! 详见仓库根 `LOCAL_PATCHES.md` 第 8、9 节。
 
 use std::path::{Path, PathBuf};
 

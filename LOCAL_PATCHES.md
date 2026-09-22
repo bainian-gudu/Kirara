@@ -1,6 +1,6 @@
 # kachina-installer 本地修改清单
 
-本文档记录 `installer/kachina` 相对上游快照的全部改动、原因和复核方式。它服务于两类
+本文档记录本仓库（Kirara）相对上游快照的全部改动、原因和复核方式。它服务于两类
 场景：审查当前副本，以及升级上游后按顺序重新套用修改。代码行为以仓库中的实现和
 `tools/devcheck` 检查结果为准；本文档中的路径、配置键和命令均保持原样，便于搜索。
 
@@ -36,6 +36,7 @@
 - [19. 第四轮加固：自更新失败路径、换文件回滚、归档摘要、提权进度洪水、本地扫描](#19-第四轮加固自更新失败路径换文件回滚归档摘要提权进度洪水本地扫描)
 - [20. 静默 / 非交互失败路径不再弹模态框](#20-静默--非交互失败路径不再弹模态框)
 - [21. 暂存目录 + 两阶段提交](#21-暂存目录--两阶段提交)
+- [22. 原生 Win32 + WebView2 宿主替换 Tauri](#22-原生-win32--webview2-宿主替换-tauri)
 - [升级上游时的套用顺序](#升级上游时的套用顺序)
 
 | # | 需求 | 涉及文件 |
@@ -61,6 +62,7 @@
 | 17 | 同步上游 0.5.1 之后的打包器修复（包体 PE 识别、嵌入名规则、抽取路径越界、临时文件与摘要） | `src-tauri/src/builder/local.rs`、`builder/append.rs`、`builder/extract.rs`、`builder/pack.rs`、`src-tauri/src/utils/hash.rs`、`tools/devcheck/` |
 | 18 | 同步上游 0.5.1 之后的安装行为测试与 Rust 单元测试 job | `tests/`（新增 5 组）、`.github/workflows/build.yml`、`package.json` |
 | 19 | 第四轮加固：自更新失败不再丢更新器、补丁换文件回滚、Mirror酱归档摘要、提权进度洪水、本地扫描 | `src-tauri/src/fs.rs`、`ipc/install_file.rs`、`ipc/manager.rs`、`ipc/operation.rs`、`thirdparty/mirrorc.rs`、`installer/uninstall.rs`、`utils/hash.rs`、`src/App.vue`、`src/api/ipc.ts`、`src/types.ts` |
+| 22 | 去掉 Tauri，换成原生 Win32 + WebView2 宿主和单文件内联前端 | `package.json`、`pnpm-lock.yaml`、`rsbuild.config.ts`、`src/host.ts`（新增）、`src/tauri.ts`（删除）、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`、`src-tauri/build.rs`、`src-tauri/resources/`（新增）、`src-tauri/src/host/`（新增）、`src-tauri/src/main.rs`、`tools/devcheck/` |
 
 ---
 
@@ -410,7 +412,7 @@ right: 8px`（次要按钮 `.btn-install-2rd` 再往左挪 150px）。三个弹�
 复用了同一个类，于是按钮脱离文档流、浮在 `.dialog-body` 上面。主界面没事（正文短），
 协议弹窗就露馅了：
 
-- 安装窗口只有 **520 × 250** 逻辑像素（`src-tauri/src/main.rs` 的 `base_width` /
+- 安装窗口只有 **520 × 250** 逻辑像素（`src-tauri/src/host/mod.rs` 的窗口尺寸 /
   `base_height` × 系统文字缩放），`.dialog` 撑满后约 488 × 246；
 - 协议正文原先写死 `max-height: 46vh`（≈115px）+ 内边距/边框/外边距 ≈ 149px，
   加上标题（25px 字）与说明文字，文档流走到约 210px；
@@ -731,7 +733,7 @@ AppContainer 进程、远程会话，并把完整性级别压到 Low。于是别
 - 卸载器把自己 `rename` 到 `%TEMP%\kachina.uninst.<时间戳>.exe` 再自删：时间戳可预测，
   但 `rename` 不跟随符号链接、随后的 `del` 删的也只是链接本身，最坏是让 rename 失败并
   回退到安装目录的父级（上游已有的分支）。
-- `tauri_main` 把工作目录切到 `%TEMP%`：没找到依赖相对路径的写操作，先记着不动。
+- `native_main` 把工作目录切到 `%TEMP%`：没找到依赖相对路径的写操作，先记着不动。
 
 ### 9.6 验证到哪一步
 
@@ -961,8 +963,8 @@ IDList、相对路径、图标这些格式细节都得自己维护。现在改�
 
 上游在本快照（tag `0.5.1`）之后又走了几十个提交，其中一次大重构把整个项目从
 Tauri + Vue 换成「原生 Win32 + WebView2 宿主 + Preact」，目录也从 `src-tauri/`
-挪到了仓库根（见 `UPSTREAM.md`）。那套重构没法按提交挑拣，本仓库也不打算跟着换架构 ——
-但重构前后**打包器（builder）里那几个真问题**是通用的，这一节把它们单独搬了过来。
+挪到了仓库根（见 `UPSTREAM.md`）。这一节只先搬重构前后**打包器（builder）里那几个
+真问题**；宿主层在 C10 中按本仓库现有 Vue + 前端驱动 IPC 的形状单独替换，见第 22 节。
 
 移植时对照的是上游 `main`（`a52a4c66`），逐条如下：
 
@@ -1003,8 +1005,8 @@ junction 之后仍在输出根内），并且**先规划完所有路径再落盘
 
 ### 没有跟着搬的部分（有意为之）
 
-- **架构重构**：Tauri + Vue → 原生 Win32 + WebView2 + Preact。那会连带作废本文件
-  第 1～16 节的全部改动，属于「重写」而不是「同步」，不在本分支范围。
+- **架构重构**：Tauri + Vue → 原生 Win32 + WebView2 + Preact。第 22 节只替换宿主，
+  保留本仓库的 Vue 与前端驱动 IPC；不照搬上游 Preact / session 重写。
 - **两阶段提交（staging 目录）与安装会话**：上游把安装流程重写成
   `session/` + `fs/staging.rs` + `fs/commit.rs`，并配了 `updater-survival` 测试。
   这份快照当时没有对应落点；第 21 节后来以四个 IPC 把提交协议单独搬了过来，
@@ -1206,8 +1208,8 @@ note：[无人值守运行不弹模态框](docs/notes/implemented/2026-09-22-una
   干净目录，下载完成后提交；`src/api/ipc.ts`、`installFile.ts`、`dfs.ts`、
   `downloadTaskManager.ts` 同步传递暂存目标与补丁旧路径。
 - 自更新换掉正在运行的 exe 时保留暂存根，退出时用 `delete_self_on_exit` 删除整个
-  暂存目录；提权 helper 没有 Tauri 窗口，`uac_ipc_main` 退出时也会主动执行一次，
-  不再只依赖主窗口的 `CloseRequested`。删除命令先 `rmdir /s /q` 再尝试 `del`，
+  暂存目录；提权 helper 没有 UI 窗口，`uac_ipc_main` 退出时也会主动执行一次，
+  不再只依赖主窗口关闭路径。删除命令先 `rmdir /s /q` 再尝试 `del`，
   兼容目录路径。
 
 有意保留的边界：没有目录单元、没有运行中取消按钮、暂存根没有放到 `%TEMP%`。这些是
@@ -1222,6 +1224,47 @@ note：[暂存目录 + 两阶段提交](docs/notes/implemented/2026-09-22-staged
 `pwsh tools/devcheck/devcheck.ps1 -Layer front` 检查前端；CI 的 `unit-test` job 在
 Windows 上跑 `cargo test --bin kachina-installer --locked`，覆盖 journal 版本门、
 真实文件换入/删除、前滚和旧文件恢复。
+
+---
+
+## 22. 原生 Win32 + WebView2 宿主替换 Tauri
+
+C9 的暂存提交完成后，宿主层不再需要为兼容 Tauri 的窗口/命令模型保留抽象。本节把
+Tauri 从依赖和运行路径中移除，但不重写安装会话、Vue 前端或 C9 提交协议：
+
+- `rsbuild.config.ts` 把 JS/CSS 内联到 `dist/index.html`，`chunkSplit` 改为
+  `all-in-one`；`pnpm build:frontend` 只产出这一个 HTML（外加已忽略的 `.gitkeep`）。
+- 新增 `src/host.ts`，前端直接使用 WebView2 的 `chrome.webview.postMessage` /
+  `message` 事件；`src/tauri.ts` 与 `@tauri-apps/api`、`@tauri-apps/cli` 一并删除。
+- `src-tauri/build.rs` 将 `dist/index.html` 用 zstd 压进 `OUT_DIR`，生成
+  `ui_assets.rs`；没有前端产物时嵌入空资源表，保证干净检出上的 `cargo test/check`
+  不会被构建脚本卡住。exe manifest 与图标仍通过 `embed-resource` 嵌入。
+- 新增 `src-tauri/src/host/{mod,window,webview,bridge,assets}.rs`：原生 Win32 窗口、
+  DPI/主题、WebView2 controller、`https://app.localhost` 资源协议和 JSON IPC。
+  原有命令全部在 `bridge.rs` 中按同一参数名分发，`ManagedElevate` 的进度事件改为
+  经 `HostHandle` 发回主线程；窗口缩放时同步 `SetBounds`。`rfd` 选目录、错误和
+  确认对话框通过 `HostHandle::dialog_parent` 重新挂回宿主窗口，启动看门狗同样如此。
+- 原生宿主直接使用 Win32 `ExtractIconExW`，旧 Tauri 路径下已无调用的
+  `src-tauri/src/utils/icon.rs` 删除，避免保留两套图标提取逻辑。
+- `src-tauri/Cargo.toml` 去掉 `tauri` / `tauri-build` / `tauri-utils`，改为
+  `webview2-com 0.38`；`Cargo.lock` 重新生成，Tauri/wry 及其 GTK/WebKit 传递依赖
+  全部消失。包数从快照的 717 降到 511；本仓库仍有 H3/quinn、russh、aws-lc 等本地
+  依赖，所以不等于上游原生重构的 392 包口径。
+- `build.ps1`、README、workflow 与 devcheck 说明同步改为原生宿主；`vendor` 层新增
+  Tauri 依赖/旧桥接文件回归守卫，`logic` 层把自更新退出清理断言改到原生 `WM_CLOSE`。
+
+保留的边界：`src-tauri/` 目录名不动，继续使用前端驱动的 JSON IPC；不移植上游
+`session/`、Preact、DFS2 批量会话或 Sentry。前端在浏览器中直接打开时没有原生桥，
+需要选路径/执行安装的交互只保证在 WebView2 宿主内工作。
+
+note：[原生 Win32 + WebView2 宿主替换 Tauri](docs/notes/implemented/2026-09-22-native-host-replacing-tauri.md)
+
+### 复核方式
+
+`pnpm build:frontend` 必须只产出 `dist/index.html`；`pnpm exec tsc --noEmit`、
+`bash tools/devcheck/check-installer.sh --bin kachina-installer` 与
+`pwsh tools/devcheck/devcheck.ps1 -Layer vendor,ps1,gen,rust,logic,front,ci` 全部通过。
+CI 的 Windows `Build` / `unit-test` / 行为测试仍需在真实 MSVC + WebView2 环境跑一次。
 
 ---
 
@@ -1307,16 +1350,24 @@ Windows 上跑 `cargo test --bin kachina-installer --locked`，覆盖 journal �
    冲突：那时应以 staging 方案为准，只保留「失败不丢更新器」这条验收判据；
 3n. **重做第 20 节的无人值守对话框抑制**：`installer/mod.rs` 加
    `should_show_dialog`，`error_dialog` / `confirm_dialog` 接
-   `State<InstallArgs>` 并在 `-S` / `-I` 下不调用 `rfd`；前端 `dialog_error`
+   `&InstallArgs`（若上游快照仍是 Tauri 宿主，则先按 `State<InstallArgs>` 接参；
+   C10 后改为借用宿主传入的配置）并在 `-S` / `-I` 下不调用 `rfd`；前端 `dialog_error`
    在两种模式下关窗；`tools/devcheck/lib/Generate.ps1` 加 `LogicDialogItems`，
    `rust/logic/src/main.rs` 补 [25] 组断言；
 3o. **重做第 21 节的暂存提交**：新增 `src-tauri/src/fs/staging.rs` 与
    `src-tauri/src/fs/commit.rs`，把 `fs.rs` / `ipc/install_file.rs` /
    `thirdparty/mirrorc.rs` 的写入改成 `new/` 暂存，接入四个 staging IPC，
-   前端 `App.vue` / `api/ipc.ts` / `installFile.ts` / `dfs.ts` /
+  前端 `App.vue` / `api/ipc.ts` / `installFile.ts` / `dfs.ts` /
    `downloadTaskManager.ts` 同步；`.github/workflows/build.yml` 的 `unit-test`
    job 追加 `cargo test --bin kachina-installer --locked`。若上游已经采用原生
-   session + staging，优先照搬其完整协议，不再套用第 19a / 19b 的旧换文件逻辑；
+  session + staging，优先照搬其完整协议，不再套用第 19a / 19b 的旧换文件逻辑；
+3p. **重做第 22 节的宿主替换**：前端恢复 `inlineScripts` / `inlineStyles` /
+   `all-in-one` 并改用 `src/host.ts`；`build.rs` 恢复 zstd 嵌入 `dist/index.html`；
+   新增 `src-tauri/src/host/` 五个模块和 `resources/` manifest/icon；`Cargo.toml`
+   去掉 `tauri` / `tauri-build` / `tauri-utils`、换成 `webview2-com`；`main.rs`
+   改走 `native_main`；同步 `package.json`、`build.ps1`、`README.md` 与
+   `tools/devcheck` 的 C10 守卫。上游若已完整采用 `native/` 布局，先评估是否直接
+   切换其 session/Preact 协议，不能只机械复制文件；
 4. `npx tsc --noEmit -p tsconfig.json`（上游本身有 3 个 `noUnusedLocals` 报错，
    只要没有新增报错即可）+ 用 `@vue/compiler-sfc` 编译 `src/App.vue` 自检；
 5. Windows 上 `pnpm build` 出 `kachina-builder.exe`，跑一次

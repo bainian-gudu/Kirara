@@ -13,13 +13,17 @@ export default defineConfig({
   },
   output: {
     overrideBrowserslist: ['edge >= 100'],
+    dataUriLimit: 10 * 1024 * 1024,
+    inlineScripts: true,
+    inlineStyles: true,
+    legalComments: 'none',
   },
   html: {
     title: 'Kachina Installer',
   },
   performance: {
     chunkSplit: {
-      strategy: 'single-vendor',
+      strategy: 'all-in-one',
     },
   },
   plugins: [pluginVue()],

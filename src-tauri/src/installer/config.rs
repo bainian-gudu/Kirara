@@ -11,7 +11,6 @@ use anyhow::Context;
 use serde::Serialize;
 use serde_json::Value;
 use std::path::Path;
-use tauri::State;
 
 #[derive(Serialize, Debug, Clone)]
 pub struct InstallerConfig {
@@ -138,15 +137,11 @@ impl InstallerConfig {
     }
 }
 
-#[tauri::command]
-pub async fn get_installer_config(
-    args: State<'_, InstallArgs>,
-    scan_exe: bool,
-) -> TAResult<InstallerConfig> {
+pub async fn get_installer_config(args: &InstallArgs, scan_exe: bool) -> TAResult<InstallerConfig> {
     APP_BOOT_SIGNAL.store(true, std::sync::atomic::Ordering::SeqCst);
     // 检查当前目录是否包含 exeName
     let exe_path = std::env::current_exe().context("GET_EXE_PATH_ERR")?;
-    let mut config = get_config_pre(&exe_path, args.inner().clone(), scan_exe).await?;
+    let mut config = get_config_pre(&exe_path, args.clone(), scan_exe).await?;
     let mut uninstall_name = "uninst.exe";
     let mut exe_name = "main.exe";
     let mut program_files_path = "KachinaInstaller";

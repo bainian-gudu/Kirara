@@ -3,9 +3,9 @@
 //! `src/gen/` 下的文件由 `tools/devcheck/devcheck.ps1 -Layer rust` 从
 //! `src-tauri/src/` 生成（不要手改，也不会入库）：
 //!
-//! - `gen/uninstall.rs` —— `installer/uninstall.rs` 原样复制，只去掉 `#[tauri::command]`
+//! - `gen/uninstall.rs` —— `installer/uninstall.rs` 原样复制（兼容旧快照时去掉 `#[tauri::command]`）
 //! - `gen/utils_error.rs` —— `utils/error.rs` 原样复制
-//! - `gen/lnk.rs` —— `installer/lnk.rs` 原样复制，只去掉 `#[tauri::command]`
+//! - `gen/lnk.rs` —— `installer/lnk.rs` 原样复制（兼容旧快照时去掉 `#[tauri::command]`）
 //! - `gen/utils_dir.rs` —— `utils/dir.rs` 原样复制
 //! - `gen/utils_os_version.rs` —— `utils/os_version.rs` 原样复制
 //!

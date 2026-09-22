@@ -1,6 +1,6 @@
 import { hybridPatch, InstallFile } from './api/installFile';
 import { ipc, log, addInsightWithMode } from './api/ipc';
-import { invoke } from './tauri';
+import { invoke } from './host';
 import { KachinaInstallSource, pluginManager } from './plugins';
 import { registerAllPlugins } from './plugins/registry';
 import { getDfs2Session } from './dfs/session';

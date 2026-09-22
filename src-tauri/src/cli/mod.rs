@@ -48,9 +48,7 @@ pub async fn install_webview2() {
         file.write_all(&wv2_installer_blob)
             .await
             .expect("failed to write installer to temp dir");
-        file.flush()
-            .await
-            .expect("failed to flush installer file");
+        file.flush().await.expect("failed to flush installer file");
     }
     crate::utils::secure_temp::verify_microsoft_signed(&installer_path)
         .await

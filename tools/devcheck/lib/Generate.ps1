@@ -99,7 +99,7 @@ $script:LogicDialogItems = @(
 )
 
 # fs.rs 里只抽自更新回滚：它是「更新失败不许丢更新器」这条保证的落点，用真实临时文件
-# 就能断言。同文件的其余部分依赖 tokio / reqwest / tauri，塞不进最小 crate。
+# 就能断言。同文件的其余部分依赖 tokio / reqwest / WebView2 宿主，塞不进最小 crate。
 $script:LogicFsItems = @(
     @{ Kind = 'fn'; Name = 'rollback_self_update_backup_sync' }
 )
@@ -127,14 +127,14 @@ function New-TypecheckGen {
 
     $header = @'
 // 生成物，勿手改：由 tools/devcheck/devcheck.ps1 从 src-tauri/src 复制。
-// 与上游的唯一差别是去掉了 #[tauri::command]（本 crate 不依赖 tauri）。
+// 与上游旧快照的差别是去掉了 #[tauri::command]（本 crate 不依赖 Tauri）。
 '@
 
     Write-GeneratedFile -Path (Join-Path $genDir 'uninstall.rs') `
         -Content ($header + "`n" + (Remove-TauriCommandAttr -Text $uninstall.Text) + "`n")
     Write-GeneratedFile -Path (Join-Path $genDir 'utils_error.rs') `
         -Content ($header + "`n" + $error.Text)
-    # lnk.rs 里 create_lnk / get_dirs 两个命令都要去掉 #[tauri::command]；
+    # lnk.rs 在旧快照里带 #[tauri::command]；生成器会剥掉，兼容未来同步旧上游。
     # 它依赖的 is_safe_delete_target / has_reparse_point 由 gen/uninstall.rs 提供。
     Write-GeneratedFile -Path (Join-Path $genDir 'lnk.rs') `
         -Content ($header + "`n" + (Remove-TauriCommandAttr -Text $lnk.Text) + "`n")

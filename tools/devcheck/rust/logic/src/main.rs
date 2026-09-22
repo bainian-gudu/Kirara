@@ -1480,7 +1480,7 @@ fn unattended_dialog_cases() {
 }
 
 /// [26] 提权 helper 退出自删接线：C9 自更新把旧安装器留在暂存目录的 `old\`，
-/// helper 没有 Tauri 窗口，不主动执行的话这份旧镜像只能等下次 `OpenStaging` 清掉。
+/// helper 没有 UI 窗口，不主动执行的话这份旧镜像只能等下次 `OpenStaging` 清掉。
 fn uac_cleanup_wiring_case() {
     println!("[26] 提权 helper 退出自删接线（本仓库文件）");
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1501,11 +1501,11 @@ fn uac_cleanup_wiring_case() {
         "",
     );
 
-    let main_rs =
-        std::fs::read_to_string(repo.join("src-tauri/src/main.rs")).expect("read main.rs");
+    let host_window = std::fs::read_to_string(repo.join("src-tauri/src/host/window.rs"))
+        .expect("read host/window.rs");
     check(
-        "主窗口 CloseRequested 仍调用 delete_self_on_exit",
-        main_rs.contains("delete_self_on_exit();"),
+        "原生宿主 WM_CLOSE 仍调用 delete_self_on_exit",
+        host_window.contains("WM_CLOSE") && host_window.contains("delete_self_on_exit();"),
         "",
     );
 }

@@ -50,6 +50,9 @@ DFS 会话拆分和 `vendor/rcedit-rs/` 副本；同时删除
    `zip` 去掉 `xytoki/zip2` fork、H3 传输层换成 `quinn` + `rustls`、
    `mslnk` / `nt_version` 换成系统 API（Shell Link / `ntdll`）。`Cargo.lock` 里
    已经没有 git 依赖。
+9. **原生宿主替换**（第 22 节）：去掉 Tauri / wry，改用仓库内的
+   `src-tauri/src/host/` Win32 + WebView2 宿主；前端改成单文件内联 HTML，由
+   `build.rs` 用 zstd 嵌入。保留本仓库 Vue 前端、前端驱动 JSON IPC 与 C9 暂存提交。
 
 逐文件的改动位置、原因与升级套用顺序见 [`LOCAL_PATCHES.md`](LOCAL_PATCHES.md)。
 第 1～6 项都是「加字段 / 加分支 / 加样式覆盖」，不写这些配置项时行为与上游完全一致；
@@ -58,13 +61,13 @@ DFS 会话拆分和 `vendor/rcedit-rs/` 副本；同时删除
 
 ## 构建产物
 
-`installer/build-kachina.ps1` 会产出：
+仓库根的 `build.ps1` 会产出：
 
 ```
-installer/tools/kachina-builder.exe
+tools/kirara-builder.exe
 ```
 
-它是上游 `pnpm build` 的结果 —— 即 `kachina-builder-standalone.exe` 与
+它是本仓库 `pnpm build` 的结果 —— 即 `kachina-builder-standalone.exe` 与
 `kachina-installer.exe` 的二进制拼接（上游 `package.json` 的 build 脚本行为），
 一个文件同时包含「打包器 CLI」与「安装器 GUI 模板」。该目录已被 `.gitignore`
 排除，不进版本库。
@@ -78,7 +81,7 @@ installer/tools/kachina-builder.exe
 - 目标三元组 `x86_64-win7-windows-msvc`
 - Node.js 20+ 与 pnpm 10（上游 `packageManager: pnpm@10.17.0`）
 - MSVC 生成工具（`crt-static` 链接参数见 `src-tauri/.cargo/config.toml`）
-- 仅在 Windows 上构建（依赖 `windows` / `win32-version-info` / `mslnk` 等 crate）
+- 仅在 Windows 上构建（依赖 `windows` / `win32-version-info` / `webview2-com` 等 crate）
 
 本仓库当前的差异（见 `LOCAL_PATCHES.md` 第 13 节）：目标改成标准
 `x86_64-pc-windows-msvc`，不再需要 `rust-src` 与 `-Z build-std`；nightly 仍然保留，
@@ -117,8 +120,7 @@ Remove-Item installer\kachina\.git, installer\kachina\.github, installer\kachina
 覆盖会连带删掉本地修改，因此升级后必须按
 [`LOCAL_PATCHES.md`](LOCAL_PATCHES.md) 的「升级上游时的套用顺序」重新套用改动，
 并把 `LOCAL_PATCHES.md` / `UPSTREAM.md` 两个文件恢复回来（它们在覆盖前可以先备份，
-或用 `git checkout HEAD -- installer/kachina/LOCAL_PATCHES.md installer/kachina/UPSTREAM.md`）。
+或用 `git checkout HEAD -- LOCAL_PATCHES.md UPSTREAM.md`）。
 
-> CI 的 `build-kachina` 缓存 key 是 `hashFiles('installer/kachina/**')`，
-> 改动本目录任意文件都会自动触发重建，不需要手动清缓存（也可用
-> `rebuild_kachina` 输入强制重建）。
+> CI 的缓存 key 覆盖 `src-tauri/**`、`src/**`、`package.json` 与锁文件；改动源码或
+> 依赖会自然失效缓存，不需要手动清。

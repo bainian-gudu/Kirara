@@ -112,6 +112,14 @@ jobs:
         -Run { Test-VendoredSource } `
         -Cleanup { Restore-RepoFile -Backup (Get-RepoBackupPath -Path $kaCargoToml) -Path $kaCargoToml }
 
+    # --- 0h) vendor：C10 后 Tauri 依赖被加回来就必须报错 ---
+    Add-Case 'vendor 层能抓到 Tauri 依赖回归' `
+        -Mutate {
+            Add-Content -Path $kaCargoToml -Encoding utf8 -Value "`ntauri = `"2`""
+        } `
+        -Run { Test-VendoredSource } `
+        -Cleanup { Restore-RepoFile -Backup (Get-RepoBackupPath -Path $kaCargoToml) -Path $kaCargoToml }
+
     # --- 1) ps1：临时放一个语法错误的 .ps1 进仓库 ---
     Add-Case 'ps1 层能抓到 PowerShell 语法错误' `
         -Mutate {
