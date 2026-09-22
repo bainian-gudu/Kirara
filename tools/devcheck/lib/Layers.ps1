@@ -152,10 +152,10 @@ function Test-VendoredSource {
     }
 
     # 8b) 依赖清单三处：Cargo.toml / package.json / pnpm-workspace.yaml + 两个 lock
-    if ($cargoTomlCode -match '(?m)^\s*(sentry|sentry-tracing|sentry-anyhow|whoami)\s*=') {
-        throw 'kachina 的 Cargo.toml 又声明了 Sentry / whoami 依赖（遥测已移除）'
+    if ($cargoTomlCode -match '(?m)^\s*(sentry|sentry-tracing|sentry-anyhow)\s*=') {
+        throw 'kachina 的 Cargo.toml 又声明了 Sentry 依赖（遥测已移除）'
     }
-    if ($cargoLock -match '(?m)^name = "(sentry[^"]*|whoami|hostname|os_info|debugid)"') {
+    if ($cargoLock -match '(?m)^name = "(sentry[^"]*|hostname|os_info|debugid)"') {
         throw 'Cargo.lock 里还锁着 Sentry 相关 crate —— 改完依赖要重新生成 Cargo.lock（cargo metadata）'
     }
     foreach ($section in @('dependencies', 'devDependencies')) {

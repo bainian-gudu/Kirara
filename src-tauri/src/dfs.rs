@@ -1,3 +1,4 @@
+use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -27,7 +28,7 @@ pub struct HttpGetResponse {
     pub final_url: String,
 }
 
-// DFS2 数据结构
+// DFS2 data structures
 #[derive(Deserialize, Serialize, Debug)]
 pub struct Dfs2Metadata {
     pub resource_version: String,
@@ -38,7 +39,7 @@ pub struct Dfs2Metadata {
 #[derive(Deserialize, Serialize, Debug)]
 pub struct Dfs2Data {
     pub index: std::collections::HashMap<String, Dfs2FileInfo>,
-    pub metadata: serde_json::Value,
+    pub metadata: crate::utils::metadata::RepoMetadata,
     pub installer_end: u32,
 }
 
@@ -107,9 +108,86 @@ pub struct InsightItem {
     pub size: u32, // 实际下载字节数
     pub error: Option<String>,
     #[serde(default)]
-    pub range: Vec<(u32, u32)>, // HTTP 范围请求范围
+    pub range: Vec<(u32, u32)>, // HTTP Range请求范围
     #[serde(default)]
     pub mode: Option<String>, // 安装模式
+}
+
+/// Non-2xx answer from a DFS / metadata endpoint. Typed so classifiers can tell
+/// "the server answered with an error" from "the server was unreachable"
+/// without parsing text; `body` is capped so it can travel as `Coded.detail`.
+#[derive(Debug)]
+pub struct HttpStatus {
+    pub status: u16,
+    pub body: String,
+}
+
+impl HttpStatus {
+    pub fn new(status: u16, body: impl Into<String>) -> Self {
+        let mut body: String = body.into();
+        if body.len() > 512 {
+            let mut cut = 512;
+            while !body.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            body.truncate(cut);
+        }
+        Self { status, body }
+    }
+}
+
+impl std::fmt::Display for HttpStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.body.is_empty() {
+            write!(f, "{}", self.status)
+        } else {
+            write!(f, "{}: {}", self.status, self.body)
+        }
+    }
+}
+
+impl std::error::Error for HttpStatus {}
+
+async fn status_error(res: reqwest::Response) -> anyhow::Error {
+    let status = res.status().as_u16();
+    let body = res.text().await.unwrap_or_default();
+    anyhow::Error::new(HttpStatus::new(status, body))
+}
+
+fn parse_json<T: serde::de::DeserializeOwned>(body: &str) -> anyhow::Result<T> {
+    serde_json::from_str(body).with_context(|| {
+        let mut cut = body.len().min(512);
+        while !body.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("parse JSON: {}", &body[..cut])
+    })
+}
+
+/// Record the error class once: a code already present is not overwritten by
+/// a later, less specific one.
+pub fn apply_insight_error(insight: &mut InsightItem, err: &anyhow::Error) {
+    if insight.error.is_some() {
+        return;
+    }
+    insight.error = Some(crate::utils::code::insight_code(err).to_string());
+}
+
+pub fn apply_insight_io_error(insight: &mut InsightItem, err: &std::io::Error) {
+    if insight.error.is_some() {
+        return;
+    }
+    insight.error = Some(crate::utils::code::insight_code_for_io(err).to_string());
+}
+
+pub fn is_remote_insight_url(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("http3://")
+        || lower.starts_with("h3://")
+        || lower.starts_with("h3wt://")
+        || lower.starts_with("sftp://")
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -127,7 +205,7 @@ pub async fn get_dfs(
     url: String,
     range: Option<String>,
     extras: Option<String>,
-) -> Result<DownloadResp, String> {
+) -> anyhow::Result<DownloadResp> {
     let url_with_range_in_query = if let Some(range) = range {
         format!("{url}?range={range}")
     } else {
@@ -143,50 +221,34 @@ pub async fn get_dfs(
         .body(extras.clone())
         .send()
         .await
-        .with_http_context("get_dfs", &url_with_range_in_query)
-        .map_err(|e| e.to_string())?;
-    // 检查 status code 如果 是 不 200 或 401
+        .with_http_context("get_dfs", &url_with_range_in_query)?;
+    // 401 carries the challenge in the body
     if res.status() != reqwest::StatusCode::OK && res.status() != reqwest::StatusCode::UNAUTHORIZED
     {
-        let status = res.status();
-        // 检查是否存在响应体
-        let body = res.text().await;
-        if body.is_err() {
-            return Err(format!("{status}"));
-        } else {
-            return Err(format!("{}: {}", status, body.unwrap()));
-        }
+        return Err(status_error(res).await);
     }
     let body_text = res
         .text()
         .await
         .with_http_context("get_dfs", &url)
-        .map_err(|e| format!("Failed to read response body: {}", e))?;
-    let json: Result<DownloadResp, serde_json::Error> = serde_json::from_str(&body_text);
-    if json.is_err() {
-        return Err(format!(
-            "Failed to parse JSON ({}): {}",
-            json.err().unwrap(),
-            body_text
-        ));
-    }
-    let json = json.unwrap();
-    // 直接 返回 如果 不 challenge
+        .context("read response body")?;
+    let json: DownloadResp = parse_json(&body_text)?;
+    // directly return if not challenge
     if json.challenge.is_none() {
         return Ok(json);
     }
     let challenge = json.challenge.unwrap();
-    // 拆分 challenge 到 "哈希/来源"
+    // split challenge into "hash/source"
     let challenge: Vec<&str> = challenge.split('/').collect();
     if challenge.len() != 2 {
-        return Err("Invalid challenge".to_string());
+        return Err(anyhow!("Invalid challenge"));
     }
     let hash = challenge[0];
     let source = challenge[1];
     let mut solve = "".to_string();
-    // 循环 1 到 256
+    // loop 1 to 256
     for i in 0..=255 {
-        // 将 i 编码为两位十六进制数并追加到来源 URL
+        // suffix i in source as hex 2 digits
         let new_src = format!("{source}{i:02x}");
         let new_hash = chksum_md5::hash(new_src.as_bytes()).to_hex_lowercase();
         if hash == new_hash {
@@ -195,7 +257,7 @@ pub async fn get_dfs(
         }
     }
     if solve.is_empty() {
-        return Err("Failed to solve challenge".to_string());
+        return Err(anyhow!("Failed to solve challenge"));
     }
     let url = format!("{url_with_range_in_query}&sid={solve}");
     let res = REQUEST_CLIENT
@@ -203,41 +265,25 @@ pub async fn get_dfs(
         .body(extras)
         .send()
         .await
-        .with_http_context("get_dfs", &url)
-        .map_err(|e| e.to_string())?;
-    // 检查 status code 如果 是 不 200 或 401
+        .with_http_context("get_dfs", &url)?;
     if res.status() != reqwest::StatusCode::OK && res.status() != reqwest::StatusCode::UNAUTHORIZED
     {
-        let status = res.status();
-        let body = res.text().await;
-        if body.is_err() {
-            return Err(format!("{status}"));
-        } else {
-            return Err(format!("{}: {}", status, body.unwrap()));
-        }
+        return Err(status_error(res).await);
     }
     let body_text = res
         .text()
         .await
         .with_http_context("get_dfs", &url)
-        .map_err(|e| format!("Failed to read response body: {}", e))?;
-    let json: Result<DownloadResp, serde_json::Error> = serde_json::from_str(&body_text);
-    if json.is_err() {
-        return Err(format!(
-            "Failed to parse JSON ({}): {}",
-            json.err().unwrap(),
-            body_text
-        ));
-    }
-    let json = json.unwrap();
+        .context("read response body")?;
+    let json: DownloadResp = parse_json(&body_text)?;
     if json.challenge.is_some() {
-        return Err("Challenge not solved".to_string());
+        return Err(anyhow!("Challenge not solved"));
     }
     Ok(json)
 }
 
-// 相关实现：DFS2 API commands
-pub async fn get_dfs2_metadata(api_url: String) -> Result<Dfs2Metadata, String> {
+// DFS2 API commands
+pub async fn get_dfs2_metadata(api_url: String) -> anyhow::Result<Dfs2Metadata> {
     let url_with_metadata = if api_url.contains('?') {
         format!("{}&with_metadata=1", api_url)
     } else {
@@ -248,25 +294,19 @@ pub async fn get_dfs2_metadata(api_url: String) -> Result<Dfs2Metadata, String> 
         .get(&url_with_metadata)
         .send()
         .await
-        .with_http_context("get_dfs2_metadata", &url_with_metadata)
-        .map_err(|e| e.to_string())?;
+        .with_http_context("get_dfs2_metadata", &url_with_metadata)?;
 
     if !res.status().is_success() {
-        let status = res.status();
-        let body = res.text().await.unwrap_or_default();
-        return Err(format!("{}: {}", status, body));
+        return Err(status_error(res).await);
     }
 
     let body_text = res
         .text()
         .await
         .with_http_context("get_dfs2_metadata", &url_with_metadata)
-        .map_err(|e| format!("Failed to read response body: {}", e))?;
+        .context("read response body")?;
 
-    let metadata: Dfs2Metadata = serde_json::from_str(&body_text)
-        .map_err(|e| format!("Failed to parse JSON ({}): {}", e, body_text))?;
-
-    Ok(metadata)
+    parse_json(&body_text)
 }
 
 pub async fn create_dfs2_session(
@@ -276,7 +316,7 @@ pub async fn create_dfs2_session(
     challenge_response: Option<String>,
     session_id: Option<String>,
     extras: Option<serde_json::Value>,
-) -> Result<Dfs2SessionResponse, String> {
+) -> anyhow::Result<Dfs2SessionResponse> {
     let request_body = Dfs2SessionRequest {
         chunks,
         sid: session_id,
@@ -290,64 +330,57 @@ pub async fn create_dfs2_session(
         .json(&request_body)
         .send()
         .await
-        .with_http_context("create_dfs2_session", &api_url)
-        .map_err(|e| e.to_string())?;
+        .with_http_context("create_dfs2_session", &api_url)?;
 
     let status = res.status();
     let body_text = res
         .text()
         .await
         .with_http_context("create_dfs2_session", &api_url)
-        .map_err(|e| format!("Failed to read response body: {}", e))?;
+        .context("read response body")?;
 
     tracing::info!("Response body: {}", body_text);
 
-    let response: Dfs2SessionResponse = serde_json::from_str(&body_text)
-        .map_err(|e| format!("Failed to parse JSON ({}): {}", e, body_text))?;
-
-    // 返回 响应 直接 - let frontend 处理 challenges
+    // 402 carries the challenge in the body
     if !status.is_success() && status != reqwest::StatusCode::PAYMENT_REQUIRED {
-        return Err(format!("Session creation failed: {}", status));
+        return Err(anyhow::Error::new(HttpStatus::new(
+            status.as_u16(),
+            body_text,
+        )));
     }
 
-    Ok(response)
+    parse_json(&body_text)
 }
 
 pub async fn get_dfs2_chunk_url(
     session_api_url: String,
     range: String,
-) -> Result<Dfs2ChunkResponse, String> {
+) -> anyhow::Result<Dfs2ChunkResponse> {
     let url = format!("{}?range={}", session_api_url, range);
 
     let res = REQUEST_CLIENT
         .get(&url)
         .send()
         .await
-        .with_http_context("get_dfs2_chunk_url", &url)
-        .map_err(|e| e.to_string())?;
+        .with_http_context("get_dfs2_chunk_url", &url)?;
 
     if !res.status().is_success() {
-        let status = res.status();
-        let body = res.text().await.unwrap_or_default();
-        return Err(format!("{}: {}", status, body));
+        return Err(status_error(res).await);
     }
 
     let body_text = res
         .text()
         .await
         .with_http_context("get_dfs2_chunk_url", &url)
-        .map_err(|e| format!("Failed to read response body: {}", e))?;
+        .context("read response body")?;
 
-    let response: Dfs2ChunkResponse = serde_json::from_str(&body_text)
-        .map_err(|e| format!("Failed to parse JSON ({}): {}", e, body_text))?;
-
-    Ok(response)
+    parse_json(&body_text)
 }
 
 pub async fn get_dfs2_batch_chunk_urls(
     session_api_url: String,
     chunks: Vec<String>,
-) -> Result<Dfs2BatchChunkResponse, String> {
+) -> anyhow::Result<Dfs2BatchChunkResponse> {
     let request_body = Dfs2BatchChunkRequest { chunks };
 
     let res = REQUEST_CLIENT
@@ -355,31 +388,25 @@ pub async fn get_dfs2_batch_chunk_urls(
         .json(&request_body)
         .send()
         .await
-        .with_http_context("get_dfs2_batch_chunk_urls", &session_api_url)
-        .map_err(|e| e.to_string())?;
+        .with_http_context("get_dfs2_batch_chunk_urls", &session_api_url)?;
 
     if !res.status().is_success() {
-        let status = res.status();
-        let body = res.text().await.unwrap_or_default();
-        return Err(format!("{}: {}", status, body));
+        return Err(status_error(res).await);
     }
 
     let body_text = res
         .text()
         .await
         .with_http_context("get_dfs2_batch_chunk_urls", &session_api_url)
-        .map_err(|e| format!("Failed to read response body: {}", e))?;
+        .context("read response body")?;
 
-    let response: Dfs2BatchChunkResponse = serde_json::from_str(&body_text)
-        .map_err(|e| format!("Failed to parse JSON ({}): {}", e, body_text))?;
-
-    Ok(response)
+    parse_json(&body_text)
 }
 
 pub async fn end_dfs2_session(
     session_api_url: String,
     insights: Option<Dfs2SessionInsights>,
-) -> Result<(), String> {
+) -> anyhow::Result<()> {
     let request_body = Dfs2DeleteRequest { insights };
 
     let res = REQUEST_CLIENT
@@ -387,13 +414,10 @@ pub async fn end_dfs2_session(
         .json(&request_body)
         .send()
         .await
-        .with_http_context("end_dfs2_session", &session_api_url)
-        .map_err(|e| e.to_string())?;
+        .with_http_context("end_dfs2_session", &session_api_url)?;
 
     if !res.status().is_success() {
-        let status = res.status();
-        let body = res.text().await.unwrap_or_default();
-        return Err(format!("{}: {}", status, body));
+        return Err(status_error(res).await);
     }
     Ok(())
 }
@@ -401,7 +425,7 @@ pub async fn end_dfs2_session(
 pub async fn solve_dfs2_challenge(challenge_type: String, data: String) -> Result<String, String> {
     match challenge_type.as_str() {
         "md5" => {
-            // 拆分 数据 到 "哈希/来源"
+            // Split data into "hash/source"
             let parts: Vec<&str> = data.split('/').collect();
             if parts.len() != 2 {
                 return Err("Invalid challenge data format".to_string());
@@ -410,7 +434,7 @@ pub async fn solve_dfs2_challenge(challenge_type: String, data: String) -> Resul
             let target_hash = parts[0];
             let source = parts[1];
 
-            // 通过追加十六进制值尝试求解
+            // Try to find the solution by appending hex values
             for i in 0..=255 {
                 let candidate = format!("{}{:02x}", source, i);
                 let hash = chksum_md5::hash(candidate.as_bytes()).to_hex_lowercase();
@@ -422,7 +446,7 @@ pub async fn solve_dfs2_challenge(challenge_type: String, data: String) -> Resul
             Err("Failed to solve MD5 challenge".to_string())
         }
         "sha256" => {
-            // 拆分 数据 到 "哈希/来源"
+            // Split data into "hash/source"
             let parts: Vec<&str> = data.split('/').collect();
             if parts.len() != 2 {
                 return Err("Invalid challenge data format".to_string());
@@ -431,11 +455,11 @@ pub async fn solve_dfs2_challenge(challenge_type: String, data: String) -> Resul
             let target_hash = parts[0].to_string();
             let source = parts[1].to_string();
 
-            // 使用 spawn_blocking 用于 CPU-intensive SHA256 computation
+            // Use spawn_blocking for CPU-intensive SHA256 computation
             let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
                 use sha2::{Digest, Sha256};
 
-                // 尝试 不同 suffix lengths - 开始 使用 reasonable 范围
+                // Try different suffix lengths - start with reasonable range
                 for suffix_len in 1..=8u32 {
                     let max_val = 16_u64.pow(suffix_len);
 
@@ -461,8 +485,8 @@ pub async fn solve_dfs2_challenge(challenge_type: String, data: String) -> Resul
             result
         }
         "web" => {
-            // 待实现：网页挑战需要由前端处理
-            // 因为可能需要用户交互（验证码、浏览器弹窗等）
+            // TODO: Web challenges need to be handled by the frontend
+            // as they may require user interaction (captcha, browser popup, etc.)
             Err("Web challenges must be handled by the frontend".to_string())
         }
         _ => Err(format!("Unsupported challenge type: {}", challenge_type)),
@@ -493,14 +517,14 @@ pub async fn http_get_request(
     ignore_redirects: Option<bool>,
     headers: Option<HashMap<String, String>>,
     timeout_ms: Option<u64>,
-) -> Result<HttpGetResponse, String> {
-    // 发送请求；重定向策略不同时使用一次性的原始客户端
+) -> anyhow::Result<HttpGetResponse> {
+    // Send request — use a one-off raw client when redirect policy differs
     let response = if ignore_redirects.unwrap_or(false) {
         let client = reqwest::ClientBuilder::new()
             .user_agent(crate::capabilities::ua_string())
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+            .context("create HTTP client")?;
 
         let mut rb = client.get(&url);
         if let Some(timeout) = timeout_ms {
@@ -513,8 +537,7 @@ pub async fn http_get_request(
         }
         rb.send()
             .await
-            .with_http_context("http_get_request", &url)
-            .map_err(|e| e.to_string())?
+            .with_http_context("http_get_request", &url)?
     } else {
         let mut rb = REQUEST_CLIENT.get(&url);
         if let Some(timeout) = timeout_ms {
@@ -527,21 +550,20 @@ pub async fn http_get_request(
         }
         rb.send()
             .await
-            .with_http_context("http_get_request", &url)
-            .map_err(|e| e.to_string())?
+            .with_http_context("http_get_request", &url)?
     };
 
-    // 获取 final URL (之后 redirects)
+    // Get final URL (after redirects)
     let final_url = if let Some(redirected_url) = response.headers().get("Location") {
         redirected_url.to_str().unwrap_or("").to_string()
     } else {
         response.url().to_string()
     };
 
-    // 获取 status code
+    // Get status code
     let status_code = response.status().as_u16();
 
-    // 提取 headers
+    // Extract headers
     let mut response_headers = HashMap::new();
     for (name, value) in response.headers() {
         if let Ok(value_str) = value.to_str() {
@@ -549,12 +571,12 @@ pub async fn http_get_request(
         }
     }
 
-    // 获取响应体
+    // Get response body
     let body = response
         .text()
         .await
         .with_http_context("http_get_request", &url)
-        .map_err(|e| format!("Failed to read response body: {}", e))?;
+        .context("read response body")?;
 
     Ok(HttpGetResponse {
         status_code,
@@ -562,4 +584,59 @@ pub async fn http_get_request(
         body,
         final_url,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_url_gate_rejects_local_paths() {
+        assert!(is_remote_insight_url("https://cdn.example.com/file"));
+        assert!(is_remote_insight_url("http://127.0.0.1/a"));
+        assert!(is_remote_insight_url("h3wt://node.example/path"));
+        assert!(!is_remote_insight_url(""));
+        assert!(!is_remote_insight_url("unknown"));
+        assert!(!is_remote_insight_url("file:///C:/pack.bin"));
+        assert!(!is_remote_insight_url("C:\\pack.bin"));
+    }
+
+    #[test]
+    fn insight_error_is_the_code_and_first_wins() {
+        use crate::utils::code::{Attach, DOWNLOAD_STALLED, HASH_MISMATCH, INTERNAL_ERROR};
+        let mut item = InsightItem {
+            url: "https://x".to_string(),
+            ttfb: 1,
+            time: 1,
+            size: 1,
+            error: None,
+            range: vec![],
+            mode: None,
+        };
+        apply_insight_error(
+            &mut item,
+            &anyhow::anyhow!("mismatch").attach(HASH_MISMATCH),
+        );
+        assert_eq!(item.error.as_deref(), Some(HASH_MISMATCH));
+        apply_insight_error(&mut item, &anyhow::anyhow!("x").attach(DOWNLOAD_STALLED));
+        assert_eq!(item.error.as_deref(), Some(HASH_MISMATCH));
+
+        item.error = None;
+        apply_insight_error(&mut item, &anyhow::anyhow!("Failed to skip bytes"));
+        assert_eq!(item.error.as_deref(), Some(INTERNAL_ERROR));
+
+        item.error = None;
+        apply_insight_io_error(
+            &mut item,
+            &std::io::Error::from(std::io::ErrorKind::TimedOut),
+        );
+        assert_eq!(
+            item.error.as_deref(),
+            Some(crate::utils::code::DOWNLOAD_TIMEOUT)
+        );
+
+        let status = HttpStatus::new(503, "a".repeat(1000));
+        assert_eq!(status.body.len(), 512);
+        assert!(status.to_string().starts_with("503: "));
+    }
 }

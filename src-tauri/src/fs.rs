@@ -3,8 +3,9 @@ use bytes::Bytes;
 use fmmap::tokio::AsyncMmapFileExt;
 use futures::Stream;
 use futures::{StreamExt, TryStreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
@@ -479,7 +480,7 @@ impl<S> NetworkInsightStream<S> {
     }
 }
 
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Metadata {
     pub file_name: String,
     pub hash: String,
@@ -492,12 +493,18 @@ pub struct Metadata {
 /// 除了「清单里有哪些文件在本地」，还要给出「本地有哪些文件不在清单里」：后者此前
 /// 完全不可见（函数只按清单逐条比对），安装目录里留着的旧版本残留、用户自己放进去的
 /// 文件都不会出现在计划里。
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct LocalScan {
     /// 清单里、本地确实存在的文件（`file_name` 是绝对路径）
     pub files: Vec<Metadata>,
     /// 本地存在但不在清单里的文件：相对安装目录、小写、`/` 分隔
+    #[serde(default)]
     pub unmanaged: Vec<String>,
+    /// 新会话层使用的目录级扫描结果。旧 IPC 保留 `unmanaged`，新字段默认空。
+    #[serde(default)]
+    pub dirty_dirs: Vec<String>,
+    #[serde(default)]
+    pub reparse_dirs: Vec<String>,
 }
 
 /// 路径归一化成「小写 + `/` 分隔」，清单与本地路径都走这一步再比对。
@@ -514,6 +521,8 @@ pub async fn check_local_files(
     let empty = LocalScan {
         files: Vec::new(),
         unmanaged: Vec::new(),
+        dirty_dirs: Vec::new(),
+        reparse_dirs: Vec::new(),
     };
     let path = Path::new(&source);
     if !path.exists() {
@@ -625,7 +634,284 @@ pub async fn check_local_files(
     Ok(LocalScan {
         files: finished_hashes,
         unmanaged,
+        dirty_dirs: Vec::new(),
+        reparse_dirs: Vec::new(),
     })
+}
+
+fn norm_rel(name: &str) -> String {
+    name.replace('\\', "/")
+        .trim_start_matches('/')
+        .to_lowercase()
+}
+
+struct ScanWalk<'a> {
+    root: &'a Path,
+    managed: &'a HashMap<String, String>,
+    managed_dirs: &'a HashSet<String>,
+    all_skip_dirs: &'a HashSet<String>,
+    stat: Vec<(String, u64)>,
+    dirty: Vec<String>,
+    reparse: Vec<String>,
+    unmanaged: Vec<String>,
+}
+
+fn join_lower(dir: &str, name: &str) -> String {
+    if dir.is_empty() {
+        name.to_lowercase()
+    } else {
+        format!("{dir}/{}", name.to_lowercase())
+    }
+}
+
+impl ScanWalk<'_> {
+    fn stat_individually(&mut self, rel: &str) {
+        let prefix = format!("{rel}/");
+        let under: Vec<String> = self
+            .managed
+            .iter()
+            .filter(|(managed, _)| managed.starts_with(&prefix))
+            .map(|(_, original)| original.clone())
+            .collect();
+        for original in under {
+            let Some(path) = staging::try_join_rel(self.root, &original) else {
+                continue;
+            };
+            if let Ok(meta) = std::fs::metadata(path) {
+                if meta.is_file() {
+                    self.stat.push((original, meta.len()));
+                }
+            }
+        }
+    }
+
+    fn walk(&mut self, path: &Path, rel: &str) -> std::io::Result<bool> {
+        let mut clean = true;
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            let sub_rel = join_lower(rel, &name);
+            let meta = entry.metadata()?;
+            let is_link = meta.file_type().is_symlink() || commit::is_reparse(&meta);
+            if is_link || meta.is_dir() {
+                if is_link {
+                    clean = false;
+                    self.reparse.push(sub_rel.clone());
+                    self.stat_individually(&sub_rel);
+                    continue;
+                }
+                if !self.managed_dirs.contains(&sub_rel) {
+                    clean = false;
+                    continue;
+                }
+                if self.all_skip_dirs.contains(&sub_rel) {
+                    clean = false;
+                    self.stat_individually(&sub_rel);
+                    continue;
+                }
+                if !self.walk(&entry.path(), &sub_rel)? {
+                    clean = false;
+                }
+            } else if let Some(original) = self.managed.get(&sub_rel) {
+                self.stat.push((original.clone(), meta.len()));
+            } else {
+                self.unmanaged.push(sub_rel);
+                clean = false;
+            }
+        }
+        if !clean {
+            self.dirty.push(rel.to_string());
+        }
+        Ok(clean)
+    }
+}
+
+fn parent_dirs(rel: &str) -> impl Iterator<Item = String> + '_ {
+    let mut acc = String::new();
+    let parts: Vec<&str> = rel.split('/').collect();
+    let dirs = parts[..parts.len().saturating_sub(1)].to_vec();
+    std::iter::once(String::new()).chain(dirs.into_iter().map(move |part| {
+        if !acc.is_empty() {
+            acc.push('/');
+        }
+        acc.push_str(part);
+        acc.clone()
+    }))
+}
+
+fn enumerate_local(
+    source: &Path,
+    managed: &HashMap<String, String>,
+    skip_hash: &HashSet<String>,
+) -> Result<(Vec<(String, u64)>, Vec<String>, Vec<String>, Vec<String>)> {
+    let mut managed_dirs: HashSet<String> = HashSet::new();
+    let mut dir_files: HashMap<String, (usize, usize)> = HashMap::new();
+    for item in managed.keys() {
+        for dir in parent_dirs(item) {
+            managed_dirs.insert(dir.clone());
+            let entry = dir_files.entry(dir).or_insert((0, 0));
+            entry.0 += 1;
+            if skip_hash.contains(item) {
+                entry.1 += 1;
+            }
+        }
+    }
+    let all_skip_dirs: HashSet<String> = dir_files
+        .iter()
+        .filter(|(dir, (total, skipped))| !dir.is_empty() && total == skipped)
+        .map(|(dir, _)| dir.clone())
+        .collect();
+    let mut walk = ScanWalk {
+        root: source,
+        managed,
+        managed_dirs: &managed_dirs,
+        all_skip_dirs: &all_skip_dirs,
+        stat: Vec::new(),
+        dirty: Vec::new(),
+        reparse: Vec::new(),
+        unmanaged: Vec::new(),
+    };
+    walk.walk(source, "").context("GET_METADATA_ERR")?;
+    Ok((walk.stat, walk.dirty, walk.reparse, walk.unmanaged))
+}
+
+/// 新会话层的本地扫描：一次遍历同时产出文件、非清单文件、脏目录和重解析点目录。
+pub async fn check_local_files_v2(
+    source: String,
+    hash_algorithm: String,
+    file_list: Vec<String>,
+    skip_hash: Vec<String>,
+    notify: crate::ipc_v2::ProgressNotify,
+) -> Result<LocalScan> {
+    use crate::ipc_v2::Progress;
+
+    let source_path = PathBuf::from(&source);
+    if !source_path.exists() {
+        return Ok(LocalScan::default());
+    }
+    let skip_hash: HashSet<String> = skip_hash.iter().map(|name| norm_rel(name)).collect();
+    let managed: HashMap<String, String> = file_list
+        .iter()
+        .map(|name| {
+            (
+                norm_rel(name),
+                name.replace('\\', "/").trim_start_matches('/').to_string(),
+            )
+        })
+        .filter(|(name, _)| !name.is_empty())
+        .collect();
+
+    let (stat, dirty_dirs, reparse_dirs, unmanaged) = {
+        let source_path = source_path.clone();
+        let managed = managed.clone();
+        let skip_hash = skip_hash.clone();
+        tokio::task::spawn_blocking(move || enumerate_local(&source_path, &managed, &skip_hash))
+            .await
+            .context("SCAN_THREAD_ERR")??
+    };
+
+    let mut files = Vec::new();
+    let mut stated = Vec::new();
+    for (rel, size) in stat {
+        let Some(abs) = staging::try_join_rel(&source_path, &rel) else {
+            continue;
+        };
+        let item = Metadata {
+            file_name: abs.to_string_lossy().to_string(),
+            hash: String::new(),
+            size,
+            unwritable: false,
+        };
+        if skip_hash.contains(&norm_rel(&rel)) {
+            stated.push(item);
+        } else {
+            files.push(item);
+        }
+    }
+
+    files.sort_by(|a, b| b.size.cmp(&a.size));
+    let len = files.len() + stated.len();
+    notify(Progress::CountOf {
+        done: 0,
+        total: len as u64,
+    });
+    let scan = LocalScan {
+        files: Vec::new(),
+        unmanaged,
+        dirty_dirs,
+        reparse_dirs,
+    };
+    if len == 0 {
+        return Ok(scan);
+    }
+    if files.is_empty() {
+        notify(Progress::CountOf {
+            done: len as u64,
+            total: len as u64,
+        });
+        return Ok(LocalScan {
+            files: stated,
+            ..scan
+        });
+    }
+
+    let hash_concurrency = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(hash_concurrency));
+    let mut joinset = tokio::task::JoinSet::new();
+    for file in files {
+        let hash_algorithm = hash_algorithm.clone();
+        let semaphore = semaphore.clone();
+        joinset.spawn(async move {
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .context("HASH_SEMAPHORE_ERR")?;
+            let mut file = file;
+            file.hash = run_hash(&hash_algorithm, &file.file_name).await?;
+            Ok::<Metadata, anyhow::Error>(file)
+        });
+    }
+
+    let mut finished = stated.len();
+    let mut finished_hashes = Vec::with_capacity(len);
+    finished_hashes.extend(stated);
+    let mut last_notify = Instant::now();
+    const PROGRESS_FRAME: Duration = Duration::from_millis(50);
+    while let Some(result) = joinset.join_next().await {
+        let result = result.context("HASH_THREAD_ERR")?;
+        let result = result.context("HASH_COMPLETE_ERR")?;
+        finished += 1;
+        finished_hashes.push(result);
+        if finished == len || last_notify.elapsed() >= PROGRESS_FRAME {
+            notify(Progress::CountOf {
+                done: finished as u64,
+                total: len as u64,
+            });
+            last_notify = Instant::now();
+        }
+    }
+    Ok(LocalScan {
+        files: finished_hashes,
+        ..scan
+    })
+}
+
+pub async fn probe_writable(file_list: Vec<String>) -> Vec<String> {
+    let mut unwritable = Vec::new();
+    for path in file_list {
+        if tokio::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .await
+            .is_err()
+        {
+            unwritable.push(path);
+        }
+    }
+    unwritable
 }
 
 pub async fn is_dir_empty(path: String, exe_name: String) -> (bool, bool) {

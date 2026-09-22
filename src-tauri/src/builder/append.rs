@@ -7,22 +7,22 @@ use crate::{
 };
 
 pub async fn append_cli(args: AppendArgs) {
-    // 文件数量应等于名称数量，或名称数量应为 0
+    // files len should equals to names len, or names len should be 0
     if args.file.len() != args.name.len() && !args.name.is_empty() {
         panic!("Files length must equal to names length, or names length must be 0");
     }
-    // 以追加模式打开文件
+    // open file as append mode
     let mut output = tokio::fs::OpenOptions::new()
         .append(true)
         .open(&args.output)
         .await
         .expect("Failed to open output file");
-    // 移动到文件末尾
+    // seek to the end of the file
     output
         .seek(std::io::SeekFrom::End(0))
         .await
         .expect("Failed to seek to the end of the file");
-    // 遍历输入文件，获取对应名称；未提供时使用文件名
+    // loop through input files, get corresponding name or dafault to the file name
     for (i, file) in args.file.iter().enumerate() {
         let name = if !args.name.is_empty() {
             &args.name[i]
@@ -44,7 +44,7 @@ pub async fn append_cli(args: AppendArgs) {
             .await
             .expect("Failed to get input file metadata")
             .len();
-        // 将文件写入输出
+        // write file to output
         write_file(
             &mut output,
             &mut PackFile {

@@ -1567,9 +1567,9 @@ mod tests {
         let err = commit_sync(fx.args(units), progress_noop(), FAST, None).unwrap_err();
         assert!(matches!(
             crate::utils::code::extract(&err),
-            crate::utils::code::Extracted::Coded { code, subject }
-                if code == crate::utils::code::FILE_IN_USE
-                    && subject.as_deref() == Some("b.txt")
+            crate::utils::code::Extracted::Coded(coded)
+                if coded.code == crate::utils::code::FILE_IN_USE
+                    && coded.subject.as_deref() == Some("b.txt")
         ));
         assert_eq!(read(&fx.target("a.txt")), Some(b"a-old".to_vec()));
         assert_eq!(read(&fx.target("b.txt")), Some(b"b-old".to_vec()));
@@ -1655,8 +1655,8 @@ mod tests {
         let err = recover_sync(CommitArgs { journal, ..args }, progress_noop(), FAST).unwrap_err();
         assert!(matches!(
             crate::utils::code::extract(&err),
-            crate::utils::code::Extracted::Coded { code, .. }
-                if code == crate::utils::code::FILE_IN_USE
+            crate::utils::code::Extracted::Coded(coded)
+                if coded.code == crate::utils::code::FILE_IN_USE
         ));
         drop(_hold);
         fx.assert_old();
@@ -1680,8 +1680,8 @@ mod tests {
         let err = recover_sync(CommitArgs { journal, ..args }, progress_noop(), FAST).unwrap_err();
         assert!(matches!(
             crate::utils::code::extract(&err),
-            crate::utils::code::Extracted::Coded { code, .. }
-                if code == crate::utils::code::FILE_IN_USE
+            crate::utils::code::Extracted::Coded(coded)
+                if coded.code == crate::utils::code::FILE_IN_USE
         ));
         drop(_hold);
         assert_eq!(read(&fx.target("a.txt")), Some(b"a-old".to_vec()));

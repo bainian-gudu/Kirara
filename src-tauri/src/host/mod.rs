@@ -3,13 +3,14 @@ mod bridge;
 mod webview;
 mod window;
 
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 
 use anyhow::Context;
 use raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, Win32WindowHandle, WindowHandle,
 };
 use serde_json::Value;
+use tokio::sync::oneshot;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -20,8 +21,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::cli::arg::InstallArgs;
 use crate::installer::uninstall::delete_self_on_exit;
-use crate::ipc::manager::ManagedElevate;
+use crate::ipc_v2::manager::ManagedElevate;
+use crate::session::commands::{GuiRuntime, SessionState};
+use crate::session::types::SessionInput;
 use crate::APP_BOOT_SIGNAL;
+
+pub use window::HwndParent;
 
 const UI_HOST: &str = "https://app.localhost";
 
@@ -78,6 +83,14 @@ impl HostHandle {
         HWND(self.hwnd as *mut _)
     }
 
+    pub fn parent(&self) -> HwndParent {
+        HwndParent::from_hwnd(self.hwnd())
+    }
+
+    pub fn close(&self) {
+        self.send(UiAction::Close);
+    }
+
     pub fn emit(&self, event: &str, payload: impl serde::Serialize) {
         let payload = serde_json::to_value(payload).unwrap_or(Value::Null);
         self.send(UiAction::Emit {
@@ -96,7 +109,44 @@ impl HostHandle {
 
 pub struct HostCtx {
     pub args: InstallArgs,
+    /// 新会话层使用的 typed/postcard IPC。
     pub elevate: ManagedElevate,
+    pub session: SessionState,
+    pub ui: HostHandle,
+    pub plugin_runtime: bool,
+    pub plugin_ready: Mutex<Option<oneshot::Sender<()>>>,
+    pub preset: Option<SessionInput>,
+    pub gui: Mutex<Option<Arc<GuiRuntime>>>,
+}
+
+pub struct PluginRuntime {
+    handle: HostHandle,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PluginRuntime {
+    pub fn handle(&self) -> &HostHandle {
+        &self.handle
+    }
+
+    pub fn close(mut self) {
+        self.shutdown();
+    }
+
+    fn shutdown(&mut self) {
+        self.handle.close();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+impl Drop for PluginRuntime {
+    fn drop(&mut self) {
+        if self.join.is_some() {
+            self.shutdown();
+        }
+    }
 }
 
 pub fn webview_version() -> anyhow::Result<String> {
@@ -113,6 +163,7 @@ pub fn run(args: InstallArgs) -> anyhow::Result<()> {
     let width = (520.0 * scale).round() as i32;
     let height = (250.0 * scale).round() as i32;
     let hwnd = window::create(width, height).context("create native host window")?;
+    tracing::info!("native host: window created ({width}x{height} client)");
 
     let (tx, rx) = mpsc::channel();
     let handle = HostHandle {
@@ -120,9 +171,18 @@ pub fn run(args: InstallArgs) -> anyhow::Result<()> {
         thread_id: unsafe { GetCurrentThreadId() },
         hwnd: hwnd.0 as isize,
     };
+    // 无人值守运行（`-S` / `-I`）里没人能点模态框：CI、控制面板、自动化调用
+    // 一旦走到弹框就会永久挂住。看门狗只在交互运行里弹框，其余只写日志退出。
+    let unattended = args.silent || args.non_interactive;
     let ctx = Arc::new(HostCtx {
         args,
         elevate: ManagedElevate::new(),
+        session: SessionState::default(),
+        ui: handle.clone(),
+        plugin_runtime: false,
+        plugin_ready: Mutex::new(None),
+        preset: None,
+        gui: Mutex::new(None),
     });
 
     let watchdog_handle = handle.clone();
@@ -133,6 +193,14 @@ pub fn run(args: InstallArgs) -> anyhow::Result<()> {
                 tracing::info!("Native WebView2 frontend is ready");
                 return;
             }
+            tracing::error!(
+                "WebView2 frontend failed to become ready within 30s (unattended={unattended})"
+            );
+            if unattended {
+                // 先记日志再退出：日志是无人值守场景唯一的诊断出口，弹框只会
+                // 把失败伪装成超时（CI 上曾因此每个安装用例都卡满 3 分钟）。
+                std::process::exit(1);
+            }
             let parent = watchdog_handle.dialog_parent();
             rfd::MessageDialog::new()
                 .set_title("Kachina Installer")
@@ -140,7 +208,6 @@ pub fn run(args: InstallArgs) -> anyhow::Result<()> {
                 .set_level(rfd::MessageLevel::Error)
                 .set_parent(&parent)
                 .show();
-            tracing::error!("WebView2 frontend failed to become ready within 30s");
             std::process::exit(1);
         }
     });
@@ -150,8 +217,10 @@ pub fn run(args: InstallArgs) -> anyhow::Result<()> {
     } else {
         format!("{UI_HOST}/index.html")
     };
+    tracing::info!("native host: attaching WebView2 at {start}");
     let webview =
         webview::attach(hwnd, handle.clone(), ctx, &start).context("attach WebView2 host")?;
+    tracing::info!("native host: WebView2 attached");
 
     if cfg!(debug_assertions) {
         window::set_visible(hwnd, true);
@@ -198,6 +267,134 @@ pub fn run(args: InstallArgs) -> anyhow::Result<()> {
                 if msg.message == WM_SIZE {
                     if let Err(err) = webview.resize(hwnd) {
                         tracing::warn!("native host resize failed: {err}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub async fn spawn_plugin_runtime(
+    args: InstallArgs,
+    session: SessionState,
+) -> anyhow::Result<PluginRuntime> {
+    let (started_tx, started_rx) = oneshot::channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let runtime = tokio::runtime::Handle::current();
+    let join = std::thread::Builder::new()
+        .name("kachina-plugin-host".into())
+        .spawn(move || {
+            let _enter = runtime.enter();
+            plugin_runtime_thread(args, session, started_tx, ready_tx);
+        })
+        .context("spawn plugin host thread")?;
+
+    let handle = started_rx
+        .await
+        .map_err(|_| anyhow::anyhow!("PLUGIN_HOST_FAILED"))?
+        .map_err(|error| {
+            tracing::error!("plugin host thread failed: {error:#}");
+            error.context("PLUGIN_HOST_FAILED")
+        })?;
+    let plugin_runtime = PluginRuntime {
+        handle,
+        join: Some(join),
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(10), ready_rx).await {
+        Ok(Ok(())) => Ok(plugin_runtime),
+        _ => {
+            plugin_runtime.close();
+            Err(anyhow::anyhow!("PLUGIN_HOST_FAILED"))
+        }
+    }
+}
+
+fn plugin_runtime_thread(
+    args: InstallArgs,
+    session: SessionState,
+    started_tx: oneshot::Sender<anyhow::Result<HostHandle>>,
+    ready_tx: oneshot::Sender<()>,
+) {
+    match plugin_runtime_setup(args, session, ready_tx) {
+        Ok((handle, rx, hwnd, webview)) => {
+            let _ = started_tx.send(Ok(handle.clone()));
+            plugin_runtime_loop(handle, rx, hwnd, webview);
+        }
+        Err(error) => {
+            let _ = started_tx.send(Err(error));
+        }
+    }
+}
+
+fn plugin_runtime_setup(
+    args: InstallArgs,
+    session: SessionState,
+    ready_tx: oneshot::Sender<()>,
+) -> anyhow::Result<(
+    HostHandle,
+    mpsc::Receiver<UiAction>,
+    HWND,
+    webview::WebViewHost,
+)> {
+    unsafe {
+        CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
+    }
+    let hwnd = window::create_hidden().context("create hidden plugin window")?;
+    let (tx, rx) = mpsc::channel();
+    let handle = HostHandle {
+        tx,
+        thread_id: unsafe { GetCurrentThreadId() },
+        hwnd: hwnd.0 as isize,
+    };
+    let ctx = Arc::new(HostCtx {
+        args,
+        elevate: ManagedElevate::new(),
+        session,
+        ui: handle.clone(),
+        plugin_runtime: true,
+        plugin_ready: Mutex::new(Some(ready_tx)),
+        preset: None,
+        gui: Mutex::new(None),
+    });
+    let start = format!("{UI_HOST}/index.html?pluginHost=1");
+    let webview = webview::attach(hwnd, handle.clone(), ctx, &start)
+        .context("attach hidden plugin webview")?;
+    Ok((handle, rx, hwnd, webview))
+}
+
+fn plugin_runtime_loop(
+    _handle: HostHandle,
+    rx: mpsc::Receiver<UiAction>,
+    hwnd: HWND,
+    webview: webview::WebViewHost,
+) {
+    let mut msg = MSG::default();
+    loop {
+        while let Ok(action) = rx.try_recv() {
+            if !matches!(action, UiAction::Close) && !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+                continue;
+            }
+            if let Err(error) = webview.apply(hwnd, action) {
+                tracing::warn!("plugin host ui action failed: {error}");
+            }
+        }
+        let result = unsafe { GetMessageW(&mut msg, None, 0, 0) };
+        match result.0 {
+            -1 | 0 => break,
+            _ => {
+                if msg.message == WM_QUIT {
+                    break;
+                }
+                if msg.message == window::WM_THEME_BACKGROUND {
+                    let dark = crate::utils::gui::is_dark_mode().unwrap_or(false);
+                    if let Err(error) = webview.apply(hwnd, UiAction::SetBackground { dark }) {
+                        tracing::warn!("plugin host theme update failed: {error}");
+                    }
+                }
+                if msg.message != WM_APP {
+                    unsafe {
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
                     }
                 }
             }

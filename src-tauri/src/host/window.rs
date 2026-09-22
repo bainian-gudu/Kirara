@@ -20,16 +20,37 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, GetWindowLongPtrW, LoadCursorW, PostMessageW, PostQuitMessage,
     RegisterClassExW, SendMessageW, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
     GWL_STYLE, HICON, ICON_BIG, ICON_SMALL, IDC_ARROW, SM_CXSCREEN, SM_CYSCREEN, SWP_FRAMECHANGED,
-    SWP_NOMOVE, SWP_NOZORDER, SW_HIDE, SW_MINIMIZE, SW_SHOW, WM_APP, WM_CLOSE, WM_DESTROY,
-    WM_SETICON, WM_SETTINGCHANGE, WNDCLASSEXW, WS_CAPTION, WS_EX_NOREDIRECTIONBITMAP, WS_MAXIMIZE,
-    WS_MINIMIZE, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_POPUP, WS_SYSMENU, WS_VISIBLE,
+    SWP_NOMOVE, SWP_NOZORDER, SW_HIDE, SW_MINIMIZE, SW_SHOW, SW_SHOWNA, WM_APP, WM_CLOSE,
+    WM_DESTROY, WM_SETICON, WM_SETTINGCHANGE, WNDCLASSEXW, WS_CAPTION, WS_EX_NOACTIVATE,
+    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_MAXIMIZE, WS_MINIMIZE, WS_MINIMIZEBOX,
+    WS_OVERLAPPED, WS_POPUP, WS_SYSMENU, WS_VISIBLE,
 };
 
 use crate::installer::uninstall::delete_self_on_exit;
 use crate::utils::gui::is_dark_mode;
 
 const CLASS: PCWSTR = w!("KachinaInstaller");
+const PLUGIN_CLASS: PCWSTR = w!("KachinaPluginHost");
 pub const WM_THEME_BACKGROUND: u32 = WM_APP + 1;
+
+/// 原生对话框（TaskDialog / IFileDialog）只需要一个裸 `HWND`，不需要宿主的
+/// 生命周期或 `raw_window_handle` 形状。`Send`/`Sync` 是显式声明：句柄本身
+/// 只在窗口存活期间使用，跨线程只传递数值。
+#[derive(Clone, Copy)]
+pub struct HwndParent(pub isize);
+
+impl HwndParent {
+    pub fn from_hwnd(hwnd: HWND) -> Self {
+        Self(hwnd.0 as isize)
+    }
+
+    pub fn hwnd(self) -> HWND {
+        HWND(self.0 as *mut _)
+    }
+}
+
+unsafe impl Send for HwndParent {}
+unsafe impl Sync for HwndParent {}
 
 pub fn is_win11() -> bool {
     let (major, minor, build) = crate::utils::os_version::get();
@@ -147,6 +168,41 @@ pub fn create(client_w: i32, client_h: i32) -> anyhow::Result<HWND> {
     apply_icon(hwnd);
     unsafe {
         let _ = UpdateWindow(hwnd);
+    }
+    Ok(hwnd)
+}
+
+pub fn create_hidden() -> anyhow::Result<HWND> {
+    let hinstance = unsafe { GetModuleHandleW(None) }?.into();
+    let class = WNDCLASSEXW {
+        cbSize: size_of::<WNDCLASSEXW>() as u32,
+        lpfnWndProc: Some(plugin_wndproc),
+        hInstance: hinstance,
+        lpszClassName: PLUGIN_CLASS,
+        hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }?,
+        hbrBackground: HBRUSH::default(),
+        ..Default::default()
+    };
+    unsafe { RegisterClassExW(&class) };
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            PLUGIN_CLASS,
+            w!(" "),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            None,
+            None,
+            Some(hinstance),
+            None,
+        )
+    }
+    .context("CreateWindowExW hidden")?;
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_SHOWNA);
     }
     Ok(hwnd)
 }
@@ -327,6 +383,29 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
     match msg {
         WM_CLOSE => {
             delete_self_on_exit();
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            unsafe { PostQuitMessage(0) };
+            LRESULT(0)
+        }
+        WM_SETTINGCHANGE => {
+            if is_color_theme_change(lparam) {
+                apply_mica(hwnd);
+                post_theme_background(hwnd);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+extern "system" fn plugin_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_CLOSE => {
             unsafe {
                 let _ = DestroyWindow(hwnd);
             }

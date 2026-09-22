@@ -378,7 +378,7 @@ pub fn remove_tree(path: &Path) {
     }
 }
 
-/// Compatibility wrappers used by `ipc::operation`.
+/// Compatibility wrappers used by the frontend IPC compatibility layer.
 pub fn open(install_dir: &str) -> anyhow::Result<StagingOpenResult> {
     let opened = Staging::open(install_dir)?;
     Ok(StagingOpenResult {
@@ -427,7 +427,7 @@ mod tests {
         let err = sibling_candidate(Path::new(r"D:\")).unwrap_err();
         assert!(matches!(
             crate::utils::code::extract(&err),
-            crate::utils::code::Extracted::Coded { code, .. } if code == INSTALL_PATH_INVALID
+            crate::utils::code::Extracted::Coded(coded) if coded.code == INSTALL_PATH_INVALID
         ));
     }
 
@@ -474,7 +474,7 @@ mod tests {
         let err = Staging::open(&install_s).unwrap_err();
         assert!(matches!(
             crate::utils::code::extract(&err),
-            crate::utils::code::Extracted::Coded { code, .. } if code == STAGING_IN_USE
+            crate::utils::code::Extracted::Coded(coded) if coded.code == STAGING_IN_USE
         ));
         let _ = child.wait_with_output();
         remove_tree(&root);

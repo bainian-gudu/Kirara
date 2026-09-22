@@ -10,8 +10,8 @@ const MARKER: &[u8] = b"!KachinaInstaller!";
 const DOS_STUB: &[u8] = b"This program cannot be run in DOS mode";
 const TLV_MAGIC: &[u8] = b"!IN\0";
 
-/// DOS stub 里 `!KachinaInstaller!` 之后写入的 5 个字段。
-/// `base_end` 是文件内的绝对偏移；其余 4 个都是各段的**长度**。
+/// Values stored after `!KachinaInstaller!` in the DOS stub.
+/// `base_end` is an absolute file offset; the rest are section *lengths*.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackLayout {
     pub base_end: u32,

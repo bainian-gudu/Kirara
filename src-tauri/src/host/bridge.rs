@@ -222,21 +222,32 @@ async fn dispatch(
             ok(crate::utils::wincred::wincred_delete(&target)?)
         }
         "managed_operation" => {
-            let ipc = args
+            let legacy = args
                 .get("ipc")
                 .cloned()
                 .ok_or_else(|| missing("ipc"))
                 .and_then(|value| {
-                    serde_json::from_value(value).map_err(|error| {
-                        TACommandError::new(anyhow::anyhow!("invalid IPC operation: {error}"))
-                    })
+                    serde_json::from_value::<crate::ipc_v2::legacy::LegacyIpcOperation>(value)
+                        .map_err(|error| {
+                            TACommandError::new(anyhow::anyhow!("invalid IPC operation: {error}"))
+                        })
                 })?;
             let id = req_str(&args, &["id"])?;
             let elevate = req_bool(&args, &["elevate"])?;
-            match crate::ipc::manager::managed_operation(ipc, id, elevate, &ctx.elevate, handle)
-                .await
-            {
-                Ok(value) => Ok(json!({ "Ok": value })),
+            let progress_kind = legacy.progress_kind();
+            let ipc = legacy.into_v2();
+            let handle = handle.clone();
+            let progress_id = id.clone();
+            let progress = crate::ipc_v2::progress_notify(move |progress| {
+                handle.emit(
+                    &progress_id,
+                    crate::ipc_v2::legacy::progress_payload(progress_kind, progress),
+                );
+            });
+            match ctx.elevate.run(ipc, elevate, progress).await {
+                Ok(result) => Ok(json!({
+                    "Ok": crate::ipc_v2::legacy::result_payload(result)?,
+                })),
                 Err(error) => Ok(json!({ "Err": error })),
             }
         }
@@ -398,8 +409,11 @@ fn missing(field: &str) -> TACommandError {
     TACommandError::new(anyhow::anyhow!("missing field: {field}"))
 }
 
-fn string_error(error: String) -> TACommandError {
-    TACommandError::new(anyhow::anyhow!(error))
+/// DFS 命令的错误类型在新版 `dfs.rs` 里从 `String` 换成了 `anyhow::Error`。
+/// 这里接受任何可显示的错误（`String` 与 `anyhow::Error` 都算），
+/// 两种形状的调用点都不用改。
+fn string_error<E: std::fmt::Display>(error: E) -> TACommandError {
+    TACommandError::new(anyhow::anyhow!("{error:#}"))
 }
 
 fn ok<T: serde::Serialize>(value: T) -> Result<Value, TACommandError> {

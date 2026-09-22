@@ -88,7 +88,6 @@ pub async fn pack_cli(args: PackArgs) {
     let reader = get_reader_for_bundle().await;
     if reader.is_err() {
         eprintln!("Failed to get reader: {:?}", reader.err());
-        // 打包失败必须是失败退出：调用方（脚本 / CI）靠退出码判断有没有产物
         std::process::exit(1);
     }
     let reader = reader.unwrap();
@@ -101,13 +100,12 @@ pub async fn pack_cli(args: PackArgs) {
         );
         return;
     }
-    let config = config.unwrap();
-    let config = serde_json::from_slice(&config);
+    let config = serde_json::from_slice::<serde_json::Value>(&config.unwrap());
     if config.is_err() {
         eprintln!("Failed to parse config: {:?}", config.err());
         return;
     }
-    let mut config: serde_json::Value = config.unwrap();
+    let mut config = config.unwrap();
     // 把 agreementFile 指向的协议正文内联进配置，供安装界面弹窗展示
     resolve_agreement(&mut config, &args.config);
     let metadata = if let Some(metadata) = args.metadata {
@@ -154,8 +152,8 @@ pub async fn pack_cli(args: PackArgs) {
     let mut files = vec![];
     if let Some(data_dir) = data_dir {
         if let Some(metadata) = metadata.as_ref() {
-            if let Some(hashed) = metadata.hashed.as_ref() {
-                for file in hashed.iter() {
+            if !metadata.hashed.is_empty() {
+                for file in metadata.hashed.iter() {
                     let Some(hash) = preferred_file_hash(&file.md5, &file.xxh) else {
                         eprintln!("No hash found for file: {:?}", file.file_name);
                         return;
@@ -178,8 +176,8 @@ pub async fn pack_cli(args: PackArgs) {
                     });
                 }
             }
-            if let Some(patches) = metadata.patches.as_ref() {
-                for patch in patches.iter() {
+            if !metadata.patches.is_empty() {
+                for patch in metadata.patches.iter() {
                     let Some(from_hash) = preferred_file_hash(&patch.from.md5, &patch.from.xxh)
                     else {
                         eprintln!("No hash found for patch: {:?}", patch.file_name);
@@ -209,7 +207,7 @@ pub async fn pack_cli(args: PackArgs) {
                 }
             }
         } else {
-            // 未设置元数据时，直接打包不含“_”的所有文件
+            // if no metadata set, just pack all files without '_'
             let entries = tokio::fs::read_dir(data_dir).await;
             if entries.is_err() {
                 eprintln!("Failed to read data dir: {:?}", entries.err());
@@ -219,7 +217,7 @@ pub async fn pack_cli(args: PackArgs) {
             while let Some(entry) = entries.next_entry().await.unwrap() {
                 let path = entry.path();
                 let name = path.file_name().unwrap().to_str().unwrap().to_string();
-                // 名称包含“_”时忽略
+                // ignore if name includes '_'
                 if name.contains('_') {
                     continue;
                 }
@@ -257,9 +255,6 @@ pub async fn pack(
     mut config: PackConfig,
 ) {
     println!("Generating exe with version info...");
-    // 将基础内容写入临时文件。文件名带进程号 + UUID：固定名字在并发打包
-    // （同机跑多个 builder、CI 上多 job 共用 TEMP）时会互相踩，且上一次崩溃
-    // 留下的半截文件会被这次直接读走。
     let tmppath = std::env::temp_dir().join(format!(
         "kachina_installer_tmp_{}_{}.exe",
         std::process::id(),
@@ -267,12 +262,10 @@ pub async fn pack(
     ));
     let mut tmpfile = tokio::fs::File::create(&tmppath).await.unwrap();
     tokio::io::copy(&mut base, &mut tmpfile).await.unwrap();
-    // 关闭前先落盘：rcedit 是另一个进程内的实现，靠文件内容读，不能只看缓冲
     tmpfile.sync_all().await.unwrap();
     tmpfile.shutdown().await.unwrap();
     drop(tmpfile);
     let tmp_len = tokio::fs::metadata(&tmppath).await.unwrap().len();
-    // 打开资源文件
     let mut updater = rcedit::ResourceUpdater::new();
     if let Err(e) = updater.load(&tmppath) {
         panic!(
@@ -293,7 +286,7 @@ pub async fn pack(
         .unwrap();
     updater.set_version_string("ProductName", product).unwrap();
 
-    // 如果提供了图标则设置
+    // Set icon if provided
     if let Some(icon_path) = &config.icon_path {
         if icon_path.exists() {
             if let Err(e) = updater.set_icon(icon_path) {
@@ -310,30 +303,25 @@ pub async fn pack(
     drop(updater);
     println!("Reading base...");
     let mut base_data = vec![];
-    // 读取临时文件
+    // read tmp file
     let mut tmpfile = tokio::fs::File::open(tmppath.clone()).await.unwrap();
     tokio::io::copy(&mut tmpfile, &mut base_data).await.unwrap();
-    // 关闭临时文件
+    // close tmp file
     tmpfile.shutdown().await.unwrap();
     drop(tmpfile);
-    // 删除临时文件
+    // remove tmp file
     tokio::fs::remove_file(tmppath).await.unwrap();
 
-    // 先克隆 packing_info 用于排序；空表时不参与分类（下面按 [0]..[4] 打印会越界）
+    // packing_info 为空时不参与分类排序（避免按 [0]..=[4] 打印时越界）。
     let packing_info_clone = config
         .metadata
         .as_ref()
-        .and_then(|m| m.packing_info.clone())
+        .map(|m| m.packing_info.clone())
         .filter(|p| !p.is_empty());
 
-    let metadata_bytes = if let Some(mut metadata) = config.metadata {
+    let metadata_bytes = if let Some(metadata) = config.metadata {
         println!("Writing metadata...");
-        // 排除 packing_info，这些信息只用于打包阶段
-        metadata.packing_info = None;
-        let mut metadata = serde_json::json!(metadata);
-        metadata.sort_all_objects();
-        let metadata_bytes = serde_json::to_string(&metadata).unwrap();
-        Some(metadata_bytes.as_bytes().to_vec())
+        Some(embed_metadata_bytes(metadata))
     } else {
         None
     };
@@ -341,9 +329,9 @@ pub async fn pack(
     config.config.sort_all_objects();
     let config_bytes = serde_json::to_string(&config.config).unwrap();
     let mut files = config.files;
-    // 名称、大小、偏移量
+    // name size offset
     let mut index: Vec<(String, u32, u32)> = vec![];
-    // 将配置写入索引
+    // insert config to index
     let mut current_offset = 0;
     index.push((
         "\0CONFIG".to_string(),
@@ -351,13 +339,13 @@ pub async fn pack(
         get_header_size("\0CONFIG") as u32,
     ));
     current_offset += config_bytes.len() + get_header_size("\0CONFIG");
-    // 将图片写入索引
+    // insert image to index
     if let Some(img) = config.image.as_ref() {
         let offset = current_offset + get_header_size(&img.name);
         index.push((img.name.clone(), img.size as u32, offset as u32));
         current_offset = offset + img.size;
     }
-    // 将元数据写入索引
+    // insert metadata to index
     if let Some(metadata_bytes) = metadata_bytes.as_ref() {
         let offset = current_offset + get_header_size("\0META");
         index.push((
@@ -386,15 +374,15 @@ pub async fn pack(
         current_offset = offset + size;
     }
     let index_len = index_to_bin(&index).len() + get_header_size("\0INDEX");
-    // 将索引长度加到偏移量
+    // add index_len to offset
     for (name, _size, offset) in index.iter_mut() {
-        // 索引位于配置和图片之后
+        // index is after config and image
         if name == "\0CONFIG" || name == "\0IMAGE" {
             continue;
         }
         *offset += index_len as u32;
     }
-    // 将索引前信息写入 PE 头部
+    // write pre-index to pe header
     let index_pre = if !files.is_empty() {
         gen_index_header(
             base_data.len() as u32,
@@ -414,20 +402,20 @@ pub async fn pack(
     } else {
         gen_index_header(0, 0, 0, 0, 0)
     };
-    // 将 PE 头部中的 DOS 模式提示文本替换为 index_pre
+    // replace 'This program cannot be run in DOS mode' in pe header to index_pre
     let pe_str_offset = base_data.iter().position(|x| *x == 0x54).unwrap();
     let pe_str = &mut base_data[pe_str_offset..pe_str_offset + index_pre.len()];
-    // 检查 pe_str 是否确实为 DOS 模式提示文本
+    // check if pe_str is really 'This program cannot be run in DOS mode'
     let pe_string = std::str::from_utf8_mut(pe_str).unwrap();
     if pe_string != "This program cannot be run in DOS mode" {
         eprintln!("Failed to find pe string: {pe_string:?}");
         return;
     }
     pe_str.copy_from_slice(&index_pre);
-    // 将基础内容复制到输出，暂不关闭输出文件
+    // copy base to output, not closing output file
     println!("Writing base...");
     output.write_all(&base_data).await.unwrap();
-    // 写入配置
+    // write config
     println!("Writing config...");
     let config_bytes = config_bytes.as_bytes();
     let res = write_header(&mut output, "\0CONFIG", config_bytes.len() as u32).await;
@@ -440,7 +428,7 @@ pub async fn pack(
         eprintln!("Failed to write config: {:?}", res.err());
         return;
     }
-    // 存在主题时写入主题
+    // if theme exists, write theme
     if let Some(image) = config.image.as_mut() {
         println!("Writing image...");
         let res = write_file(&mut output, image).await;
@@ -450,7 +438,7 @@ pub async fn pack(
         }
     }
     if !files.is_empty() {
-        // 写入索引
+        // write index
         println!("Writing index...");
         let index_bytes = index_to_bin(&index);
         write_header(&mut output, "\0INDEX", index_bytes.len() as u32)
@@ -459,7 +447,7 @@ pub async fn pack(
 
         output.write_all(&index_bytes).await.unwrap();
     }
-    // 存在元数据时写入元数据
+    // if metadata exists, write metadata
     if let Some(metadata_bytes) = metadata_bytes {
         let res = write_header(&mut output, "\0META", metadata_bytes.len() as u32).await;
         if res.is_err() {
@@ -472,7 +460,7 @@ pub async fn pack(
             return;
         }
     }
-    // 写入文件
+    // write files
     for file in files.iter_mut() {
         println!("Writing file: {}", file.name);
         let res = write_file(&mut output, file).await;
@@ -481,7 +469,7 @@ pub async fn pack(
             return;
         }
     }
-    // 刷新
+    // flush
     println!("Finalizing...");
     let res = output.flush().await;
     if res.is_err() {
@@ -514,7 +502,7 @@ pub fn get_header_size(name: &str) -> usize {
 
 pub fn index_to_bin(index: &[(String, u32, u32)]) -> Vec<u8> {
     let mut data = vec![];
-    // u8：名称长度；可变长度名称；u32：大小；u32：偏移量
+    // u8: name_len var: name u32: size u32: offset
     for (name, size, offset) in index.iter() {
         let name = name.as_bytes();
         let name_len = name.len() as u8;
@@ -551,6 +539,14 @@ pub async fn write_file(
     Ok(())
 }
 
+/// 嵌入安装包的元数据：去掉 packing_info 后按键排序再序列化。
+fn embed_metadata_bytes(mut metadata: RepoMetadata) -> Vec<u8> {
+    metadata.packing_info.clear();
+    let mut metadata = serde_json::json!(metadata);
+    metadata.sort_all_objects();
+    serde_json::to_string(&metadata).unwrap().into_bytes()
+}
+
 fn get_file_pack_priority(
     file_name: &str,
     packing_info: Option<&Vec<Vec<String>>>,
@@ -566,4 +562,179 @@ fn get_file_pack_priority(
 
     // 未分类的文件放在最后，使用原有的字母排序
     (5, file_name.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::embed_metadata_bytes;
+    use crate::utils::metadata::{FileMeta, InstallerInfo, PatchInfo, PatchSide, RepoMetadata};
+    use serde::Serialize;
+
+    /// 合并前写出镜像的 serde 属性（`Option` 字段、`assets`），对照嵌入 JSON 字节。
+    #[derive(Serialize)]
+    struct LegacyFile {
+        file_name: String,
+        size: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        md5: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        xxh: Option<String>,
+    }
+
+    #[derive(Serialize)]
+    struct LegacyPatchSide {
+        size: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        md5: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        xxh: Option<String>,
+    }
+
+    #[derive(Serialize)]
+    struct LegacyPatch {
+        file_name: String,
+        size: u64,
+        from: LegacyPatchSide,
+        to: LegacyPatchSide,
+    }
+
+    #[derive(Serialize)]
+    struct LegacyInstaller {
+        size: u64,
+        md5: Option<String>,
+        xxh: Option<String>,
+    }
+
+    #[derive(Serialize)]
+    struct LegacyRepo {
+        repo_name: String,
+        tag_name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        assets: Option<Vec<LegacyFile>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hashed: Option<Vec<LegacyFile>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        patches: Option<Vec<LegacyPatch>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        installer: Option<LegacyInstaller>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        deletes: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        packing_info: Option<Vec<Vec<String>>>,
+    }
+
+    fn legacy_embed(mut metadata: LegacyRepo) -> Vec<u8> {
+        metadata.packing_info = None;
+        let mut metadata = serde_json::json!(metadata);
+        metadata.sort_all_objects();
+        serde_json::to_string(&metadata).unwrap().into_bytes()
+    }
+
+    fn file(name: &str, size: u64, xxh: &str) -> (FileMeta, LegacyFile) {
+        (
+            FileMeta {
+                file_name: name.into(),
+                size,
+                md5: None,
+                xxh: Some(xxh.into()),
+                installer: None,
+            },
+            LegacyFile {
+                file_name: name.into(),
+                size,
+                md5: None,
+                xxh: Some(xxh.into()),
+            },
+        )
+    }
+
+    #[test]
+    fn pack_embed_matches_legacy_after_strip() {
+        let (hashed, legacy_hashed) = file("app.exe", 12, "abcd");
+        let new_bytes = embed_metadata_bytes(RepoMetadata {
+            tag_name: "v1.0.0".into(),
+            hashed: vec![hashed],
+            patches: Vec::new(),
+            installer: None,
+            deletes: Vec::new(),
+            repo_name: "demo".into(),
+            packing_info: vec![vec!["abcd".into()], vec![], vec![], vec![], vec![]],
+        });
+        let old_bytes = legacy_embed(LegacyRepo {
+            repo_name: "demo".into(),
+            tag_name: "v1.0.0".into(),
+            assets: None,
+            hashed: Some(vec![legacy_hashed]),
+            patches: None,
+            installer: None,
+            deletes: None,
+            packing_info: Some(vec![vec!["abcd".into()], vec![], vec![], vec![], vec![]]),
+        });
+        assert_eq!(
+            String::from_utf8_lossy(&new_bytes),
+            String::from_utf8_lossy(&old_bytes)
+        );
+    }
+
+    #[test]
+    fn pack_embed_matches_legacy_with_patches_and_installer() {
+        let (hashed, legacy_hashed) = file("app.exe", 12, "abcd");
+        let new_bytes = embed_metadata_bytes(RepoMetadata {
+            tag_name: "v2".into(),
+            hashed: vec![hashed],
+            patches: vec![PatchInfo {
+                file_name: "app.exe".into(),
+                size: 4,
+                from: PatchSide {
+                    size: 10,
+                    md5: None,
+                    xxh: Some("from".into()),
+                },
+                to: PatchSide {
+                    size: 12,
+                    md5: None,
+                    xxh: Some("abcd".into()),
+                },
+            }],
+            installer: Some(InstallerInfo {
+                size: 8,
+                md5: None,
+                xxh: Some("upd".into()),
+            }),
+            deletes: vec!["old.txt".into()],
+            repo_name: "demo".into(),
+            packing_info: vec![vec![], vec![], vec![], vec!["p".into()], vec![]],
+        });
+        let old_bytes = legacy_embed(LegacyRepo {
+            repo_name: "demo".into(),
+            tag_name: "v2".into(),
+            assets: None,
+            hashed: Some(vec![legacy_hashed]),
+            patches: Some(vec![LegacyPatch {
+                file_name: "app.exe".into(),
+                size: 4,
+                from: LegacyPatchSide {
+                    size: 10,
+                    md5: None,
+                    xxh: Some("from".into()),
+                },
+                to: LegacyPatchSide {
+                    size: 12,
+                    md5: None,
+                    xxh: Some("abcd".into()),
+                },
+            }]),
+            installer: Some(LegacyInstaller {
+                size: 8,
+                md5: None,
+                xxh: Some("upd".into()),
+            }),
+            deletes: Some(vec!["old.txt".into()]),
+            packing_info: Some(vec![vec![], vec![], vec![], vec!["p".into()], vec![]]),
+        });
+        assert_eq!(
+            String::from_utf8_lossy(&new_bytes),
+            String::from_utf8_lossy(&old_bytes)
+        );
+    }
 }

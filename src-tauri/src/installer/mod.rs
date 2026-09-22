@@ -39,6 +39,100 @@ pub struct SelectDirRes {
     pub upgrade: bool,
 }
 
+/// 安装器会话对目标目录的全部认知。GUI / 原生 `UiState.path`、`Settings.elevate`、
+/// `Settings.is_update` 与目录选择器共用同一份判定；路径是已存在的文件时返回 `None`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirProbe {
+    pub exists: bool,
+    pub empty: bool,
+    /// 项目 exe 已经在该目录里。
+    pub upgrade: bool,
+    pub writable: bool,
+    pub private: bool,
+}
+
+impl DirProbe {
+    pub fn state(&self) -> DirState {
+        if !self.writable {
+            DirState::Unwritable
+        } else if self.private {
+            DirState::Private
+        } else {
+            DirState::Writable
+        }
+    }
+}
+
+/// `C:\` / `D:/` 这类盘根：盘根永远不能作为安装目录——它无法被整体改名或删除，
+/// 卸载它会扫掉整个卷。
+pub fn is_drive_root(path: &str) -> bool {
+    let n = path.replace('\\', "/");
+    let n = n.trim_end_matches('/');
+    n.len() == 2 && n.as_bytes()[1] == b':' && n.as_bytes()[0].is_ascii_alphabetic()
+}
+
+/// 可写性用「在目录里建一个探针文件再删掉」判定；目录还不存在时用最近的存在祖先。
+/// 已存在的文件、盘根、自身是重解析点（junction / symlink）的路径都返回 `None`：
+/// 这些路径在任何把探测结果喂给 `Settings` 的地方都必须被拒绝。
+pub fn probe_dir(path: &std::path::Path, exe_name: &str) -> Option<DirProbe> {
+    if path.is_file() || is_drive_root(&path.to_string_lossy()) {
+        return None;
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() || crate::fs::commit::is_reparse(&meta) {
+            return None;
+        }
+    }
+    let exists = path.is_dir();
+    let (empty, upgrade) = if exists {
+        let upgrade = !exe_name.is_empty() && path.join(exe_name).is_file();
+        let empty = !upgrade
+            && std::fs::read_dir(path)
+                .map(|mut it| it.next().is_none())
+                .unwrap_or(true);
+        (empty, upgrade)
+    } else {
+        (true, false)
+    };
+    let writable = path
+        .ancestors()
+        .find(|p| p.is_dir())
+        .is_some_and(can_create_probe_file);
+    Some(DirProbe {
+        exists,
+        empty,
+        upgrade,
+        writable,
+        private: in_private_folder(path),
+    })
+}
+
+fn can_create_probe_file(dir: &std::path::Path) -> bool {
+    let p = dir.join(format!(".kachina-write-probe-{}", std::process::id()));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&p)
+    {
+        Ok(f) => {
+            drop(f);
+            let _ = std::fs::remove_file(&p);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+pub async fn inspect_dir(pathstr: String, exe_name: String) -> Option<SelectDirRes> {
+    let probe = probe_dir(std::path::Path::new(&pathstr), &exe_name)?;
+    Some(SelectDirRes {
+        path: pathstr,
+        state: probe.state(),
+        empty: probe.empty,
+        upgrade: probe.upgrade,
+    })
+}
+
 pub async fn select_dir(
     path: String,
     exe_name: String,

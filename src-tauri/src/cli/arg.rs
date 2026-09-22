@@ -23,6 +23,9 @@ pub struct InstallArgs {
     // 相关实现：override mirrorc cdk
     #[clap(long, hide = true)]
     pub mirrorc_cdk: Option<String>,
+    /// 把安装会话的完整状态写到这个目录（仅供开发 / 测试）。
+    #[clap(long = "dump-dir", hide = true)]
+    pub dump_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, clap::Args)]

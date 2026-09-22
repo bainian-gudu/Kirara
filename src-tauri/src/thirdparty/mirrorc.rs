@@ -5,6 +5,7 @@ use anyhow::Context;
 use crate::{
     fs::{create_http_stream, create_staged_file, progressed_copy},
     installer::uninstall::is_safe_relative_member,
+    ipc_v2::{Progress, ProgressNotify},
     utils::{
         error::{return_ta_result, IntoTAResult, TAResult},
         metadata::RepoMetadata,
@@ -29,6 +30,13 @@ pub struct MirrorcChangeset {
     pub added: Option<Vec<String>>,
     pub deleted: Option<Vec<String>>,
     pub modified: Option<Vec<String>>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, Default)]
+pub struct MirrorcExtract {
+    pub metadata: Option<String>,
+    pub files: Vec<(String, String)>,
+    pub deletes: Vec<String>,
 }
 
 pub async fn run_mirrorc_install(
@@ -190,14 +198,14 @@ fn run_mirrorc_install_inner(
         }
     }
     if let Some(metadata) = metadata.as_ref() {
-        if let Some(deletes) = metadata.deletes.as_ref() {
-            for file in deletes {
-                if !is_safe_relative_member(target_root, file) {
-                    tracing::warn!("跳过不安全的 metadata 删除路径: {file}");
-                    continue;
-                }
-                all_deletes.push(file.clone());
+        // 新版 `RepoMetadata` 把可选清单改成默认空表：`deletes` / `hashed` /
+        // `patches` / `packing_info` 都不再是 `Option`。
+        for file in &metadata.deletes {
+            if !is_safe_relative_member(target_root, file) {
+                tracing::warn!("跳过不安全的 metadata 删除路径: {file}");
+                continue;
             }
+            all_deletes.push(file.clone());
         }
     }
     all_deletes.sort();
@@ -278,6 +286,230 @@ pub async fn run_mirrorc_download(
         }
     }
     Ok(())
+}
+
+pub async fn run_mirrorc_download_v2(
+    zip_path: &str,
+    url: &str,
+    sha256: Option<&str>,
+    notify: ProgressNotify,
+) -> TAResult<()> {
+    let (stream, len, _insight) = create_http_stream(url, 0, 0, true).await?;
+    let target = create_staged_file(zip_path).await?;
+    progressed_copy(stream, target, |downloaded| {
+        notify(Progress::BytesOf {
+            done: downloaded as u64,
+            total: len,
+        });
+    })
+    .await
+    .context("MIRRORC_DOWNLOAD_ERR")?;
+    if let Some(expected) = sha256.map(str::trim).filter(|value| !value.is_empty()) {
+        let actual = crate::utils::hash::hash_file("sha256", zip_path)
+            .into_ta_result()
+            .context("MIRRORC_HASH_ERR")?;
+        if !actual.eq_ignore_ascii_case(expected) {
+            let _ = tokio::fs::remove_file(zip_path).await;
+            return return_ta_result(
+                format!("Mirrorc archive digest mismatch: expected {expected}, got {actual}"),
+                "MIRRORC_HASH_ERR",
+            );
+        }
+    }
+    Ok(())
+}
+
+/// 新会话层使用的 Mirror酱归档解包：只写入 staging 的 `new\`，返回文件哈希、
+/// 删除清单和 `.metadata.json` 原文，供 journal 阶段统一提交。
+pub async fn run_mirrorc_install_v2(
+    zip_path: &str,
+    new_dir: &str,
+    sha256: &str,
+    notify: ProgressNotify,
+) -> TAResult<MirrorcExtract> {
+    let zip_path = zip_path.to_string();
+    let new_dir = new_dir.to_string();
+    let sha256 = sha256.to_string();
+    tokio::task::spawn_blocking(move || {
+        run_mirrorc_install_v2_sync(&zip_path, &new_dir, &sha256, notify)
+    })
+    .await
+    .into_ta_result()?
+}
+
+fn run_mirrorc_install_v2_sync(
+    zip_path: &str,
+    new_dir: &str,
+    sha256: &str,
+    notify: ProgressNotify,
+) -> TAResult<MirrorcExtract> {
+    if !sha256.trim().is_empty() {
+        let actual = crate::utils::hash::hash_file("sha256", zip_path)
+            .into_ta_result()
+            .context("MIRRORC_HASH_ERR")?;
+        if !actual.eq_ignore_ascii_case(sha256.trim()) {
+            let _ = std::fs::remove_file(zip_path);
+            return return_ta_result(
+                format!(
+                    "Mirrorc archive digest mismatch: expected {}, got {actual}",
+                    sha256.trim()
+                ),
+                "MIRRORC_HASH_ERR",
+            );
+        }
+    }
+
+    let file = std::fs::File::open(zip_path).into_ta_result()?;
+    let mut archive = zip::ZipArchive::new(file).into_ta_result()?;
+    let total_len = archive.len();
+    let new_root = std::path::Path::new(new_dir);
+    if !new_root.is_absolute() || crate::installer::uninstall::has_reparse_point(new_root) {
+        return return_ta_result(
+            "Invalid or unsafe mirrorc target path".to_string(),
+            "MIRRORC_TARGET_ERR",
+        );
+    }
+
+    let mut file_lists = Vec::with_capacity(total_len);
+    for index in 0..total_len {
+        let entry = archive.by_index(index).into_ta_result()?;
+        let name = decode_entry_name(entry.name_raw());
+        if name != "changes.json" && name != ".metadata.json" {
+            file_lists.push(name);
+        }
+    }
+    let mut prefix = longest_common_prefix(file_lists);
+    if let Some((head, _)) = prefix.rsplit_once('/') {
+        prefix = format!("{head}/");
+    } else {
+        prefix.clear();
+    }
+
+    let changeset: Option<MirrorcChangeset> = match archive.by_name("changes.json") {
+        Ok(mut entry) => {
+            let mut text = String::new();
+            entry.read_to_string(&mut text).into_ta_result()?;
+            Some(serde_json::from_str(&text).into_ta_result()?)
+        }
+        Err(_) => None,
+    };
+    let metadata_text: Option<String> =
+        match archive.by_name(&format!("{prefix}.metadata.json")) {
+            Ok(mut entry) => {
+                let mut text = String::new();
+                entry.read_to_string(&mut text).into_ta_result()?;
+                let _: RepoMetadata = serde_json::from_str(&text).into_ta_result()?;
+                Some(text)
+            }
+            Err(_) => None,
+        };
+    let metadata: Option<RepoMetadata> = metadata_text
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .into_ta_result()?;
+    if changeset.is_none() && metadata.is_none() {
+        return return_ta_result(
+            "Not a valid mirrorc archive: neither changes.json nor .metadata.json found"
+                .to_string(),
+            "MIRRORC_ARCHIVE_ERR",
+        );
+    }
+
+    let mut files = Vec::new();
+    for index in 0..total_len {
+        let mut entry = archive.by_index(index).into_ta_result()?;
+        let raw_name = decode_entry_name(entry.name_raw());
+        let file_name = raw_name
+            .strip_prefix(&prefix)
+            .unwrap_or(&raw_name)
+            .replace('\\', "/");
+        if file_name == "changes.json"
+            || file_name == ".metadata.json"
+            || file_name == format!("{prefix}.metadata.json")
+            || file_name.is_empty()
+        {
+            continue;
+        }
+        if !is_safe_relative_member(new_root, &file_name)
+            || !crate::fs::staging::is_safe_rel(&file_name)
+        {
+            return return_ta_result(
+                format!("Unsafe archive member path: {file_name}"),
+                "MIRRORC_ARCHIVE_PATH_ERR",
+            );
+        }
+        if entry.is_dir() {
+            continue;
+        }
+        let out_path = crate::fs::staging::join_rel(new_root, &file_name);
+        if crate::installer::uninstall::has_reparse_point(&out_path) {
+            return return_ta_result(
+                format!("Archive output path is a reparse point: {}", out_path.display()),
+                "MIRRORC_ARCHIVE_PATH_ERR",
+            );
+        }
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)
+                .into_ta_result()
+                .context("CREATE_DIR_ERR")?;
+        }
+        let mut out_file = std::fs::File::create(&out_path)
+            .into_ta_result()
+            .context(format!("CREATE_FILE_ERR: {}", out_path.display()))?;
+        std::io::copy(&mut entry, &mut out_file)
+            .into_ta_result()
+            .context(format!("WRITE_FILE_ERR: {}", out_path.display()))?;
+        out_file
+            .sync_all()
+            .into_ta_result()
+            .context(format!("SYNC_FILE_ERR: {}", out_path.display()))?;
+        let md5 = crate::utils::hash::hash_file(
+            "md5",
+            out_path.to_string_lossy().as_ref(),
+        )
+        .into_ta_result()
+        .context("MIRRORC_HASH_ERR")?;
+        files.push((file_name, md5));
+        notify(Progress::Extract {
+            file: raw_name,
+            done: (index + 1) as u64,
+            total: total_len as u64,
+        });
+    }
+
+    let mut deletes = Vec::new();
+    if let Some(changeset) = changeset.as_ref() {
+        for file in changeset.deleted.as_deref().unwrap_or_default() {
+            let relative = file.strip_prefix(&prefix).unwrap_or(file);
+            if !is_safe_relative_member(new_root, relative)
+                || !crate::fs::staging::is_safe_rel(relative)
+            {
+                tracing::warn!("跳过不安全的 Mirrorc 删除路径: {relative}");
+                continue;
+            }
+            deletes.push(relative.replace('\\', "/"));
+        }
+    }
+    if let Some(metadata) = metadata.as_ref() {
+        for file in &metadata.deletes {
+            if !is_safe_relative_member(new_root, file)
+                || !crate::fs::staging::is_safe_rel(file)
+            {
+                tracing::warn!("跳过不安全的 metadata 删除路径: {file}");
+                continue;
+            }
+            deletes.push(file.replace('\\', "/"));
+        }
+    }
+    deletes.sort();
+    deletes.dedup();
+    let _ = std::fs::remove_file(zip_path);
+    Ok(MirrorcExtract {
+        metadata: metadata_text,
+        files,
+        deletes,
+    })
 }
 
 pub fn longest_common_prefix(strs: Vec<String>) -> String {

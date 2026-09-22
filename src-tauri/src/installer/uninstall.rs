@@ -98,23 +98,29 @@ pub struct RegistryCleanupItem {
 
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
 pub struct RunUninstallArgs {
-    source: String,
-    files: Vec<String>,
-    user_data_path: Vec<String>,
-    extra_uninstall_path: Vec<String>,
-    reg_name: String,
-    uninstall_name: String,
+    pub source: String,
+    pub files: Vec<String>,
+    pub user_data_path: Vec<String>,
+    pub extra_uninstall_path: Vec<String>,
+    pub reg_name: String,
+    pub uninstall_name: String,
     /// 额外注册表清理（安装时写入的自启动等项）。旧版前端不会传，故给默认值。
     #[serde(default)]
-    extra_uninstall_registry: Vec<RegistryCleanupItem>,
+    pub extra_uninstall_registry: Vec<RegistryCleanupItem>,
     /// 额外计划任务清理（「开机自启动 + 自动管理员」组合登记的登录任务，见
     /// `src/Host/Autostart.cs`）。旧版前端不会传，故给默认值。
     #[serde(default)]
-    extra_uninstall_scheduled_tasks: Vec<String>,
+    pub extra_uninstall_scheduled_tasks: Vec<String>,
     /// 尽力删除的路径（安装期由宿主自建/改名的快捷方式等）。
     /// 与 `extra_uninstall_path` 的区别：删不掉只记日志，绝不让卸载失败。
     #[serde(default)]
-    extra_uninstall_shortcuts: Vec<String>,
+    pub extra_uninstall_shortcuts: Vec<String>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, Default)]
+pub struct UninstallOutcome {
+    pub errors: Vec<String>,
+    pub self_moved_to: Option<String>,
 }
 pub async fn run_uninstall_with_args(args: RunUninstallArgs) -> TAResult<Vec<String>> {
     run_uninstall(
@@ -129,6 +135,102 @@ pub async fn run_uninstall_with_args(args: RunUninstallArgs) -> TAResult<Vec<Str
         args.extra_uninstall_shortcuts,
     )
     .await
+}
+
+pub async fn run_uninstall_with_args_v2(args: RunUninstallArgs) -> TAResult<UninstallOutcome> {
+    let errors = run_uninstall_with_args(args).await?;
+    let self_moved_to = DELETE_SELF_ON_EXIT_PATH
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    Ok(UninstallOutcome {
+        errors,
+        self_moved_to,
+    })
+}
+
+/// 将安装器自身镜像（卸载器 / 更新器）写入 staging 的 `new\`，只返回提交阶段
+/// 需要的文件单元信息，不触碰安装目录。
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
+pub struct StageSelfImageArgs {
+    pub install_dir: String,
+    pub new_dir: String,
+    pub hash_algorithm: String,
+    pub names: Vec<String>,
+    pub copy_from: Option<String>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct StagedImage {
+    pub rel: String,
+    pub hash: String,
+    pub old: Option<String>,
+    pub unchanged: bool,
+}
+
+pub async fn stage_self_image(args: StageSelfImageArgs) -> TAResult<Vec<StagedImage>> {
+    let new_dir = Path::new(&args.new_dir);
+    let install = Path::new(&args.install_dir);
+    let mut out = Vec::new();
+    for name in &args.names {
+        if !crate::fs::staging::is_safe_rel(name) {
+            return Err(anyhow::Error::from(crate::utils::code::Coded::bare(
+                crate::utils::code::FILE_IO_FAILED,
+            ))
+            .into());
+        }
+        let staged = crate::fs::staging::join_rel(new_dir, name);
+        if let Some(parent) = staged.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .context("CREATE_DIR_ERR")?;
+        }
+        match &args.copy_from {
+            Some(source) => {
+                tokio::fs::copy(source, &staged)
+                    .await
+                    .context("CREATE_UPDATER_ERR")?;
+            }
+            None => {
+                let mut image = crate::local::get_base_with_config().await?;
+                let file = tokio::fs::File::create(&staged)
+                    .await
+                    .context("CREATE_UNINSTALLER_ERR")?;
+                let mut writer = tokio::io::BufWriter::new(file);
+                tokio::io::copy(&mut image, &mut writer)
+                    .await
+                    .context("CREATE_UNINSTALLER_ERR")?;
+                writer.flush().await.context("CREATE_UNINSTALLER_ERR")?;
+                drop(writer);
+                clear_index_mark(&staged).await?;
+            }
+        }
+        let staged_text = staged.to_string_lossy();
+        crate::fs::sync_staged_file(&staged_text).await?;
+        let hash = crate::utils::hash::run_hash(&args.hash_algorithm, &staged_text).await?;
+        let existing = crate::fs::staging::join_rel(install, name);
+        let old = if existing.is_file() {
+            crate::utils::hash::run_hash(
+                &args.hash_algorithm,
+                &existing.to_string_lossy(),
+            )
+            .await
+            .ok()
+        } else {
+            None
+        };
+        let unchanged = old.as_deref() == Some(hash.as_str());
+        if unchanged {
+            let _ = tokio::fs::remove_file(&staged).await;
+        }
+        out.push(StagedImage {
+            rel: name.replace('\\', "/"),
+            hash,
+            old,
+            unchanged,
+        });
+    }
+    Ok(out)
 }
 
 /// 删整棵子键时禁止命中的「共享容器」键名（大写比较）。
@@ -1172,11 +1274,11 @@ pub async fn run_uninstall(
 /// 只应在确实需要删除该文件/目录的那一刻调用：C9 提交成功后旧镜像在暂存目录的
 /// `old\` 下，这份备份就是旧版本的最后一份拷贝，**失败路径登记它等于把更新器删掉**。
 /// 因此写入点只有两个——提交/恢复全部成功之后，以及卸载器把自己挪进 %TEMP% 之后。
-pub fn schedule_delete_on_exit(path: &Path) {
+pub fn schedule_delete_on_exit(path: impl AsRef<Path>) {
     DELETE_SELF_ON_EXIT_PATH
         .write()
         .unwrap()
-        .replace(path.to_string_lossy().to_string());
+        .replace(path.as_ref().to_string_lossy().to_string());
 }
 
 pub fn delete_self_on_exit() {

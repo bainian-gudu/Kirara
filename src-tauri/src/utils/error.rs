@@ -183,4 +183,10 @@ impl TACommandError {
 
         Self { error, insight }
     }
+
+    /// 上游在这里上报错误并返回事件 id。本项目已移除遥测，保留接口形状，
+    /// 只让错误继续沿本地日志和 UI 呈现。
+    pub fn report_if_needed(&self) -> Option<String> {
+        None
+    }
 }

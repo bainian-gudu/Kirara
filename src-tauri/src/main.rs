@@ -7,9 +7,10 @@ pub mod dfs;
 pub mod fs;
 pub mod host;
 pub mod installer;
-pub mod ipc;
+pub mod ipc_v2;
 pub mod local;
 pub mod module;
+pub mod session;
 pub mod thirdparty;
 pub mod utils;
 use clap::Parser;
@@ -152,7 +153,7 @@ fn main() {
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(ipc::manager::uac_ipc_main(args));
+                .block_on(ipc_v2::manager::uac_ipc_main(args));
         }
         Command::InstallWebview2 => {
             tracing::info!("KachinaInstaller started as Webview2 Installer");
@@ -185,6 +186,7 @@ fn main() {
                     source: None,
                     dfs_extras: None,
                     mirrorc_cdk: None,
+                    dump_dir: None,
                 }));
         }
     }

@@ -109,25 +109,47 @@ pub async fn write_registry_raw(
 }
 
 pub async fn read_uninstall_metadata(reg_name: String) -> TAResult<Value> {
+    read_uninstall_metadata_raw(&reg_name, None)
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).context("GET_INSTALLMETA_ERR"))
+        .into_ta_result()
+}
+
+/// 返回注册表里 `InstallerMeta` 的原始 JSON 文本。
+///
+/// 新会话层自己决定反序列化目标，避免先解成 `Value` 再二次解析。
+pub fn read_uninstall_metadata_raw(
+    reg_name: &str,
+    install_path: Option<&str>,
+) -> Result<String> {
     let key_path = format!("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{reg_name}");
-
-    // 先尝试 HKLM，不存在时再尝试 HKCU
-    let key = windows_registry::LOCAL_MACHINE
-        .options()
-        .read()
-        .open(&key_path)
-        .or_else(|_| {
-            windows_registry::CURRENT_USER
-                .options()
-                .read()
-                .open(&key_path)
-        })
-        .context("GET_INSTALLMETA_ERR")?;
-
-    let metadata: String = key
-        .get_string("InstallerMeta")
-        .context("GET_INSTALLMETA_ERR")?;
-
-    let metadata: Value = serde_json::from_str(&metadata).context("GET_INSTALLMETA_ERR")?;
-    Ok(metadata)
+    let hives = [
+        windows_registry::LOCAL_MACHINE,
+        windows_registry::CURRENT_USER,
+    ];
+    let mut fallback = None;
+    for hive in hives {
+        let Ok(key) = hive.options().read().open(&key_path) else {
+            continue;
+        };
+        let Ok(metadata) = key.get_string("InstallerMeta") else {
+            continue;
+        };
+        if serde_json::from_str::<serde::de::IgnoredAny>(&metadata).is_err() {
+            continue;
+        }
+        if let Some(want) = install_path {
+            let location = key.get_string("InstallLocation").unwrap_or_default();
+            if !location.is_empty()
+                && location
+                    .trim_end_matches(['\\', '/'])
+                    .eq_ignore_ascii_case(want.trim_end_matches(['\\', '/']))
+            {
+                return Ok(metadata);
+            }
+        }
+        if fallback.is_none() {
+            fallback = Some(metadata);
+        }
+    }
+    fallback.context("GET_INSTALLMETA_ERR")
 }

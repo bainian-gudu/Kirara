@@ -236,12 +236,16 @@ pub fn attach(
         webview.add_NavigationCompleted(
             &NavigationCompletedEventHandler::create(Box::new(move |_sender, args| {
                 let mut success = windows::core::BOOL::default();
+                let mut status = COREWEBVIEW2_WEB_ERROR_STATUS::default();
                 if let Some(args) = args {
                     let _ = args.IsSuccess(&mut success);
+                    let _ = args.WebErrorStatus(&mut status);
                 }
                 if !success.as_bool() {
+                    tracing::error!("native host: navigation failed (web error status {status:?})");
                     return Ok(());
                 }
+                tracing::info!("native host: navigation completed");
                 let pending = {
                     let mut gate = posts_for_navigation.borrow_mut();
                     gate.ready = true;
@@ -374,13 +378,17 @@ fn handle_resource(
     };
     let path = path.split('?').next().unwrap_or(path);
     let Some((bytes, mime)) = assets::lookup(path) else {
+        tracing::warn!("native host: asset not found for {uri}");
         if let Ok(response) = make_response(environment, b"not found", 404, "text/plain") {
             let _ = unsafe { args.SetResponse(&response) };
         }
         return;
     };
+    tracing::info!("native host: serving {path} ({} bytes)", bytes.len());
     if let Ok(response) = make_response(environment, bytes, 200, mime) {
         let _ = unsafe { args.SetResponse(&response) };
+    } else {
+        tracing::error!("native host: failed to build response for {path}");
     }
 }
 

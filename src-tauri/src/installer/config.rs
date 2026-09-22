@@ -21,11 +21,13 @@ pub struct InstallerConfig {
     pub embedded_files: Option<Vec<Embedded>>,
     pub embedded_index: Option<Vec<Embedded>>,
     pub embedded_config: Option<Value>,
-    pub enbedded_metadata: Option<Value>,
+    pub enbedded_metadata: Option<crate::utils::metadata::RepoMetadata>,
     pub embedded_image: Option<String>,
     pub exe_path: String,
     pub args: crate::cli::arg::InstallArgs,
     pub elevated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preset: Option<crate::session::types::SessionInput>,
 }
 
 pub async fn get_config_pre(
@@ -44,7 +46,12 @@ pub async fn get_config_pre(
         if let Ok(embedded_files_res) = get_embedded(file).await {
             if let Ok(res) = get_config_from_embedded(&embedded_files_res).await {
                 embedded_config = res.0;
-                enbedded_metadata = res.1;
+                enbedded_metadata = match res.1 {
+                    Some(value) => Some(
+                        serde_json::from_value(value).context("EMBEDDED_METADATA_PARSE_ERR")?,
+                    ),
+                    None => None,
+                };
                 embedded_index = res.2;
                 embedded_image = res.3;
             }
@@ -120,6 +127,7 @@ pub async fn get_config_pre(
         exe_path,
         args,
         elevated: check_elevated().unwrap_or(false),
+        preset: None,
     })
 }
 
@@ -256,4 +264,15 @@ pub async fn get_installer_config(args: &InstallArgs, scan_exe: bool) -> TAResul
     }
 
     Ok(config.fill(&program_files_real_path, false, "DEFAULT"))
+}
+
+/// 会话层使用的配置解析入口。保留旧 `get_installer_config` 的 Tauri 错误类型，
+/// 新会话只关心 anyhow 链，避免把旧 IPC 的错误包装泄漏到 `session/`。
+pub async fn resolve_installer_config(
+    args: InstallArgs,
+    scan_exe: bool,
+) -> anyhow::Result<InstallerConfig> {
+    get_installer_config(&args, scan_exe)
+        .await
+        .map_err(|error| error.error)
 }

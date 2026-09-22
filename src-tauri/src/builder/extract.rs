@@ -1,11 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use fmmap::tokio::{AsyncMmapFile, AsyncMmapFileExt};
 
 use crate::{
     cli::ExtractArgs,
-    local::{get_embedded, Embedded},
+    local::{get_embedded, preferred_file_hash, Embedded},
     utils::metadata::RepoMetadata,
 };
 
@@ -22,6 +22,7 @@ enum FileType {
     Config,
     Image,
     Meta,
+    Index,
     File,
     Patch,
 }
@@ -32,6 +33,7 @@ impl std::fmt::Display for FileType {
             FileType::Config => write!(f, "CONFIG"),
             FileType::Image => write!(f, "IMAGE"),
             FileType::Meta => write!(f, "META"),
+            FileType::Index => write!(f, "INDEX"),
             FileType::File => write!(f, "FILE"),
             FileType::Patch => write!(f, "PATCH"),
         }
@@ -51,6 +53,9 @@ fn validate_args(args: &ExtractArgs) -> Result<(), String> {
     .filter(|&&x| x)
     .count();
 
+    if feature_count == 0 {
+        return Err("Specify one of --list, --all, --name, or --meta-name".to_string());
+    }
     if feature_count > 1 {
         return Err("Only one extraction mode can be used at a time".to_string());
     }
@@ -75,7 +80,7 @@ fn validate_args(args: &ExtractArgs) -> Result<(), String> {
     Ok(())
 }
 
-// 解析元数据功能
+// 解析metadata功能
 async fn parse_metadata(file: &AsyncMmapFile) -> Result<Option<RepoMetadata>, String> {
     let embedded = get_embedded(file).await.map_err(|e| e.to_string())?;
 
@@ -107,37 +112,58 @@ fn classify_file_type(name: &str) -> FileType {
         "\0CONFIG" => FileType::Config,
         "\0IMAGE" => FileType::Image,
         "\0META" => FileType::Meta,
+        "\0INDEX" => FileType::Index,
         name if name.contains('_') && !name.starts_with('\0') => FileType::Patch,
         _ => FileType::File,
     }
 }
 
-// 构建哈希到文件名的映射
-fn build_hash_to_name_map(metadata: &RepoMetadata) -> HashMap<String, String> {
+/// hash → 所有声明该数据块的目标路径。相同内容只保存一个数据块，所以一个
+/// hash 可以对应多个安装路径；补丁块不进这张表，避免占用完整文件的路径。
+fn build_hash_to_names_map(metadata: &RepoMetadata) -> HashMap<String, Vec<String>> {
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    for file in &metadata.hashed {
+        if let Some(hash) = preferred_file_hash(&file.md5, &file.xxh) {
+            let names = map.entry(hash.clone()).or_default();
+            if !names.contains(&file.file_name) {
+                names.push(file.file_name.clone());
+            }
+        }
+    }
+    map
+}
+
+/// 补丁块名 → 文件名，仅用于 `--list` 展示；导出路径规划不使用它。
+fn build_patch_display_map(metadata: &RepoMetadata) -> HashMap<String, String> {
     let mut map = HashMap::new();
-
-    // 处理普通文件
-    if let Some(hashed) = &metadata.hashed {
-        for file in hashed {
-            if let Some(hash) = file.xxh.as_ref().or(file.md5.as_ref()) {
-                map.insert(hash.clone(), file.file_name.clone());
-            }
+    for patch in &metadata.patches {
+        let from_hash = preferred_file_hash(&patch.from.md5, &patch.from.xxh);
+        let to_hash = preferred_file_hash(&patch.to.md5, &patch.to.xxh);
+        if let (Some(from), Some(to)) = (from_hash, to_hash) {
+            map.insert(format!("{from}_{to}"), patch.file_name.clone());
         }
     }
+    map
+}
 
-    // 处理补丁文件
-    if let Some(patches) = &metadata.patches {
-        for patch in patches {
-            let from_hash = patch.from.xxh.as_ref().or(patch.from.md5.as_ref());
-            let to_hash = patch.to.xxh.as_ref().or(patch.to.md5.as_ref());
-
-            if let (Some(from), Some(to)) = (from_hash, to_hash) {
-                let patch_name = format!("{}_{}", from, to);
-                map.insert(patch_name, patch.file_name.clone());
-            }
+/// name → hash，供 `--meta-name` 反查。完整文件优先于补丁块：同名时
+/// `--meta-name` 应还原完整数据而不是补丁内容。
+fn build_name_to_hash_map(metadata: &RepoMetadata) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for file in &metadata.hashed {
+        if let Some(hash) = preferred_file_hash(&file.md5, &file.xxh) {
+            map.entry(file.file_name.clone())
+                .or_insert_with(|| hash.clone());
         }
     }
-
+    for patch in &metadata.patches {
+        let from_hash = preferred_file_hash(&patch.from.md5, &patch.from.xxh);
+        let to_hash = preferred_file_hash(&patch.to.md5, &patch.to.xxh);
+        if let (Some(from), Some(to)) = (from_hash, to_hash) {
+            map.entry(patch.file_name.clone())
+                .or_insert_with(|| format!("{from}_{to}"));
+        }
+    }
     map
 }
 
@@ -148,16 +174,16 @@ async fn collect_file_info(file: &AsyncMmapFile) -> Result<Vec<FileInfo>, String
 
     let mut file_infos = Vec::new();
 
-    // 构建哈希到元数据 名称的映射
-    let hash_to_name = if let Some(ref meta) = metadata {
-        build_hash_to_name_map(meta)
-    } else {
-        HashMap::new()
-    };
+    let hash_to_names = metadata.as_ref().map(build_hash_to_names_map);
+    let patch_names = metadata.as_ref().map(build_patch_display_map);
 
     for emb in embedded {
         let file_type = classify_file_type(&emb.name);
-        let metadata_name = hash_to_name.get(&emb.name).cloned();
+        let metadata_name = hash_to_names
+            .as_ref()
+            .and_then(|m| m.get(&emb.name))
+            .and_then(|names| names.first().cloned())
+            .or_else(|| patch_names.as_ref().and_then(|m| m.get(&emb.name)).cloned());
 
         file_infos.push(FileInfo {
             file_type,
@@ -190,10 +216,11 @@ fn format_file_size(size: usize) -> String {
 
 // 字符串截断
 fn truncate_string(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    if s.chars().count() <= max_len {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_len.saturating_sub(3)])
+        let truncated: String = s.chars().take(max_len.saturating_sub(3)).collect();
+        format!("{truncated}...")
     }
 }
 
@@ -224,7 +251,7 @@ async fn list_files(file: &AsyncMmapFile) -> Result<(), String> {
     Ok(())
 }
 
-// 实现通过哈希 名称提取（原有功能）
+// 实现通过hash name提取（原有功能）
 async fn extract_by_hash_name(
     file: &AsyncMmapFile,
     embedded: &[Embedded],
@@ -245,7 +272,7 @@ async fn extract_by_hash_name(
             output_file.clone()
         } else {
             let mut path = input_path.to_path_buf();
-            path.set_file_name(&embedded_file.name);
+            path.set_file_name(sanitize_output_name(&embedded_file.name));
             path
         };
 
@@ -275,7 +302,7 @@ async fn extract_by_hash_name(
     Ok(())
 }
 
-// 实现通过元数据 名称提取
+// 实现通过metadata name提取
 async fn extract_by_meta_name(
     file: &AsyncMmapFile,
     meta_names: &[String],
@@ -284,13 +311,7 @@ async fn extract_by_meta_name(
     input_path: &std::path::Path,
 ) -> Result<(), String> {
     let embedded = get_embedded(file).await.map_err(|e| e.to_string())?;
-    let hash_to_name = build_hash_to_name_map(metadata);
-
-    // 构建名称到哈希的反向映射
-    let mut name_to_hash = HashMap::new();
-    for (hash, name) in hash_to_name {
-        name_to_hash.insert(name, hash);
-    }
+    let name_to_hash = build_name_to_hash_map(metadata);
 
     for (i, meta_name) in meta_names.iter().enumerate() {
         let hash = name_to_hash
@@ -340,7 +361,6 @@ async fn extract_by_meta_name(
     Ok(())
 }
 
-// 实现提取所有文件
 /// 归档 metadata 派生的相对路径只允许 Normal 组件（子目录合法）；`..`、
 /// 绝对路径、盘符、UNC 一律拒绝，防止包内路径把文件写到输出根之外。
 fn relative_under_root(root: &Path, relative: &str) -> Result<std::path::PathBuf, String> {
@@ -361,7 +381,7 @@ fn relative_under_root(root: &Path, relative: &str) -> Result<std::path::PathBuf
     Ok(path)
 }
 
-/// 解析 symlink / junction 后仍须位于 root 内。从已 canonicalize 的 root 逐
+/// 解析 symlink/junction 后仍须位于 root 内。从已 canonicalize 的 root 逐
 /// 组件向下走，已存在的部分就地 canonicalize 并检查前缀；不存在的部分只
 /// 可能挂在已验证位于 root 内的父目录下，由后续 create 落盘。
 async fn verify_within_root(root: &Path, path: &Path) -> Result<(), String> {
@@ -396,6 +416,7 @@ async fn verify_within_root(root: &Path, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+// 实现提取所有文件
 async fn extract_all_files(
     file: &AsyncMmapFile,
     output_dir: &Path,
@@ -412,31 +433,51 @@ async fn extract_all_files(
         )
     })?;
 
-    let hash_to_name = if let Some(meta) = metadata {
-        build_hash_to_name_map(meta)
-    } else {
-        HashMap::new()
-    };
+    let hash_to_names = metadata.map(build_hash_to_names_map);
+    let claimed: HashSet<&str> = hash_to_names
+        .as_ref()
+        .map(|m| m.keys().map(String::as_str).collect())
+        .unwrap_or_default();
 
     // 先完成全部路径解析与安全校验，再落盘：任何一条越界即整体失败，
     // 不留下半次提取。
     let mut plan: Vec<(String, std::path::PathBuf, &Embedded)> = Vec::new();
+    let mut planned_paths: HashSet<String> = HashSet::new();
+
+    // 以 metadata.hashed 的文件路径为主：一个数据块可服务多个目标路径
+    // （pack 对相同内容去重存储），补丁块不会占用完整文件的输出路径。
+    if let Some(hash_to_names) = hash_to_names.as_ref() {
+        for (block_name, names) in hash_to_names {
+            let Some(embedded_file) = embedded.iter().find(|e| &e.name == block_name) else {
+                for file_name in names {
+                    println!("Skipped (block not packed): {file_name}");
+                }
+                continue;
+            };
+            for file_name in names {
+                let output_path = relative_under_root(output_dir, file_name)?;
+                verify_within_root(output_dir, &output_path).await?;
+                if planned_paths.insert(output_path.to_string_lossy().into_owned()) {
+                    plan.push((file_name.clone(), output_path, embedded_file));
+                }
+            }
+        }
+    }
+
+    // 未被 hashed 引用的数据块（追加的资源、补丁块）按自身名称导出。
     for embedded_file in &embedded {
         // 跳过内部文件
         if embedded_file.name.starts_with('\0') {
             continue;
         }
-
-        // 确定输出文件名和路径
-        let file_name = if let Some(meta_name) = hash_to_name.get(&embedded_file.name) {
-            meta_name.clone()
-        } else {
-            embedded_file.name.clone()
-        };
-
-        let output_path = relative_under_root(output_dir, &file_name)?;
+        if claimed.contains(embedded_file.name.as_str()) {
+            continue;
+        }
+        let output_path = relative_under_root(output_dir, &embedded_file.name)?;
         verify_within_root(output_dir, &output_path).await?;
-        plan.push((file_name, output_path, embedded_file));
+        if planned_paths.insert(output_path.to_string_lossy().into_owned()) {
+            plan.push((embedded_file.name.clone(), output_path, embedded_file));
+        }
     }
 
     for (file_name, output_path, embedded_file) in plan {
@@ -469,72 +510,152 @@ async fn extract_all_files(
     Ok(())
 }
 
-pub async fn extract_cli(args: ExtractArgs) {
-    // 参数验证
-    if let Err(err) = validate_args(&args) {
-        eprintln!("Error: {}", err);
-        return;
-    }
-
-    // 打开文件
-    let mmap = match AsyncMmapFile::open(args.input.clone()).await {
-        Ok(file) => file,
-        Err(e) => {
-            eprintln!("Failed to open input file {}: {}", args.input.display(), e);
-            return;
-        }
-    };
-
-    // 根据参数选择功能
-    let result = if args.list {
-        list_files(&mmap).await
-    } else if let Some(output_dir) = args.all {
-        let metadata = match parse_metadata(&mmap).await {
-            Ok(meta) => meta,
-            Err(e) => {
-                eprintln!("Failed to parse metadata: {}", e);
-                return;
-            }
-        };
-        extract_all_files(&mmap, &output_dir, metadata.as_ref()).await
-    } else if !args.meta_name.is_empty() {
-        let metadata = match parse_metadata(&mmap).await {
-            Ok(Some(meta)) => meta,
-            Ok(None) => {
-                eprintln!("No metadata found for meta-name extraction");
-                return;
-            }
-            Err(e) => {
-                eprintln!("Failed to parse metadata: {}", e);
-                return;
-            }
-        };
-        extract_by_meta_name(&mmap, &args.meta_name, &args.file, &metadata, &args.input).await
+fn sanitize_output_name(name: &str) -> String {
+    let name = name.replace('\0', "_");
+    if name.is_empty() {
+        "_unnamed".to_string()
     } else {
-        // 原有功能保持不变
-        let embedded = match get_embedded(&mmap).await {
-            Ok(emb) => emb,
-            Err(e) => {
-                eprintln!("Failed to get embedded files: {}", e);
-                return;
-            }
-        };
-        extract_by_hash_name(&mmap, &embedded, &args.name, &args.file, &args.input).await
-    };
-
-    if let Err(err) = result {
-        eprintln!("Extraction failed: {}", err);
+        name
     }
 }
 
-// 这些用例跑在 Windows 上（CI 的 unit-test job，`cargo test --bin kachina-builder`）：
-// 反斜杠与盘符在 Linux 上只是普通字符，只有在 Windows 上才能验到
-// 「`..\x` / `C:\x` / UNC 一律拒绝」这条语义。跨平台那部分在 tools/devcheck 的
-// logic 层 [21] 组断言里。
+pub async fn extract_cli(args: ExtractArgs) -> Result<(), String> {
+    validate_args(&args)?;
+
+    let mmap = AsyncMmapFile::open(args.input.clone())
+        .await
+        .map_err(|e| format!("Failed to open input file {}: {}", args.input.display(), e))?;
+
+    if args.list {
+        return list_files(&mmap).await;
+    }
+    if let Some(output_dir) = args.all {
+        let metadata = parse_metadata(&mmap).await?;
+        return extract_all_files(&mmap, &output_dir, metadata.as_ref()).await;
+    }
+    if !args.meta_name.is_empty() {
+        let metadata = parse_metadata(&mmap)
+            .await?
+            .ok_or_else(|| "No metadata found for meta-name extraction".to_string())?;
+        return extract_by_meta_name(&mmap, &args.meta_name, &args.file, &metadata, &args.input)
+            .await;
+    }
+    let embedded = get_embedded(&mmap).await.map_err(|e| e.to_string())?;
+    extract_by_hash_name(&mmap, &embedded, &args.name, &args.file, &args.input).await
+}
+
 #[cfg(test)]
 mod tests {
-    use super::relative_under_root;
-    use std::path::Path;
+    use super::*;
+    use crate::cli::ExtractArgs;
+    use crate::utils::metadata::{FileMeta, PatchInfo, PatchSide, RepoMetadata};
+    use std::path::PathBuf;
+
+    fn extract_args() -> ExtractArgs {
+        ExtractArgs {
+            input: PathBuf::from("pkg.exe"),
+            file: vec![],
+            name: vec![],
+            meta_name: vec![],
+            all: None,
+            list: false,
+        }
+    }
+
+    #[test]
+    fn validate_requires_exactly_one_mode() {
+        assert!(validate_args(&extract_args()).is_err());
+
+        let mut args = extract_args();
+        args.list = true;
+        assert!(validate_args(&args).is_ok());
+
+        args.name = vec!["abc".into()];
+        assert!(validate_args(&args).is_err());
+    }
+
+    #[test]
+    fn hash_maps_prefer_md5_like_pack() {
+        let metadata = RepoMetadata {
+            repo_name: "r".into(),
+            tag_name: "t".into(),
+            hashed: vec![
+                FileMeta {
+                    file_name: "app.exe".into(),
+                    size: 1,
+                    md5: Some("md5hash".into()),
+                    xxh: Some("xxhhash".into()),
+                    installer: None,
+                },
+                FileMeta {
+                    file_name: "two/app.exe".into(),
+                    size: 1,
+                    md5: Some("md5hash".into()),
+                    xxh: Some("xxhhash".into()),
+                    installer: None,
+                },
+            ],
+            patches: vec![PatchInfo {
+                file_name: "app.exe".into(),
+                size: 1,
+                from: PatchSide {
+                    size: 1,
+                    md5: Some("frommd5".into()),
+                    xxh: Some("fromxxh".into()),
+                },
+                to: PatchSide {
+                    size: 1,
+                    md5: Some("tomd5".into()),
+                    xxh: Some("tomd5xxh".into()),
+                },
+            }],
+            installer: None,
+            deletes: Vec::new(),
+            packing_info: Vec::new(),
+        };
+        // 一个数据块映射到多个目标路径；补丁块不占用完整文件路径
+        let names = build_hash_to_names_map(&metadata);
+        assert_eq!(
+            names.get("md5hash").map(Vec::as_slice),
+            Some(&["app.exe".to_string(), "two/app.exe".to_string()][..])
+        );
+        assert!(!names.contains_key("xxhhash"));
+        assert!(!names.contains_key("frommd5_tomd5"));
+
+        // --meta-name 反查时完整文件优先于补丁块
+        let name_to_hash = build_name_to_hash_map(&metadata);
+        assert_eq!(
+            name_to_hash.get("app.exe").map(String::as_str),
+            Some("md5hash")
+        );
+
+        let patch_display = build_patch_display_map(&metadata);
+        assert_eq!(
+            patch_display.get("frommd5_tomd5").map(String::as_str),
+            Some("app.exe")
+        );
+    }
+
+    #[test]
+    fn truncate_respects_char_boundaries() {
+        assert_eq!(truncate_string("short", 32), "short");
+        let long = "中文文件名很长很长很长很长很长很长很长";
+        let truncated = truncate_string(long, 17);
+        assert!(truncated.ends_with("..."));
+        assert_eq!(truncated.chars().count(), 17);
+    }
+
+    #[test]
+    fn classify_internal_and_patch_names() {
+        assert!(matches!(classify_file_type("\0INDEX"), FileType::Index));
+        assert!(matches!(classify_file_type("aaa_bbb"), FileType::Patch));
+        assert!(matches!(classify_file_type("deadbeef"), FileType::File));
+    }
+
+    #[test]
+    fn sanitize_null_internal_names() {
+        assert_eq!(sanitize_output_name("\0CONFIG"), "_CONFIG");
+    }
 
     #[test]
     fn relative_paths_stay_under_root() {

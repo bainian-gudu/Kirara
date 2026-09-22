@@ -11,9 +11,9 @@ pub async fn mmap() -> &'static AsyncMmapFile {
             let exe_path = {
                 #[cfg(debug_assertions)]
                 {
-                    // 使用上一次发布构建
+                    // use last release build
                     let exe_path = std::env::current_exe().unwrap();
-                    // ../发布/${basename}
+                    // ../release/${basename}
                     let exe_path = exe_path
                         .parent()
                         .ok_or("Failed to get parent dir".to_string())
@@ -37,7 +37,7 @@ pub async fn mmap() -> &'static AsyncMmapFile {
                     } else if debug_path.exists() {
                         debug_path
                     } else {
-                        // 回退到当前 exe
+                        // fallback to current exe
                         std::env::current_exe().unwrap()
                     }
                 }
@@ -61,7 +61,7 @@ async fn search_pattern_for_extract(file: &AsyncMmapFile) -> anyhow::Result<Vec<
     let mut read = 0;
 
     loop {
-        // 将最后 4 个字节移到缓冲区开头
+        // move last 4 bytes to the beginning of the buffer
         if read > 4 {
             buffer[0] = buffer[read + 4 - 4];
             buffer[1] = buffer[read + 4 - 3];
@@ -97,8 +97,6 @@ pub struct Embedded {
     pub raw_offset: usize,
     pub size: usize,
 }
-
-/// 从一组 md5 / xxh 里挑一个用：与安装器其它地方一致，md5 优先。
 pub fn preferred_file_hash<'a>(
     md5: &'a Option<String>,
     xxh: &'a Option<String>,
@@ -106,20 +104,19 @@ pub fn preferred_file_hash<'a>(
     md5.as_ref().or(xxh.as_ref())
 }
 
-/// 读取器（`get_embedded`）只接受内置 `\0` 名称，以及 ASCII 字母/数字/`.`/`_`/`-`
-/// 组成的名称。append 写入端必须用同一规则，否则数据进了包却永远读不出来
-/// （`--list` / `--name` 都看不到它）。
-///
-/// 空名字额外拒绝：`chars().all(..)` 对空串恒为真，而读取端会因「名称长度为 0」
-/// 直接跳过 —— 两边放行的话就是一个静默丢数据的口子。
+/// 读取器（`get_embedded`）只接受内置 `\0` 名称与 ASCII 字母/数字/`.`/`_`/`-`
+/// 组成的名称；append 写入端必须使用同一规则，否则数据进了包却永远读不到。
 pub fn is_embedded_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
     matches!(
         name,
         "\0CONFIG" | "\0META" | "\0INDEX" | "\0IMAGE" | "\0THEME"
-    ) || (!name.is_empty()
-        && name
+    ) || name.chars().all(|c| c.is_ascii_hexdigit())
+        || name
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'))
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
 }
 
 pub async fn get_embedded(file: &AsyncMmapFile) -> anyhow::Result<Vec<Embedded>> {
@@ -129,22 +126,21 @@ pub async fn get_embedded(file: &AsyncMmapFile) -> anyhow::Result<Vec<Embedded>>
     let file_len = file.len();
     for offset in offsets.iter() {
         if *offset < last_offset {
-            // 处理内容包含头部的情况
+            // in case of content includes header
             continue;
         }
-        // 相关实现：TLV
-        // 头部：!IN\0
-        // 名称长度：2 字节，大端序
-        // 名称：可变长度
-        // 内容长度：4 字节，大端序
-        // 内容：可变长度
+        // TLV
+        // header: !IN\0
+        // name length: 2 bytes big endian
+        // name: variable length
+        // content length: 4 bytes big endian
+        // content: variable length
         let mem_pos_name_length = *offset + 4;
         if mem_pos_name_length + 2 > file_len {
             continue;
         }
         let name_length =
             u16::from_be_bytes(file.slice(mem_pos_name_length, 2).try_into().unwrap()) as usize;
-        // 名称长度是个上界保护：畸形包里这个字段可以是任意 u16
         if name_length == 0 || name_length > 512 {
             continue;
         }
@@ -153,8 +149,8 @@ pub async fn get_embedded(file: &AsyncMmapFile) -> anyhow::Result<Vec<Embedded>>
         if mem_pos_content_length + 4 > file_len {
             continue;
         }
-        let name = file.slice(mem_pos_name, name_length);
-        let Ok(name) = std::str::from_utf8(name) else {
+        let name_bytes = file.slice(mem_pos_name, name_length);
+        let Ok(name) = std::str::from_utf8(name_bytes) else {
             continue;
         };
         if !is_embedded_name(name) {
@@ -177,16 +173,13 @@ pub async fn get_embedded(file: &AsyncMmapFile) -> anyhow::Result<Vec<Embedded>>
     Ok(entries)
 }
 
-/// DOS 头里的 `e_lfanew` 指向 `PE\0\0`。真实链接器把它放在这个窗口内；
-/// `.rdata` / zstd 流 / ico 里偶然出现的 `MZ\x90\x00` 几乎不可能同时满足。
+/// DOS `e_lfanew` is a 32-bit offset to `PE\0\0`. Real linkers keep it in this window;
+/// a random `MZ\x90\x00` in `.rdata` / zstd / ico almost never does.
 const PE_LFANEW_MIN: usize = 0x40;
 const PE_LFANEW_MAX: usize = 0x1000;
 
-/// 打包产物是「kachina-builder 的字节 + kachina-installer 的字节」拼接而成。
-/// 只有真正的 PE 映像起点才算数，最后一个是追加进去的安装器。
-///
-/// 上游早期版本按 `MZ\x90\x00` 四个字节扫：安装器体内（压缩数据、图标、资源段）
-/// 一旦出现这串字节就会被当成映像起点，于是 rcedit 加载到半截文件直接失败。
+/// Bundle file is `kachina-builder` bytes followed by `kachina-installer` bytes.
+/// Only a real PE image start counts; the last one is the appended installer.
 pub fn pe_image_starts(bytes: &[u8]) -> Vec<usize> {
     let mut found = Vec::new();
     let mut i = 0;
@@ -232,7 +225,6 @@ pub async fn get_reader_for_bundle() -> Result<AsyncMmapFileReader<'static>, Str
 mod tests {
     use super::{is_pe_at, pe_image_starts};
 
-    /// 最小 PE 映像：DOS 头 + `e_lfanew` 指向的 `PE\0\0`。
     fn mini_pe(tag: u8) -> Vec<u8> {
         let e_lfanew = 0x80usize;
         let mut bytes = vec![0u8; 0x200];
