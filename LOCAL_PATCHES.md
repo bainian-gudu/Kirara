@@ -1155,6 +1155,28 @@ note：[本地扫描改单趟枚举并看见不受管文件](docs/notes/implemen
 
 ---
 
+## 20. 静默 / 非交互失败路径不再弹模态框
+
+`installer/mod.rs::error_dialog` 在静默（`-S`）或非交互（`-I`）时仍调用
+`rfd::MessageDialog::show()`。这个调用会阻塞等待点击；`interrupted-download` 的首次
+更新因此在 CI 上跑满 10 分钟超时，进程和更新器一直留在运行中。
+
+现在把判定抽成纯函数 `should_show_dialog(silent, non_interactive)`：只有交互运行返回
+`true`。`error_dialog` 在无人值守时写 `tracing::error!` 后返回 `Ok(())`；
+`confirm_dialog` 写 warn 后返回 `Ok(false)`（默认取消）。前端 `dialog_error` 在静默或
+非交互模式下关闭窗口，确保失败后进程退出。devcheck logic 层新增 [25] 组断言覆盖四种
+布尔组合。
+
+note：[无人值守运行不弹模态框](docs/notes/implemented/2026-09-22-unattended-dialogs-do-not-block.md)
+
+### 复核方式
+
+`pwsh tools/devcheck/devcheck.ps1 -Layer logic,front` 全绿；WSL 上
+`bash tools/devcheck/check-installer.sh` 对整包做类型检查；CI `Build` 的
+`interrupted-download` job 通过，整条工作流 success。
+
+---
+
 
 ## 升级上游时的套用顺序
 
@@ -1236,6 +1258,11 @@ note：[本地扫描改单趟枚举并看见不受管文件](docs/notes/implemen
    前端 `src/App.vue` / `src/api/ipc.ts` / `src/types.ts`（`LocalScan` 与
    `sha256` 字段）。注意上游若已把这三条路径改成 staging 提交，本节的做法与它
    冲突：那时应以 staging 方案为准，只保留「失败不丢更新器」这条验收判据；
+3n. **重做第 20 节的无人值守对话框抑制**：`installer/mod.rs` 加
+   `should_show_dialog`，`error_dialog` / `confirm_dialog` 接
+   `State<InstallArgs>` 并在 `-S` / `-I` 下不调用 `rfd`；前端 `dialog_error`
+   在两种模式下关窗；`tools/devcheck/lib/Generate.ps1` 加 `LogicDialogItems`，
+   `rust/logic/src/main.rs` 补 [25] 组断言；
 4. `npx tsc --noEmit -p tsconfig.json`（上游本身有 3 个 `noUnusedLocals` 报错，
    只要没有新增报错即可）+ 用 `@vue/compiler-sfc` 编译 `src/App.vue` 自检；
 5. Windows 上 `pnpm build` 出 `kachina-builder.exe`，跑一次
