@@ -150,6 +150,31 @@ interface RunMirrorcInstall {
   target_path: string;
 }
 
+interface IpcOpenStaging {
+  type: 'OpenStaging';
+  install_dir: string;
+}
+
+interface IpcCommit {
+  type: 'Commit';
+  staging_root: string;
+  install_dir: string;
+  version: string;
+  deletes: string[];
+}
+
+interface IpcRecover {
+  type: 'Recover';
+  staging_root: string;
+  install_dir: string;
+  version: string;
+}
+
+interface IpcDiscardStaging {
+  type: 'DiscardStaging';
+  staging_root: string;
+}
+
 export async function ipcCreateLnk(
   target: string,
   lnk: string,
@@ -320,6 +345,58 @@ export async function ipcRunMirrorcInstall(
     [InvokeGetDfsMetadataRes, MirrorcChangeset],
     MirrorcStatus
   >({ type: 'RunMirrorcInstall', zip_path, target_path }, elevate, notify);
+}
+
+export interface StagingOpenResult {
+  staging_root: string;
+  journal: string | null;
+}
+
+export interface CommitOutcome {
+  self_replaced: boolean;
+  recovered: boolean;
+}
+
+export async function ipcOpenStaging(installDir: string, elevate = false) {
+  return ipc<IpcOpenStaging, StagingOpenResult, void>(
+    { type: 'OpenStaging', install_dir: installDir },
+    elevate,
+  );
+}
+
+export async function ipcCommit(
+  stagingRoot: string,
+  installDir: string,
+  version: string,
+  deletes: string[],
+  elevate = false,
+) {
+  return ipc<IpcCommit, CommitOutcome, void>(
+    { type: 'Commit', staging_root: stagingRoot, install_dir: installDir, version, deletes },
+    elevate,
+  );
+}
+
+export async function ipcRecover(
+  stagingRoot: string,
+  installDir: string,
+  version: string,
+  elevate = false,
+) {
+  return ipc<IpcRecover, CommitOutcome, void>(
+    { type: 'Recover', staging_root: stagingRoot, install_dir: installDir, version },
+    elevate,
+  );
+}
+
+export async function ipcDiscardStaging(
+  stagingRoot: string,
+  elevate = false,
+) {
+  return ipc<IpcDiscardStaging, void, void>(
+    { type: 'DiscardStaging', staging_root: stagingRoot },
+    elevate,
+  );
 }
 
 export function log(...args: unknown[]) {

@@ -85,6 +85,7 @@ export interface DownloadContext {
   extras: string | undefined;
   local: Embedded[];
   source: string;
+  oldSource: string;
   hashKey: DfsMetadataHashType;
   elevate: boolean;
 }
@@ -126,6 +127,7 @@ export class SingleFileTask implements DownloadTask {
         this.context.extras,
         this.context.local,
         this.context.source,
+        this.context.oldSource,
         this.context.hashKey,
         this.file,
         this.file.failed,
@@ -187,6 +189,7 @@ export class LocalFileTask implements DownloadTask {
         this.context.extras,
         this.context.local,
         this.context.source,
+        this.context.oldSource,
         this.context.hashKey,
         this.file,
         this.file.failed,
@@ -240,6 +243,7 @@ export class MergedGroupTask implements DownloadTask {
         this.context.extras,
         this.context.local,
         this.context.source,
+        this.context.oldSource,
         this.context.hashKey,
         this.context.elevate,
       );

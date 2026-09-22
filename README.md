@@ -73,7 +73,9 @@ pwsh tools/devcheck/devcheck.ps1 -Fix         # 只对我们维护的两个 .rs 
 （`offline-install` / `online-install` / `offline-update` / `online-update` /
 `already-latest` / `uninstall` / `userdata-ignore` / `occupied-process` /
 `builder-extract-replace` 九组）；`unit-test` job 另跑
-`cargo test --bin kachina-builder --locked`（哈希、PE 识别、抽取路径安全阀）。
+`cargo test --bin kachina-builder --locked`（哈希、PE 识别、抽取路径安全阀）与
+`cargo test --bin kachina-installer --locked`（C9 暂存提交、恢复、回滚与 journal
+版本门）。
 上游同款流程里有一处 Sentry 上传步骤，本仓库没有（遥测已移除）。
 
 ## 日志里哪些告警是正常的

@@ -779,7 +779,10 @@ import {
   ipcInstallRuntime,
   ipcIsFolderEmpty,
   ipcKillProcess,
-  ipcRmList,
+  ipcOpenStaging,
+  ipcCommit,
+  ipcRecover,
+  ipcDiscardStaging,
   ipcRunMirrorcDownload,
   ipcRunMirrorcInstall,
   ipcRunUninstall,
@@ -841,6 +844,8 @@ const needElevate = ref(true);
 const current = ref<string>('');
 const percent = ref<number>(0);
 const source = ref<string>('');
+const stagingRoot = ref<string>('');
+const stagingNewDir = ref<string>('');
 const progressInterval = ref<number>(0);
 
 const dialog = ref<'' | 'mirrorc' | 'source' | 'agreement'>('');
@@ -1158,6 +1163,29 @@ async function runInstall(): Promise<void> {
   } else {
     throw new Error('更新服务端配置有误，不支持的哈希算法');
   }
+  let staging = await ipcOpenStaging(source.value, needElevate.value);
+  stagingRoot.value = staging.staging_root;
+  stagingNewDir.value = `${staging.staging_root}${sep()}new`;
+  if (staging.journal) {
+    const recovered = await ipcRecover(
+      staging.staging_root,
+      source.value,
+      latest_meta.tag_name,
+      needElevate.value,
+    );
+    log('Recovered staged install:', recovered);
+    if (recovered.recovered) {
+      stagingRoot.value = '';
+      await finishInstall(latest_meta);
+      percent.value = 100;
+      step.value = 4;
+      return;
+    }
+    // 版本/内容不一致时后端已丢弃旧暂存目录，重新打开一个干净目录再继续。
+    staging = await ipcOpenStaging(source.value, needElevate.value);
+    stagingRoot.value = staging.staging_root;
+    stagingNewDir.value = `${staging.staging_root}${sep()}new`;
+  }
   subStep.value = 1;
   percent.value = 5;
   const local_scan = await ipcCheckLocalFiles(
@@ -1281,7 +1309,27 @@ async function runInstall(): Promise<void> {
       });
     }
   }
+
   if (diff_files.length === 0) {
+    const deletes = (latest_meta.deletes || []).filter((deleteFile) => {
+      if (isUpdate.value && ignoreMap.length > 0) {
+        const deleteFullPath = `${source.value}${sep()}${deleteFile}`
+          .toLowerCase()
+          .replace(/[\\\/]+/g, sep());
+        return !ignoreMap.some((ignoreFolder) =>
+          deleteFullPath.startsWith(ignoreFolder),
+        );
+      }
+      return true;
+    });
+    await ipcCommit(
+      staging.staging_root,
+      source.value,
+      latest_meta.tag_name,
+      deletes,
+      needElevate.value,
+    );
+    stagingRoot.value = '';
     await finishInstall(latest_meta);
     percent.value = 100;
     step.value = 4;
@@ -1495,7 +1543,8 @@ async function runInstall(): Promise<void> {
     dfsSource: selectedSource.value,
     extras: INSTALLER_CONFIG.args.dfs_extras,
     local: INSTALLER_CONFIG.embedded_files || [],
-    source: source.value,
+    source: stagingNewDir.value,
+    oldSource: source.value,
     hashKey: hashKey as DfsMetadataHashType,
     elevate: needElevate.value,
   };
@@ -1556,42 +1605,26 @@ async function runInstall(): Promise<void> {
     }
   }
 
-  if (
-    latest_meta.deletes &&
-    Array.isArray(latest_meta.deletes) &&
-    latest_meta.deletes.length > 0
-  ) {
-    current.value = '删除旧版残留文件……';
-    try {
-      // 过滤掉 ignoreFolderPath 中的文件
-      const filesToDelete = latest_meta.deletes.filter((deleteFile) => {
-        // 如果是更新场景且有 ignoreMap（已检查过的非空文件夹）
-        if (isUpdate.value && ignoreMap.length > 0) {
-          // 构造待删除文件的完整路径
-          const deleteFullPath = `${source.value}${sep()}${deleteFile}`
-            .toLowerCase()
-            .replace(/[\\\/]+/g, sep());
-
-          // 检查文件是否在任何需要忽略的文件夹下
-          const shouldIgnore = ignoreMap.some((ignoreFolder) => {
-            return deleteFullPath.startsWith(ignoreFolder);
-          });
-
-          // 如果应该忽略，则不删除（返回 false）
-          return !shouldIgnore;
-        }
-        // 默认情况下，保留在删除列表中
-        return true;
-      });
-
-      await ipcRmList(
-        filesToDelete.map((e) => `${source.value}${sep()}${e}`),
-        needElevate.value,
+  current.value = '提交安装文件……';
+  const filesToDelete = (latest_meta.deletes || []).filter((deleteFile) => {
+    if (isUpdate.value && ignoreMap.length > 0) {
+      const deleteFullPath = `${source.value}${sep()}${deleteFile}`
+        .toLowerCase()
+        .replace(/[\\\/]+/g, sep());
+      return !ignoreMap.some((ignoreFolder) =>
+        deleteFullPath.startsWith(ignoreFolder),
       );
-    } catch (e) {
-      warn(e);
     }
-  }
+    return true;
+  });
+  await ipcCommit(
+    staging.staging_root,
+    source.value,
+    latest_meta.tag_name,
+    filesToDelete,
+    needElevate.value,
+  );
+  stagingRoot.value = '';
 
   await installRuntimes();
 
@@ -1656,6 +1689,27 @@ async function runMirrorcInstall() {
   }
   if (await installPrepare(`${mirrorc_status.data?.version_name || 'unknown'}`))
     return runMirrorcInstall();
+  let staging = await ipcOpenStaging(source.value, needElevate.value);
+  stagingRoot.value = staging.staging_root;
+  stagingNewDir.value = `${staging.staging_root}${sep()}new`;
+  if (staging.journal) {
+    const recovered = await ipcRecover(
+      staging.staging_root,
+      source.value,
+      mirrorc_status.data?.version_name || 'unknown',
+      needElevate.value,
+    );
+    if (recovered.recovered) {
+      stagingRoot.value = '';
+      await finishInstall();
+      percent.value = 100;
+      step.value = 4;
+      return;
+    }
+    staging = await ipcOpenStaging(source.value, needElevate.value);
+    stagingRoot.value = staging.staging_root;
+    stagingNewDir.value = `${staging.staging_root}${sep()}new`;
+  }
   if (!mirrorc_status.data?.url) {
     await dialog_error(
       '从Mirror酱获取更新失败: 下载地址为空，请联系Mirror酱客服',
@@ -1676,7 +1730,7 @@ async function runMirrorcInstall() {
   log('Mirrorc update mode', mirrorc_status.data.update_type);
   log('Mirrorc URL', mirrorc_status.data.url);
   const mirrorc_zip_url = mirrorc_status.data.url;
-  const mirrorc_zip_path = `${source.value}${sep()}KachinaInstaller_Mirrorc_${mirrorc_status.data.sha256}.zip`;
+  const mirrorc_zip_path = `${staging.staging_root}${sep()}dl${sep()}KachinaInstaller_Mirrorc_${mirrorc_status.data.sha256}.zip`;
   subStep.value = 1;
   percent.value = 5;
   current.value = '准备从Mirror酱下载……';
@@ -1715,7 +1769,7 @@ async function runMirrorcInstall() {
   current.value = '检查压缩包……';
   const [meta, changeset] = await ipcRunMirrorcInstall(
     mirrorc_zip_path,
-    source.value,
+    stagingNewDir.value,
     ({ payload }) => {
       console.log(payload);
       switch (payload.type) {
@@ -1732,6 +1786,15 @@ async function runMirrorcInstall() {
     needElevate.value,
   );
   console.log(changeset, meta);
+  current.value = '提交安装文件……';
+  await ipcCommit(
+    staging.staging_root,
+    source.value,
+    mirrorc_status.data?.version_name || 'unknown',
+    changeset?.deleted || [],
+    needElevate.value,
+  );
+  stagingRoot.value = '';
   await installRuntimes();
 
   current.value = '很快就好……';
@@ -1877,6 +1940,13 @@ async function install(): Promise<void> {
     // 完整 stack 只写本地日志，弹窗仍然只给用户看更友好的 message。
     log('安装失败:', logErrStr);
     await dialog_error(errstr);
+
+    // 回滚本身失败时后端会保留 journal/new/old，供下次启动恢复；
+    // 这里必须跟着保留，不能再无条件删掉最后一份旧文件。
+    if (stagingRoot.value && !logErrStr.includes('ROLLBACK_FAILED')) {
+      await ipcDiscardStaging(stagingRoot.value, needElevate.value).catch(warn);
+      stagingRoot.value = '';
+    }
 
     // 发生错误时清理 DFS2 会话（仅 DFS 模式）
     if (installMode.value === 'default') {

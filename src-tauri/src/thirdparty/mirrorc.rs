@@ -3,8 +3,8 @@ use std::io::Read;
 use anyhow::Context;
 
 use crate::{
-    fs::{create_http_stream, create_target_file, prepare_target, progressed_copy},
-    installer::uninstall::{is_safe_relative_member, path_eq},
+    fs::{create_http_stream, create_staged_file, progressed_copy},
+    installer::uninstall::is_safe_relative_member,
     utils::{
         error::{return_ta_result, IntoTAResult, TAResult},
         metadata::RepoMetadata,
@@ -48,37 +48,13 @@ pub fn run_mirrorc_install_sync(
     target_path: &str,
     notify: impl Fn(serde_json::Value) + std::marker::Send + 'static,
 ) -> TAResult<(Option<RepoMetadata>, Option<MirrorcChangeset>)> {
-    // 解压过程中若换掉了正在运行的 exe，备份路径记在这里，等整个归档都落盘成功才
-    // 登记退出自删；中途失败则把它改回原名（见 `fs::rollback_self_update_backup_sync`）。
-    let mut self_backup: Option<std::path::PathBuf> = None;
-    let res = run_mirrorc_install_inner(zip_path, target_path, notify, &mut self_backup);
-    match (res, self_backup) {
-        (Ok(v), Some(backup)) => {
-            crate::fs::commit_self_update_backup(&backup);
-            Ok(v)
-        }
-        (Err(e), Some(backup)) => {
-            if let Err(e2) = crate::fs::rollback_self_update_backup_sync(
-                &std::path::PathBuf::from(target_path),
-                &backup,
-            ) {
-                // 还原不了就把备份留在磁盘上：更新器仍然可用，只是名字带 .instbak。
-                tracing::error!(
-                    "Mirror酱 自更新回滚失败，旧安装器保留在 {}: {e2}",
-                    backup.display()
-                );
-            }
-            Err(e)
-        }
-        (res, None) => res,
-    }
+    run_mirrorc_install_inner(zip_path, target_path, notify)
 }
 
 fn run_mirrorc_install_inner(
     zip_path: &str,
     target_path: &str,
     notify: impl Fn(serde_json::Value) + std::marker::Send + 'static,
-    self_backup: &mut Option<std::path::PathBuf>,
 ) -> TAResult<(Option<RepoMetadata>, Option<MirrorcChangeset>)> {
     let file = std::fs::File::open(zip_path).into_ta_result()?;
     let mut archive = zip::ZipArchive::new(file).into_ta_result()?;
@@ -143,8 +119,6 @@ fn run_mirrorc_install_inner(
         );
     }
 
-    let current_exe = std::env::current_exe().context("GET_EXE_PATH_ERR")?;
-
     for i in 0..total_len {
         let mut file = archive.by_index(i).into_ta_result()?;
         let raw_name = decode_entry_name(file.name_raw());
@@ -178,20 +152,6 @@ fn run_mirrorc_install_inner(
                 "MIRRORC_ARCHIVE_PATH_ERR",
             );
         }
-        if path_eq(&out_path, &current_exe) {
-            // 如果存在则删除 .instbak
-            let instbak = out_path.clone().with_extension("instbak");
-            if instbak.exists() {
-                std::fs::remove_file(&instbak)
-                    .into_ta_result()
-                    .context("SELF_UPDATE_ERR")?;
-            }
-            // 将当前 exe 移动为 .instbak
-            std::fs::rename(&current_exe, &instbak)
-                .into_ta_result()
-                .context("SELF_UPDATE_ERR")?;
-            *self_backup = Some(instbak);
-        }
         let parent = out_path.parent();
         if let Some(parent) = parent {
             if !parent.exists() {
@@ -206,46 +166,47 @@ fn run_mirrorc_install_inner(
         std::io::copy(&mut file, &mut out_file)
             .into_ta_result()
             .context(format!("WRITE_FILE_ERR: {}", out_path.display()))?;
+        out_file
+            .sync_all()
+            .into_ta_result()
+            .context(format!("SYNC_FILE_ERR: {}", out_path.display()))?;
         notify(
             serde_json::json!({"type": "extract", "file": file_name, "count": i, "total": total_len}),
         );
     }
 
-    // 删除 target_path 中不在变更集里的文件
+    // 删除清单交给同一份 journal 在阶段二处理：阶段一不碰安装目录。
+    let mut all_deletes: Vec<String> = Vec::new();
     if let Some(changeset) = changeset.as_ref() {
         if let Some(deletes) = changeset.deleted.as_ref() {
             for file in deletes {
-                let mut out_path = std::path::PathBuf::from(target_path);
                 let strip_path = file.strip_prefix(&prefix).unwrap_or(file);
                 if !is_safe_relative_member(target_root, strip_path) {
                     tracing::warn!("跳过不安全的 Mirrorc 删除路径: {strip_path}");
                     continue;
                 }
-                out_path.push(strip_path);
-                if out_path.exists() {
-                    std::fs::remove_file(out_path).into_ta_result()?;
-                    notify(serde_json::json!({"type": "delete", "file": strip_path}));
-                }
+                all_deletes.push(strip_path.to_string());
             }
         }
     }
     if let Some(metadata) = metadata.as_ref() {
-        // 删除 target_path 中不在元数据里的文件
         if let Some(deletes) = metadata.deletes.as_ref() {
             for file in deletes {
-                let mut out_path = std::path::PathBuf::from(target_path);
                 if !is_safe_relative_member(target_root, file) {
                     tracing::warn!("跳过不安全的 metadata 删除路径: {file}");
                     continue;
                 }
-                out_path.push(file.clone());
-                if out_path.exists() {
-                    std::fs::remove_file(out_path).into_ta_result()?;
-                    notify(serde_json::json!({"type": "delete", "file": file}));
-                }
+                all_deletes.push(file.clone());
             }
         }
     }
+    all_deletes.sort();
+    all_deletes.dedup();
+    let changeset = Some(MirrorcChangeset {
+        added: changeset.as_ref().and_then(|c| c.added.clone()),
+        deleted: Some(all_deletes),
+        modified: changeset.as_ref().and_then(|c| c.modified.clone()),
+    });
     // 删除 zip 文件
     let _ = std::fs::remove_file(zip_path);
     Ok((metadata, changeset))
@@ -296,21 +257,7 @@ pub async fn run_mirrorc_download(
     notify: impl Fn(serde_json::Value) + std::marker::Send + 'static,
 ) -> TAResult<()> {
     let (stream, len, _insight) = create_http_stream(url, 0, 0, true).await?;
-    // 归档固定落在安装目录内（`KachinaInstaller_Mirrorc_<sha256>.zip`），正常不会命中
-    // 正在运行的 exe。真命中说明调用方给错了路径：立刻还原并失败，绝不让更新器
-    // 以 `.instbak` 的形态留在磁盘上。
-    if let Some(backup) = prepare_target(zip_path).await? {
-        if let Err(e) =
-            crate::fs::rollback_self_update_backup_sync(&std::path::PathBuf::from(zip_path), &backup)
-        {
-            tracing::error!("还原被误命中的更新器失败，备份保留在 {}: {e}", backup.display());
-        }
-        return crate::utils::error::return_ta_result(
-            "Mirrorc archive path collides with the running installer".to_string(),
-            "MIRRORC_TARGET_ERR",
-        );
-    }
-    let target = create_target_file(zip_path).await?;
+    let target = create_staged_file(zip_path).await?;
     progressed_copy(stream, target, |downloaded| {
         notify(serde_json::json!({"type": "download", "downloaded": downloaded, "total": len}));
     })

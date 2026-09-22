@@ -1,13 +1,13 @@
 use crate::{
     dfs::InsightItem,
     fs::{
-        create_http_stream, create_local_stream, create_multi_http_stream, create_target_file,
-        prepare_target, progressed_copy, progressed_hpatch, verify_hash,
+        create_http_stream, create_local_stream, create_multi_http_stream, create_staged_file,
+        progressed_copy, progressed_hpatch, sync_staged_file, verify_hash,
     },
     utils::error::{IntoTAResult, TAResult},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_compression::tokio::bufread::ZstdDecoder as TokioZstdDecoder;
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
@@ -16,34 +16,17 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, BufReader};
 use tracing::{info, warn};
 
-/// 自更新收尾。
-///
-/// `prepare_target` 把正在运行的 exe 改名成 `.instbak` 之后，原名文件在磁盘上已经
-/// 不存在、备份是旧版本的最后一份拷贝。这里保证只有整次安装真的成功才登记
-/// 「退出时删除备份」；失败（网络中断、哈希不符、磁盘满、进程占用）一律把备份改回
-/// 原名，用户手上的更新器不会因为一次失败的更新而消失。
-async fn finalize_self_update<T, E>(
-    target: &str,
-    backup: Option<&PathBuf>,
-    res: Result<T, E>,
-) -> Result<T, E> {
-    let Some(backup) = backup else {
-        return res;
-    };
-    match res {
-        Ok(v) => {
-            crate::fs::commit_self_update_backup(backup);
-            Ok(v)
-        }
-        Err(e) => {
-            crate::fs::rollback_self_update_backup(target, backup).await;
-            Err(e)
-        }
-    }
-}
-
 fn default_as_false() -> bool {
     false
+}
+
+fn is_self_update(old_path: &Option<PathBuf>) -> bool {
+    let Some(old_path) = old_path else {
+        return false;
+    };
+    std::env::current_exe()
+        .ok()
+        .is_some_and(|exe| crate::installer::uninstall::path_eq(&exe, old_path))
 }
 
 // 根据 InstallFileArgs 检查是否需要解压的辅助函数
@@ -120,6 +103,8 @@ enum InstallFileMode {
 pub struct InstallFileArgs {
     mode: InstallFileMode,
     target: String,
+    #[serde(default)]
+    old: Option<String>,
     md5: Option<String>,
     xxh: Option<String>,
     clear_installer_index_mark: Option<bool>,
@@ -155,18 +140,16 @@ pub async fn ipc_install_file(
     args: InstallFileArgs,
     notify: impl Fn(serde_json::Value) + std::marker::Send + 'static,
 ) -> TAResult<serde_json::Value> {
-    let target = args.target.clone();
-    let override_old_path = prepare_target(&target).await?;
-    let res = install_file_inner(args, override_old_path.as_ref(), notify).await;
-    finalize_self_update(&target, override_old_path.as_ref(), res).await
+    install_file_inner(args, notify).await
 }
 
 async fn install_file_inner(
     args: InstallFileArgs,
-    override_old_path: Option<&PathBuf>,
     notify: impl Fn(serde_json::Value) + std::marker::Send + 'static,
 ) -> TAResult<serde_json::Value> {
     let target = args.target;
+    let old_path = args.old.clone().map(PathBuf::from);
+    let self_update = is_self_update(&old_path);
     let progress_noti = move |downloaded: usize| {
         notify(serde_json::json!(downloaded));
     };
@@ -175,7 +158,7 @@ async fn install_file_inner(
             let (stream, insight_handle) = create_stream_by_source(source).await?;
             let bytes_transferred = match crate::fs::progressed_copy(
                 stream,
-                create_target_file(&target).await?,
+                create_staged_file(&target).await?,
                 progress_noti,
             )
             .await
@@ -209,7 +192,7 @@ async fn install_file_inner(
 
             if args.md5.is_some() || args.xxh.is_some() {
                 // 如果需要清理安装器索引标记，先清理再进行哈希校验
-                if args.clear_installer_index_mark.unwrap_or(false) || override_old_path.is_some() {
+                if args.clear_installer_index_mark.unwrap_or(false) || self_update {
                     info!("Clearing installer index mark for: {}", target);
                     if let Err(e) = crate::installer::uninstall::clear_index_mark(
                         &std::path::PathBuf::from(&target),
@@ -223,6 +206,7 @@ async fn install_file_inner(
                     info!("Index mark cleared successfully");
                 }
                 verify_hash(&target, args.md5, args.xxh).await?;
+                sync_staged_file(&target).await?;
             }
 
             let result = InstallResult {
@@ -232,14 +216,13 @@ async fn install_file_inner(
             serde_json::to_value(result).into_ta_result()
         }
         InstallFileMode::Patch { source, diff_size } => {
-            let is_self_update = override_old_path.is_some();
             let (stream, insight_handle) = create_stream_by_source(source).await?;
             let (bytes_transferred, _) = progressed_hpatch(
                 stream,
                 &target,
                 diff_size,
                 progress_noti,
-                override_old_path.cloned(),
+                old_path.clone(),
                 None, // 传入None，因为现在insight由处理管理
             )
             .await?;
@@ -257,7 +240,7 @@ async fn install_file_inner(
 
             if args.md5.is_some() || args.xxh.is_some() {
                 // 如果需要清理安装器索引标记，先清理再进行哈希校验
-                if args.clear_installer_index_mark.unwrap_or(false) || is_self_update {
+                if args.clear_installer_index_mark.unwrap_or(false) || self_update {
                     info!("Clearing installer index mark for: {}", target);
                     if let Err(e) = crate::installer::uninstall::clear_index_mark(
                         &std::path::PathBuf::from(&target),
@@ -271,6 +254,7 @@ async fn install_file_inner(
                     info!("Index mark cleared successfully");
                 }
                 verify_hash(&target, args.md5, args.xxh).await?;
+                sync_staged_file(&target).await?;
             }
 
             let result = InstallResult {
@@ -280,10 +264,11 @@ async fn install_file_inner(
             serde_json::to_value(result).into_ta_result()
         }
         InstallFileMode::HybridPatch { diff, source } => {
-            // 先解压来源（本地文件，不需要 insight）
+            // HybridPatch 的基文件先解到暂存目录，补丁只写 target，不碰安装目录。
+            let base_path = format!("{target}.hybrid-base");
             let (source_stream, _) = create_stream_by_source(source).await?;
-            let target_fs = create_target_file(&target).await?;
-            let _source_bytes = progressed_copy(source_stream, target_fs, progress_noti).await?;
+            let base_fs = create_staged_file(&base_path).await?;
+            let _source_bytes = progressed_copy(source_stream, base_fs, progress_noti).await?;
 
             // 然后应用补丁（仅将 diff 视为 URL）
             let size: usize = match diff {
@@ -291,8 +276,18 @@ async fn install_file_inner(
                 InstallFileSource::Local { size, .. } => size,
             };
             let (diff_stream, insight_handle) = create_stream_by_source(diff).await?;
-            let (diff_bytes, _) =
-                progressed_hpatch(diff_stream, &target, size, |_| {}, None, None).await?;
+            let (diff_bytes, _) = progressed_hpatch(
+                diff_stream,
+                &target,
+                size,
+                |_| {},
+                Some(PathBuf::from(&base_path)),
+                None,
+            )
+            .await?;
+            tokio::fs::remove_file(&base_path)
+                .await
+                .context("REMOVE_HYBRID_BASE_ERR")?;
 
             // 获取最终的insight
             let final_insight = if let Some(handle) = insight_handle {
@@ -307,7 +302,7 @@ async fn install_file_inner(
 
             if args.md5.is_some() || args.xxh.is_some() {
                 // 如果需要清理安装器索引标记，先清理再进行哈希校验
-                if args.clear_installer_index_mark.unwrap_or(false) || override_old_path.is_some() {
+                if args.clear_installer_index_mark.unwrap_or(false) || self_update {
                     info!("Clearing installer index mark for: {}", target);
                     if let Err(e) = crate::installer::uninstall::clear_index_mark(
                         &std::path::PathBuf::from(&target),
@@ -321,6 +316,7 @@ async fn install_file_inner(
                     info!("Index mark cleared successfully");
                 }
                 verify_hash(&target, args.md5, args.xxh).await?;
+                sync_staged_file(&target).await?;
             }
 
             let result = InstallResult {
@@ -340,32 +336,30 @@ pub async fn install_file_by_reader<C>(
 where
     C: tokio::io::AsyncRead + Unpin + std::marker::Send,
 {
-    let target = args.target.clone();
-    let override_old_path = prepare_target(&target).await?;
-    let res = install_file_by_reader_inner(args, reader, override_old_path.as_ref(), notify).await;
-    finalize_self_update(&target, override_old_path.as_ref(), res).await
+    install_file_by_reader_inner(args, reader, notify).await
 }
 
 async fn install_file_by_reader_inner<C>(
     args: InstallFileArgs,
     reader: &mut C,
-    override_old_path: Option<&PathBuf>,
     notify: impl Fn(serde_json::Value) + std::marker::Send + 'static,
 ) -> Result<serde_json::Value>
 where
     C: tokio::io::AsyncRead + Unpin + std::marker::Send,
 {
     let target = args.target;
+    let old_path = args.old.clone().map(PathBuf::from);
+    let self_update = is_self_update(&old_path);
     let progress_noti = move |downloaded: usize| {
         notify(serde_json::json!(downloaded));
     };
     match args.mode {
         InstallFileMode::Direct { .. } => {
             let res =
-                progressed_copy(reader, create_target_file(&target).await?, progress_noti).await?;
+                progressed_copy(reader, create_staged_file(&target).await?, progress_noti).await?;
             if args.md5.is_some() || args.xxh.is_some() {
                 // 如果需要清理安装器索引标记，先清理再进行哈希校验
-                if args.clear_installer_index_mark.unwrap_or(false) || override_old_path.is_some() {
+                if args.clear_installer_index_mark.unwrap_or(false) || self_update {
                     info!("Clearing installer index mark for: {}", target);
                     if let Err(e) = crate::installer::uninstall::clear_index_mark(
                         &std::path::PathBuf::from(&target),
@@ -378,6 +372,7 @@ where
                     info!("Index mark cleared successfully");
                 }
                 verify_hash(&target, args.md5, args.xxh).await?;
+                sync_staged_file(&target).await?;
             }
             Ok(serde_json::json!(res))
         }
@@ -386,20 +381,12 @@ where
             let mut buffer: Vec<u8> = vec![0; diff_size];
             progressed_copy(reader, &mut buffer, progress_noti).await?;
             let reader = std::io::Cursor::new(buffer);
-            let is_self_update = override_old_path.is_some();
-            let res = progressed_hpatch(
-                reader,
-                &target,
-                diff_size,
-                |_| {},
-                override_old_path.cloned(),
-                None,
-            )
-            .await?
-            .0;
+            let res = progressed_hpatch(reader, &target, diff_size, |_| {}, old_path.clone(), None)
+                .await?
+                .0;
             if args.md5.is_some() || args.xxh.is_some() {
                 // 如果需要清理安装器索引标记，先清理再进行哈希校验
-                if args.clear_installer_index_mark.unwrap_or(false) || is_self_update {
+                if args.clear_installer_index_mark.unwrap_or(false) || self_update {
                     info!("Clearing installer index mark for: {}", target);
                     if let Err(e) = crate::installer::uninstall::clear_index_mark(
                         &std::path::PathBuf::from(&target),
@@ -412,6 +399,7 @@ where
                     info!("Index mark cleared successfully");
                 }
                 verify_hash(&target, args.md5, args.xxh).await?;
+                sync_staged_file(&target).await?;
             }
             Ok(serde_json::json!(res))
         }

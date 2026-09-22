@@ -27,7 +27,7 @@ Status: proposed
 分阶段推进，每阶段单独可验收，**不**做一次性重写：
 
 1. **前置：暂存目录 + 两阶段提交**（见
-   [暂存目录 + 两阶段提交](2026-09-22-staged-two-phase-commit.md)）。上游的宿主层
+   [暂存目录 + 两阶段提交](../implemented/2026-09-22-staged-two-phase-commit.md)）。上游的宿主层
    （`session/run.rs`）与提交协议是同一个设计的两个部分，先把提交协议在本仓库落地，
    宿主替换时才不用同时改两件事。
 2. **前端单文件化**：rsbuild 配置成把 JS/CSS 内联进一个 `index.html`（上游同款），
@@ -62,7 +62,7 @@ Status: proposed
 
 | 判据 | 期望 |
 |---|---|
-| 前置完成 | 两阶段提交的验收判据全绿（见 [暂存目录 + 两阶段提交](2026-09-22-staged-two-phase-commit.md)） |
+| 前置完成 | 两阶段提交的验收判据全绿（见 [暂存目录 + 两阶段提交](../implemented/2026-09-22-staged-two-phase-commit.md)） |
 | 前端单文件 | `pnpm build` 只产出 `dist/index.html`；在浏览器里直接打开能完成一次「选路径」交互 |
 | 宿主可替换 | 会话层不直接引用 `tauri::` 类型；`rg -n "tauri::" src-tauri/src/{fs,installer,thirdparty}` 零命中 |
 | 行为等价 | `test` job 的 10 组 e2e 在新宿主上全绿，且不修改测试断言 |

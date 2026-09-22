@@ -908,7 +908,10 @@ fn is_safe_task_name(product: &str, name: &str) -> bool {
     if product.is_empty() || name.is_empty() || name.len() > 100 {
         return false;
     }
-    if !name.to_ascii_lowercase().starts_with(&product.to_ascii_lowercase()) {
+    if !name
+        .to_ascii_lowercase()
+        .starts_with(&product.to_ascii_lowercase())
+    {
         return false;
     }
     name.chars()
@@ -1167,9 +1170,9 @@ pub async fn run_uninstall(
 
 /// 登记「进程退出时删除这个文件」。
 ///
-/// 只应在确实需要删除该文件的那一刻调用：自更新把正在运行的 exe 改名成 `.instbak`
-/// 之后，这份备份就是旧版本的最后一份拷贝，**失败路径登记它等于把更新器删掉**。
-/// 因此写入点只有两个——自更新/自卸载全部成功之后，以及卸载器把自己挪进 %TEMP% 之后。
+/// 只应在确实需要删除该文件/目录的那一刻调用：C9 提交成功后旧镜像在暂存目录的
+/// `old\` 下，这份备份就是旧版本的最后一份拷贝，**失败路径登记它等于把更新器删掉**。
+/// 因此写入点只有两个——提交/恢复全部成功之后，以及卸载器把自己挪进 %TEMP% 之后。
 pub fn schedule_delete_on_exit(path: &Path) {
     DELETE_SELF_ON_EXIT_PATH
         .write()
@@ -1190,7 +1193,9 @@ pub fn delete_self_on_exit() {
         // 或“%”。展开带引号的环境变量，可避免
         // 这些字符被当作命令语法解释。
         .env("KACHINA_DELETE_SELF_TARGET", path)
-        .raw_arg("/C ping 127.0.0.1 -n 2 >NUL & del /f /q \"%KACHINA_DELETE_SELF_TARGET%\"")
+        .raw_arg(
+            "/C ping 127.0.0.1 -n 2 >NUL & rmdir /s /q \"%KACHINA_DELETE_SELF_TARGET%\" 2>NUL & del /f /q \"%KACHINA_DELETE_SELF_TARGET%\" 2>NUL",
+        )
         .creation_flags(CREATE_NO_WINDOW.0)
         .spawn()
     {

@@ -208,7 +208,11 @@ jobs:
       - name: Rust unit tests
         working-directory: src-tauri
         shell: pwsh
-        run: cargo test --bin kachina-builder --locked
+        run: |
+          cargo test --bin kachina-builder --locked
+          # C9 的暂存提交测试在安装器 bin 内：恢复、回滚和 journal 版本门
+          # 必须在 Windows 上跑真实文件 IO，不能只做 builder 的纯函数测试。
+          cargo test --bin kachina-installer --locked
 
   # tag 触发时把 builder 挂到 Release（上游同款，去掉 Sentry 上传）
   release:

@@ -34,6 +34,8 @@
 - [17. 同步上游 0.5.1 之后的打包器修复](#17-同步上游-051-之后的打包器修复)
 - [18. 同步上游最新的安装行为测试与 unit-test job](#18-同步上游最新的安装行为测试与-unit-test-job)
 - [19. 第四轮加固：自更新失败路径、换文件回滚、归档摘要、提权进度洪水、本地扫描](#19-第四轮加固自更新失败路径换文件回滚归档摘要提权进度洪水本地扫描)
+- [20. 静默 / 非交互失败路径不再弹模态框](#20-静默--非交互失败路径不再弹模态框)
+- [21. 暂存目录 + 两阶段提交](#21-暂存目录--两阶段提交)
 - [升级上游时的套用顺序](#升级上游时的套用顺序)
 
 | # | 需求 | 涉及文件 |
@@ -1005,7 +1007,8 @@ junction 之后仍在输出根内），并且**先规划完所有路径再落盘
   第 1～16 节的全部改动，属于「重写」而不是「同步」，不在本分支范围。
 - **两阶段提交（staging 目录）与安装会话**：上游把安装流程重写成
   `session/` + `fs/staging.rs` + `fs/commit.rs`，并配了 `updater-survival` 测试。
-  它是新架构的一部分，单独搬过来没有落点。
+  这份快照当时没有对应落点；第 21 节后来以四个 IPC 把提交协议单独搬了过来，
+  原生会话层仍不搬。
 - **插件系统 / DFS 会话**：同上，`plugin-stub`、`dfs2` 两个测试依赖新架构。
 - **Sentry**：上游仍然保留（甚至换成了自研最小客户端），本项目继续物理移除。
 
@@ -1051,6 +1054,9 @@ Tauri → 原生 Win32 的重写（`dfs2`、`updater-survival`、`plugin-stub`�
 - `builder/local.rs`：PE 映像识别（含「安装器体内埋 `MZ\x90\x00`」反例）；
 - `builder/extract.rs`：`..\x`、盘符、UNC 等包内路径必须被 `relative_under_root` 拒绝。
 
+第 21 节加入 C9 后，同一 job 追加
+`cargo test --bin kachina-installer --locked`，跑真实的暂存文件 rename / 恢复测试。
+
 ### 18c. `replace-bin` 的包格式修复
 
 新测试暴露了 `builder/replace_bin.rs` 的旧实现与 `builder/pack.rs` 的写入格式不一致：
@@ -1074,11 +1080,11 @@ Tauri → 原生 Win32 的重写（`dfs2`、`updater-survival`、`plugin-stub`�
 
 ### 有意未移植
 
-- `dfs2`、`plugin-stub`、`dump-offline-install`：依赖上游新架构的 DFS 会话 / 插件系统
-  / staging 提交，当前快照没有对应落点；
-- `updater-survival`：上游版本断言的是「staging 目录被清空、journal 可前滚」，本仓库
-  没有 staging 提交。改写成 `interrupted-download`（见第 19 节），断言当前模型能保证
-  的那部分——中断后旧版本与更新器都还在、没有 `.instbak` / `.patching` 残留、重跑能装完；
+- `dfs2`、`plugin-stub`、`dump-offline-install`：依赖上游新架构的 DFS 会话 / 插件系统；
+  第 21 节只搬了 staging 提交协议，原生会话层仍没有对应落点；
+- `updater-survival`：上游版本断言的是「staging 目录被清空、journal 可前滚」。第 21 节
+  已用 `fs/commit.rs` 单测覆盖前滚与恢复；端到端仍保留 `interrupted-download`（见第
+  19 节），断言中断后旧版本与更新器都还在、没有旧临时残留、重跑能装完；
 - Sentry 上传：本仓库继续物理移除遥测，Release 只挂产物。
 
 ### 复核方式
@@ -1178,6 +1184,45 @@ note：[无人值守运行不弹模态框](docs/notes/implemented/2026-09-22-una
 ---
 
 
+## 21. 暂存目录 + 两阶段提交
+
+上游原生重构里的 `fs/staging.rs` + `fs/commit.rs` 解决的是三条写入路径各自直写安装
+目录、中断留下混合版本、删除不可回滚的问题。本仓库没有 `session` 层，因此只把提交
+协议按现有前端驱动的 IPC 架构搬过来：
+
+- 新增 `src-tauri/src/fs/staging.rs`：同级暂存目录
+  `<安装目录>.kachina-staged`，含 `new/`、`old/`、`dl/`、`journal`、`lock`；
+  `lock` 里的 pid 通过 `OpenProcess` + `GetExitCodeProcess` 判断是否仍存活，
+  没有 journal 的残留目录在重新加锁后清空。
+- 新增 `src-tauri/src/fs/commit.rs`：提交前为每个暂存文件计算 SHA-256，journal
+  记录版本、算法、旧摘要和新摘要；逐文件先移目标到 `old/` 再换入 `new/`，删除单元
+  也移入 `old/`。失败按逆序回滚；回滚失败保留 journal 和暂存目录并报
+  `ROLLBACK_FAILED`。恢复按摘要区分已完成、待前滚、旧文件可恢复和目标已被改动。
+- `fs.rs` 的 `create_target_file` / `prepare_target` 被 `create_staged_file` 取代，
+  `progressed_hpatch` 只读旧文件并写暂存输出；Direct / Patch / HybridPatch /
+  Mirror酱解压全部只写 `new/`，写完校验并 `sync_all`。
+- `ipc/operation.rs` 新增 `OpenStaging` / `Commit` / `Recover` / `DiscardStaging`
+  四个 IPC；`App.vue` 在 metadata 确定后打开暂存，有 journal 先恢复，失败重新打开
+  干净目录，下载完成后提交；`src/api/ipc.ts`、`installFile.ts`、`dfs.ts`、
+  `downloadTaskManager.ts` 同步传递暂存目标与补丁旧路径。
+- 自更新换掉正在运行的 exe 时保留暂存根，退出时用 `delete_self_on_exit` 删除整个
+  暂存目录；`delete_self_on_exit` 现在先 `rmdir /s /q` 再尝试 `del`，兼容目录路径。
+
+有意保留的边界：没有目录单元、没有运行中取消按钮、暂存根没有放到 `%TEMP%`。这些是
+优化或后续架构问题，不影响当前「阶段一不触碰安装目录、阶段二可回滚、恢复可前滚」的
+正确性保证。
+
+note：[暂存目录 + 两阶段提交](docs/notes/implemented/2026-09-22-staged-two-phase-commit.md)
+
+### 复核方式
+
+`bash tools/devcheck/check-installer.sh --tests` 对整包与测试目标做 Windows 类型检查；
+`pwsh tools/devcheck/devcheck.ps1 -Layer front` 检查前端；CI 的 `unit-test` job 在
+Windows 上跑 `cargo test --bin kachina-installer --locked`，覆盖 journal 版本门、
+真实文件换入/删除、前滚和旧文件恢复。
+
+---
+
 ## 升级上游时的套用顺序
 
 1. 按 `UPSTREAM.md` 覆盖整个目录；
@@ -1263,6 +1308,13 @@ note：[无人值守运行不弹模态框](docs/notes/implemented/2026-09-22-una
    `State<InstallArgs>` 并在 `-S` / `-I` 下不调用 `rfd`；前端 `dialog_error`
    在两种模式下关窗；`tools/devcheck/lib/Generate.ps1` 加 `LogicDialogItems`，
    `rust/logic/src/main.rs` 补 [25] 组断言；
+3o. **重做第 21 节的暂存提交**：新增 `src-tauri/src/fs/staging.rs` 与
+   `src-tauri/src/fs/commit.rs`，把 `fs.rs` / `ipc/install_file.rs` /
+   `thirdparty/mirrorc.rs` 的写入改成 `new/` 暂存，接入四个 staging IPC，
+   前端 `App.vue` / `api/ipc.ts` / `installFile.ts` / `dfs.ts` /
+   `downloadTaskManager.ts` 同步；`.github/workflows/build.yml` 的 `unit-test`
+   job 追加 `cargo test --bin kachina-installer --locked`。若上游已经采用原生
+   session + staging，优先照搬其完整协议，不再套用第 19a / 19b 的旧换文件逻辑；
 4. `npx tsc --noEmit -p tsconfig.json`（上游本身有 3 个 `noUnusedLocals` 报错，
    只要没有新增报错即可）+ 用 `@vue/compiler-sfc` 编译 `src/App.vue` 自检；
 5. Windows 上 `pnpm build` 出 `kachina-builder.exe`，跑一次

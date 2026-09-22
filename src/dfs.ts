@@ -786,6 +786,7 @@ export const runDfsDownload = async (
   extras: string | undefined,
   local: Embedded[],
   source: string,
+  oldSource: string,
   hashKey: DfsMetadataHashType,
   item: DfsUpdateTask,
   disable_patch = false,
@@ -822,6 +823,7 @@ export const runDfsDownload = async (
           },
           undefined,
           item.installer,
+          oldSource + filename_with_first_slash,
         ),
         elevate,
         onProgress,
@@ -843,7 +845,7 @@ export const runDfsDownload = async (
         hybridPatch(hasLpatchFile, url, source + filename_with_first_slash, {
           md5: item.md5,
           xxh: item.xxh,
-        }),
+        }, oldSource + filename_with_first_slash),
         elevate,
         onProgress,
       );
@@ -867,6 +869,7 @@ export const runDfsDownload = async (
           },
           item.patch.size,
           item.installer,
+          oldSource + filename_with_first_slash,
         ),
         elevate,
         onProgress,
@@ -891,6 +894,7 @@ export const runDfsDownload = async (
           },
           undefined,
           item.installer,
+          oldSource + filename_with_first_slash,
         ),
         elevate,
         onProgress,
@@ -1270,6 +1274,7 @@ export const runMergedGroupDownload = async (
   extras: string | undefined,
   local: Embedded[],
   source: string,
+  oldSource: string,
   hashKey: DfsMetadataHashType,
   elevate: boolean,
 ): Promise<{ insight?: InsightItem }> => {
@@ -1324,6 +1329,7 @@ export const runMergedGroupDownload = async (
       return {
         mode: { type: 'Direct' as const, source: source_info },
         target: source + filename_with_first_slash,
+        old: oldSource + filename_with_first_slash,
         md5: file.md5,
         xxh: file.xxh,
         type: 'InstallFile' as const,
@@ -1419,6 +1425,7 @@ export const runMergedGroupDownload = async (
         extras,
         local,
         source,
+        oldSource,
         hashKey,
         elevate,
       );
@@ -1450,6 +1457,7 @@ export const fallbackToIndividualDownload = async (
   extras: string | undefined,
   local: Embedded[],
   source: string,
+  oldSource: string,
   hashKey: DfsMetadataHashType,
   elevate: boolean,
 ) => {
@@ -1468,6 +1476,7 @@ export const fallbackToIndividualDownload = async (
         extras,
         local,
         source,
+        oldSource,
         hashKey,
         file,
         false, // 禁用 补丁

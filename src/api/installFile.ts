@@ -14,6 +14,7 @@ type InstallFileMode =
 interface InstallFileArgs {
   mode: InstallFileMode;
   target: string;
+  old?: string;
   xxh?: string;
   md5?: string;
   clear_installer_index_mark?: boolean;
@@ -34,6 +35,7 @@ export function InstallFile(
   },
   diff_size?: number,
   clearInstallerIndexMark?: boolean,
+  oldPath?: string,
 ): InstallFileArgs {
   let mode: InstallFileMode;
   if (!diff_size) {
@@ -50,6 +52,7 @@ export function InstallFile(
     target,
     type: 'InstallFile',
     ...hash,
+    old: oldPath,
     clear_installer_index_mark: clearInstallerIndexMark,
   };
 }
@@ -62,6 +65,7 @@ export function hybridPatch(
     xxh?: string;
     md5?: string;
   },
+  oldPath?: string,
 ): InstallFileArgs {
   const mode: InstallFileMode = {
     type: 'HybridPatch',
@@ -69,7 +73,7 @@ export function hybridPatch(
     source,
   };
 
-  return { mode, target, type: 'InstallFile', ...hash };
+  return { mode, target, old: oldPath, type: 'InstallFile', ...hash };
 }
 
 interface InstallMultipartStreamArgs {

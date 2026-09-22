@@ -39,6 +39,24 @@ pub enum IpcOperation {
         zip_path: String,
         target_path: String,
     },
+    OpenStaging {
+        install_dir: String,
+    },
+    Commit {
+        staging_root: String,
+        install_dir: String,
+        version: String,
+        #[serde(default)]
+        deletes: Vec<String>,
+    },
+    Recover {
+        staging_root: String,
+        install_dir: String,
+        version: String,
+    },
+    DiscardStaging {
+        staging_root: String,
+    },
 }
 
 pub async fn run_opr(
@@ -61,6 +79,10 @@ pub async fn run_opr(
         IpcOperation::CheckLocalFiles { .. } => "CheckLocalFiles",
         IpcOperation::RunMirrorcDownload { .. } => "RunMirrorcDownload",
         IpcOperation::RunMirrorcInstall { .. } => "RunMirrorcInstall",
+        IpcOperation::OpenStaging { .. } => "OpenStaging",
+        IpcOperation::Commit { .. } => "Commit",
+        IpcOperation::Recover { .. } => "Recover",
+        IpcOperation::DiscardStaging { .. } => "DiscardStaging",
     };
     tracing::info!("IPC operation: {}", op_name);
     let ret = match op {
@@ -132,6 +154,38 @@ pub async fn run_opr(
             crate::thirdparty::mirrorc::run_mirrorc_install(&zip_path, &target_path, notify)
                 .await?
         )),
+        IpcOperation::OpenStaging { install_dir } => {
+            Ok(serde_json::json!(crate::fs::staging::open(&install_dir)?))
+        }
+        IpcOperation::Commit {
+            staging_root,
+            install_dir,
+            version,
+            deletes,
+        } => Ok(serde_json::json!(crate::fs::commit::commit(
+            crate::fs::commit::CommitArgs {
+                staging_root,
+                install_dir,
+                version,
+                deletes,
+            }
+        )?)),
+        IpcOperation::Recover {
+            staging_root,
+            install_dir,
+            version,
+        } => Ok(serde_json::json!(crate::fs::commit::recover(
+            crate::fs::commit::CommitArgs {
+                staging_root,
+                install_dir,
+                version,
+                deletes: Vec::new(),
+            }
+        )?)),
+        IpcOperation::DiscardStaging { staging_root } => {
+            crate::fs::commit::discard(&staging_root);
+            Ok(serde_json::Value::Null)
+        }
     };
     ret
 }

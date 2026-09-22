@@ -5,7 +5,6 @@ use futures::Stream;
 use futures::{StreamExt, TryStreamExt};
 use serde::Serialize;
 use std::{
-    os::windows::fs::MetadataExt,
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
@@ -29,6 +28,9 @@ use crate::{
     DOWNLOAD_CLIENT,
 };
 use anyhow::{Context, Result};
+
+pub mod commit;
+pub mod staging;
 
 #[derive(Debug, Clone, Serialize)]
 pub enum NetworkErrorType {
@@ -886,86 +888,19 @@ pub async fn create_local_stream(
     Ok(Box::new(decoder))
 }
 
-/// 目标就是正在运行的 exe 时，把它改名成 `<exe>.instbak` 腾出原名，返回这份备份的路径。
-///
-/// 这里**不登记**退出自删：此刻磁盘上原名文件已经不存在，而备份是旧版本的最后一份
-/// 拷贝，调用方后面任何一步失败都不该把它删掉。调用方必须把返回值交给
-/// [`commit_self_update_backup`]（成功）或 [`rollback_self_update_backup`]（失败）收尾。
-pub async fn prepare_target(target: &str) -> Result<Option<PathBuf>, anyhow::Error> {
-    let target = Path::new(&target);
-    if !target.is_absolute()
-        || target
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-        || crate::installer::uninstall::has_reparse_point(target)
-        || !crate::installer::uninstall::is_safe_delete_target(target)
-    {
-        return Err(anyhow::anyhow!("Invalid or unsafe target path").context("INVALID_TARGET_ERR"));
-    }
-    let exe_path = std::env::current_exe().context("GET_EXE_PATH_ERR")?;
-    let mut override_path = None;
-
-    // 检查目标路径是否与当前 exe 路径相同
-    if crate::installer::uninstall::path_eq(&exe_path, target) && exe_path.exists() {
-        // 相同时将当前 exe 重命名为 exe.old
-        let old_exe = exe_path.with_extension("instbak");
-        // 删除 old_exe 如果 存在
-        let _ = tokio::fs::remove_file(&old_exe).await;
-        // 将当前 exe 重命名为 old_exe
-        tokio::fs::rename(&exe_path, &old_exe)
-            .await
-            .context("RENAME_EXE_ERR")?;
-        override_path = Some(old_exe.clone());
-    }
-
-    // 确保 目录
-    let parent = target.parent().context("GET_PARENT_DIR_ERR")?;
-    tokio::fs::create_dir_all(parent)
-        .await
-        .context("CREATE_PARENT_DIR_ERR")?;
-    Ok(override_path)
-}
-
-/// 自更新成功：新文件已经就位，登记进程退出时清理改名后的旧副本。
-pub fn commit_self_update_backup(backup: &Path) {
-    crate::installer::uninstall::schedule_delete_on_exit(backup);
-}
-
-/// 自更新失败：删掉可能只写了一半的目标文件，把备份改回原名。
-///
-/// 调用前磁盘状态可能是「原名缺失 + 半截新文件」（直写模式）或「原名缺失」
-/// （patch 模式在 `.patching` 上失败）。两种都还原成「旧版本原地可用」。
-///
-/// 只做两条文件系统操作、不写日志，是为了让 `tools/devcheck` 的 logic 层能在任意平台
-/// 用真实临时文件断言它（见 [24] 组）；日志由调用方补。
+/// 保留为纯函数，供 `tools/devcheck` 的 logic 层断言旧的回滚语义。
+/// 新的 C9 提交路径不再调用它，安装目录只由 `fs::commit` 的两阶段提交触碰。
 pub fn rollback_self_update_backup_sync(target: &Path, backup: &Path) -> std::io::Result<()> {
     match std::fs::remove_file(target) {
         Ok(()) => {}
-        // 半成品本来就不存在（patch 模式失败在 .patching 上）不算错误
+        // 目标可能本来就不存在（阶段一失败在暂存文件上）不算错误
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
     std::fs::rename(backup, target)
 }
 
-pub async fn rollback_self_update_backup(target: &str, backup: &Path) {
-    let target = PathBuf::from(target);
-    let backup = backup.to_path_buf();
-    let backup_for_log = backup.clone();
-    let res =
-        tokio::task::spawn_blocking(move || rollback_self_update_backup_sync(&target, &backup))
-            .await;
-    match res {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::error!(
-            "自更新回滚失败，旧安装器保留在 {}: {e}",
-            backup_for_log.display()
-        ),
-        Err(e) => tracing::error!("自更新回滚任务失败: {e}"),
-    }
-}
-
-pub async fn create_target_file(target: &str) -> Result<impl AsyncWrite, anyhow::Error> {
+pub async fn create_staged_file(target: &str) -> Result<impl AsyncWrite, anyhow::Error> {
     let target_path = Path::new(target);
     if !target_path.is_absolute()
         || target_path
@@ -976,11 +911,28 @@ pub async fn create_target_file(target: &str) -> Result<impl AsyncWrite, anyhow:
     {
         return Err(anyhow::anyhow!("Invalid or unsafe target path").context("INVALID_TARGET_ERR"));
     }
+    if let Some(parent) = target_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .context("CREATE_PARENT_DIR_ERR")?;
+    }
     let target_file = tokio::fs::File::create(target)
         .await
         .context("CREATE_TARGET_FILE_ERR")?;
     let target_file = tokio::io::BufWriter::new(target_file);
     Ok(target_file)
+}
+
+/// 暂存文件写完并校验后刷盘：rename 只保证元数据原子，NTFS 不记录数据日志。
+pub async fn sync_staged_file(path: &str) -> Result<(), anyhow::Error> {
+    let file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .await
+        .context("OPEN_STAGED_FILE_ERR")?;
+    file.sync_all().await.context("SYNC_STAGED_FILE_ERR")?;
+    Ok(())
 }
 
 pub async fn progressed_copy(
@@ -1040,10 +992,10 @@ pub async fn progressed_copy(
 
 pub async fn progressed_hpatch<R, F>(
     source: R,
-    target: &str,
+    out_path: &str,
     diff_size: usize,
     on_progress: F,
-    override_old_path: Option<PathBuf>,
+    old_path: Option<PathBuf>,
     mut insight: Option<InsightItem>,
 ) -> Result<(usize, Option<InsightItem>), anyhow::Error>
 where
@@ -1060,103 +1012,28 @@ where
             on_progress(downloaded);
         },
     };
-    let target = target.to_string();
-    let target_cl = if let Some(override_old_path) = override_old_path.as_ref() {
-        Path::new(override_old_path)
-    } else {
-        Path::new(&target)
-    };
-    let target_ori = target.clone();
-    let old_target_old = target_cl.with_extension("patchold");
-    // 尝试 移除 old_target_old, do 不 throw 错误 如果 失败
-    let _ = tokio::fs::remove_file(old_target_old).await;
-    // 上次在换文件的中途被结束进程：目标缺失而 `.old` 还在 —— 那是旧版本唯一的一份
-    // 拷贝，先还原回原名；两份都在说明 `.old` 是上次没删掉的残留，清掉。
-    let stale_old = target_cl.with_extension("old");
-    if stale_old.exists() {
-        if target_cl.exists() {
-            let _ = tokio::fs::remove_file(&stale_old).await;
-        } else if let Err(e) = tokio::fs::rename(&stale_old, target_cl).await {
-            tracing::warn!("还原上次中断留下的 {} 失败: {e}", stale_old.display());
-        }
+    let out_path = out_path.to_string();
+    let old_path = old_path.unwrap_or_else(|| PathBuf::from(&out_path));
+    let old_file = std::fs::File::open(&old_path).context("OPEN_TARGET_ERR")?;
+    let target_size = old_file.metadata().context("GET_TARGET_SIZE_ERR")?.len();
+    if let Some(parent) = Path::new(&out_path).parent() {
+        std::fs::create_dir_all(parent).context("CREATE_PARENT_DIR_ERR")?;
     }
-    let new_target = target_cl.with_extension("patching");
-    let target_size = target_cl.metadata().context("GET_TARGET_SIZE_ERR")?;
-    let target_file = std::fs::File::create(new_target.clone()).context("CREATE_NEW_TARGET_ERR")?;
-    let old_target_file = std::fs::File::open(
-        if let Some(override_old_path) = override_old_path.as_ref() {
-            override_old_path.clone()
-        } else {
-            PathBuf::from(target.clone())
-        },
-    )
-    .context("OPEN_TARGET_ERR")?;
+    let target_file = std::fs::File::create(&out_path).context("CREATE_NEW_TARGET_ERR")?;
     let diff_file = tokio_util::io::SyncIoBridge::new(decoder);
     let res = tokio::task::spawn_blocking(move || {
         hpatch_sys::safe_patch_single_stream(
             target_file,
             diff_file,
             diff_size,
-            old_target_file,
-            target_size.file_size() as usize,
+            old_file,
+            target_size as usize,
         )
     })
     .await
     .context("RUN_HPATCH_ERR")?;
-    if res == 1 {
-        // 将目标文件移动到 target.old
-        let old_target = target_cl.with_extension("old");
-        let exe_path = std::env::current_exe().context("GET_EXE_PATH_ERR")?;
-        let target_path_ori = PathBuf::from(target_ori);
-        // 下面这串 rename 是「换文件」的全部窗口：任一步失败都必须把目标还原成旧文件。
-        // 中间态是「目标缺失 + 旧文件在 .old + 新文件在 .patching」——此时进程被结束
-        // 或安装器报错退出，用户手上就只剩一个文件名不对的旧文件和一份半成品。
-        // 如果 旧 文件 是 不 self
-        if exe_path != target_cl && exe_path != target_path_ori {
-            // 重命名为 .old
-            tokio::fs::rename(target_cl, old_target.clone())
-                .await
-                .context("RENAME_TARGET_ERR")?;
-            // 将新文件重命名为原文件名
-            if let Err(e) = tokio::fs::rename(new_target.clone(), target_cl).await {
-                // 还原旧文件、丢掉半成品
-                if let Err(e2) = tokio::fs::rename(old_target.clone(), target_cl).await {
-                    tracing::error!(
-                        "换文件失败且还原失败，旧文件仍在 {}: {e2}",
-                        old_target.display()
-                    );
-                }
-                let _ = tokio::fs::remove_file(&new_target).await;
-                return Err(anyhow::Error::new(e).context("RENAME_NEW_TARGET_ERR"));
-            }
-            // 删除 旧 文件：新文件已经就位，这里失败只留一份垃圾，不该让整次安装报错
-            if let Err(e) = tokio::fs::remove_file(old_target.clone()).await {
-                tracing::warn!("清理旧目标失败，保留 {}: {e}", old_target.display());
-            }
-        } else {
-            let moved_old = if override_old_path.is_none() {
-                // 重命名为 .old
-                tokio::fs::rename(target_cl, old_target.clone())
-                    .await
-                    .context("RENAME_TARGET_ERR")?;
-                true
-            } else {
-                false
-            };
-            // 当前程序已重命名且无法删除，只需用新文件替换
-            if let Err(e) = tokio::fs::rename(new_target.clone(), target_path_ori).await {
-                if moved_old {
-                    let _ = tokio::fs::rename(old_target.clone(), target_cl).await;
-                }
-                let _ = tokio::fs::remove_file(&new_target).await;
-                return Err(anyhow::Error::new(e).context("RENAME_NEW_TARGET_ERR"));
-            }
-        }
-    } else {
-        // 目标从未被动过：删掉半成品，把 patch 自身的错误码报出去
-        if let Err(e) = tokio::fs::remove_file(new_target.clone()).await {
-            tracing::warn!("清理补丁半成品失败，保留 {}: {e}", new_target.display());
-        }
+    if res != 1 {
+        let _ = tokio::fs::remove_file(&out_path).await;
         return Err(anyhow::Error::new(std::io::Error::other(format!(
             "Patch failed with code {res}"
         ))))
