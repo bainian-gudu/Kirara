@@ -11,9 +11,10 @@
 //!
 //! 本文件负责把这些文件挂到与上游相同的模块路径上（`crate::utils::error`、
 //! `crate::utils::dir`、`crate::installer::uninstall`、`crate::installer::lnk`），
-//! 并为上游那两个重量级依赖提供最小桩：
-//! `crate::dfs::InsightItem`（只用到类型本身）与 `crate::local::get_base_with_config`
-//! （只用到「返回一个能 AsyncRead 的东西」）。
+//! 并为重量级依赖提供最小桩：
+//! `crate::dfs::InsightItem`（只用到类型本身）、`crate::local::get_base_with_config`
+//! （只用到「返回一个能 AsyncRead 的东西」），以及 `uninstall.rs` 的暂存、错误码和
+//! 哈希调用面。
 //!
 //! `lnk.rs` 是「用系统 API 换掉 mslnk」那次重构的落点（`IShellLinkW` + `IPersistFile`），
 //! 那段代码只在 Windows 上跑，本地无从执行 —— 挂进来至少保证 COM 接口名、参数类型与
@@ -68,6 +69,77 @@ pub mod utils {
     pub use crate::gen_utils_error as error;
     pub use crate::gen_utils_dir as dir;
     pub use crate::gen_utils_os_version as os_version;
+
+    /// `uninstall.rs` 只构造一个裸错误码；完整模块还依赖 serde_json 等非检查依赖，
+    /// 所以这里只保留调用面。
+    pub mod code {
+        use std::fmt;
+
+        pub const FILE_IO_FAILED: &str = "FILE_IO_FAILED";
+
+        #[derive(Debug)]
+        pub struct Coded {
+            code: &'static str,
+        }
+
+        impl Coded {
+            pub fn bare(code: &'static str) -> Self {
+                Self { code }
+            }
+        }
+
+        impl fmt::Display for Coded {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(self.code)
+            }
+        }
+
+        impl std::error::Error for Coded {}
+    }
+
+    /// `uninstall.rs` 的暂存镜像流程只需要异步哈希接口；真实文件 IO 与 Windows
+    /// 顺序读标志由完整构建覆盖。
+    pub mod hash {
+        pub async fn run_hash(
+            _hash_algorithm: &str,
+            _path: &str,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+}
+
+/// `installer/uninstall.rs` 的暂存镜像路径调用面。实现只保留真实签名；
+/// `fs.rs` 的完整实现依赖 reqwest / WebView2 等宿主组件，不应拖进检查 crate。
+pub mod fs {
+    pub async fn sync_staged_file(_path: &str) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    pub mod staging {
+        use std::path::{Path, PathBuf};
+
+        pub fn is_safe_rel(rel: &str) -> bool {
+            let normalized = rel.replace('/', "\\");
+            if normalized.starts_with('\\') || normalized.contains(':') {
+                return false;
+            }
+            normalized
+                .trim_end_matches('\\')
+                .split('\\')
+                .filter(|part| !part.is_empty())
+                .all(|part| part != "." && part != "..")
+        }
+
+        pub fn join_rel(base: &Path, rel: &str) -> PathBuf {
+            if !is_safe_rel(rel) {
+                return base.to_path_buf();
+            }
+            rel.split(['/', '\\'])
+                .filter(|part| !part.is_empty())
+                .fold(base.to_path_buf(), |path, part| path.join(part))
+        }
+    }
 }
 
 /// 对应上游 `src/local.rs`：真实实现要 mmap 自身并解析内嵌索引，

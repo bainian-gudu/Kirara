@@ -473,6 +473,11 @@ pub async fn uac_ipc_main(args: crate::cli::arg::UacArgs) {
             tracing::info!("Write thread finished");
         }
     }
+
+    // 提权 helper 没有 UI 窗口，主窗口的 WM_CLOSE 退出自删路径不会触发。
+    // 自更新把旧镜像留在暂存目录的 `old\` 时，必须在这里补执行一次；
+    // 非自更新的 helper 退出时这里是空操作。
+    crate::installer::uninstall::delete_self_on_exit();
 }
 
 #[cfg(test)]

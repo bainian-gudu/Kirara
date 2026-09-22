@@ -21,9 +21,9 @@ use crate::session::types::{settings_from_cli, SessionInput};
 use crate::session::ui::SessionUi;
 use crate::session::ProjectConfig;
 use crate::utils::code::{
-    coded_from_error, extract, should_report_error, Coded, Extracted, MIRRORC_CDK_BANNED,
-    MIRRORC_CDK_EXPIRED, MIRRORC_CDK_INVALID, MIRRORC_CDK_MISMATCH, MIRRORC_CDK_MISSING,
-    PKG_BROKEN, TEMP_DIR_UNAVAILABLE, WEBVIEW2_REQUIRED,
+    coded_from_error, extract, Coded, Extracted, MIRRORC_CDK_BANNED, MIRRORC_CDK_EXPIRED,
+    MIRRORC_CDK_INVALID, MIRRORC_CDK_MISMATCH, MIRRORC_CDK_MISSING, PKG_BROKEN,
+    TEMP_DIR_UNAVAILABLE, WEBVIEW2_REQUIRED,
 };
 use crate::utils::i18n;
 use crate::utils::taskdialog::{
@@ -531,14 +531,8 @@ async fn native_session(
             Ok(NativeOutcome::Exit)
         }
         Err(err) => {
-            let event_id = if should_report_error(&err) {
-                Some(crate::utils::sentry::capture_anyhow(&err))
-            } else {
-                None
-            };
             let reopen = cdk_should_reopen(&err);
             if let Some(mut coded) = coded_from_error(&err) {
-                coded.event_id = event_id;
                 show_error_coded(&coded, desktop_hwnd());
                 sess.state.phase = Phase::Failed(coded);
                 sess.apply(Intent::Dismiss);

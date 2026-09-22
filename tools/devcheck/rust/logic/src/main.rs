@@ -1489,8 +1489,8 @@ fn uac_cleanup_wiring_case() {
         .expect("repo root")
         .to_path_buf();
 
-    let manager = std::fs::read_to_string(repo.join("src-tauri/src/ipc/manager.rs"))
-        .expect("read ipc/manager.rs");
+    let manager = std::fs::read_to_string(repo.join("src-tauri/src/ipc_v2/manager.rs"))
+        .expect("read ipc_v2/manager.rs");
     let uac_body = manager
         .split("pub async fn uac_ipc_main")
         .nth(1)
