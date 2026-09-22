@@ -33,7 +33,7 @@ CI 上超时，测试进程和更新器一直留在运行中。
 |---|---|
 | `should_show_dialog(false, false)` 为真 | PASS：devcheck logic 层 [25] 组断言 |
 | 静默、非交互、两者同时为真时均不弹框 | PASS：devcheck logic 层 [25] 组 3 条断言 |
-| 静默更新下载中断后失败进程退出，CI 不再等到 10 分钟超时 | 待本次修复的 `interrupted-download` e2e 验证 |
+| 静默更新下载中断后失败进程退出，CI 不再等到 10 分钟超时 | PASS：`Build` run `35699771148` 的 `interrupted-download` job success，整条工作流 success |
 
 ## Consequences
 
