@@ -90,7 +90,7 @@ async function test() {
     console.log('Installing v1...');
     const installResult = await runInstaller(
       installerV1,
-      `-S -D ${testDir}`,
+      [FLAGS, '-D', testDir],
       'v1 installation',
     );
     assertExitOk(installResult, 'v1 installation');
@@ -104,7 +104,7 @@ async function test() {
     console.log('Updating to v2 with a server that truncates the package...');
     const failedUpdate = await runInstaller(
       updaterPath,
-      `${FLAGS} -D ${testDir} --source local-v2`,
+      [FLAGS, '-D', testDir, '--source', 'local-v2'],
       'interrupted update',
     );
     console.log(
@@ -144,7 +144,7 @@ async function test() {
     resume();
     const retry = await runInstaller(
       updaterPath,
-      `${FLAGS} -D ${testDir} --source local-v2`,
+      [FLAGS, '-D', testDir, '--source', 'local-v2'],
       'retried update',
     );
     assertExitOk(retry, 'retried update');
