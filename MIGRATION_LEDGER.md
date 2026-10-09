@@ -385,10 +385,38 @@ WSL 内可做的校验已做完（不需要 Windows）：
   `extraUninstallLnkNames` / `userDataPath` / `runtimes` 与内联 `agreement`，与下游
   `packaging.config.json` 同形，可以直接作为升级重演的输入。
 
-**尚未执行**：重演与隔离打包都要跑 Windows PE（安装器写注册表 / 快捷方式 / 计划任务，
-builder 做 PE 拼接），本机 WSL 无 MSVC、无 WebView2、也无交互桌面，因此按「未验证」记。
-两条路线：Kirara 加手动触发的 `p6-e2e.yml` 在 windows runner 上重演；或把固定 SHA 的
-builder 与冻结旧包拿到目标 Windows 机器上按 runbook 手跑。
+**已执行**：`.github/workflows/p6-e2e.yml`（手动触发）在 windows-2022 runner 上用
+本提交构建的 builder 跑完整条链路，run `37920859476` 全绿（26 项断言，`failures: []`）。
+本机 WSL 无 MSVC、无 WebView2，重演与打包都跑 Windows PE，因此执行放在 runner 上，
+现场（新包、载荷、安装器日志、`p6-summary.json`）下载到
+`~/workspace/kirara-p6/evidence/run-37920859476/`。
+
+关键证据：
+
+```
+=== 隔离打包：extract → pack → gen → pack ===   （下游 bainian-gudu/HoYoEnhance@b049be6d）
+  ✓ 载荷按真实路径落盘   ✓ 隔离目录里产出新安装包   ✓ 新包载荷清单含索引与主程序
+=== 旧包装入 ===
+  ✓ 旧包装出 HoYoEnhance.exe / .uninst.exe / .update.exe / FpsUnlockerStub.dll /
+    StarRailStub.dll / ui/index.html      ✓ 旧包写下 ARP 卸载记录
+  旧包装出快捷方式：C:\Users\Public\Desktop\HoYoEnhance.lnk,
+    C:\ProgramData\Microsoft\Windows\Start Menu\Programs\HoYoEnhance[\HoYoEnhance.lnk]
+  ✓ 自启项已布置   ✓ 计划任务已布置
+=== 升级到新包 ===
+  ✓ ARP 记录版本被升级改写   ✓ 安装目录里的更新器换成了新 builder 的产物   ✓ 升级不动用户数据
+=== 卸载 ===
+  ✓ 安装目录被删除   ✓ ARP 记录被删除   ✓ 安装期快捷方式被删除   ✓ 自启项被回收
+  ✓ 计划任务被回收   ✓ 未勾选时用户数据保留   ✓ 暂存目录已回收   ✓ %TEMP% 里安装期临时文件已回收
+```
+
+本轮固定产物：builder（commit `dd679e5`）`6d04bbc666e2e18cb9d173c8c4699c93fccb29a134ad8b43dbbf7d2a56577496`；
+隔离打包产出的 `HoYoEnhance.Install.1.0.1.exe` `63b2ebfcfd1c076f433161bab06bf321e4ebf6623af795cadc6cef4cce31b419`；
+旧包仍是冻结值 `d02fe926…`。builder 是同一提交现编的产物，跨构建不可复现（链接时间戳与
+路径进镜像），所以「固定 SHA」以运行记录里的 SHA256 为准，而不是拿它当可复现构建校验。
+
+**仍未覆盖**：Windows 10/11 桌面交互路径——WebView2 界面、UAC 弹窗、OneDrive 重定向过的
+用户目录（卸载器的跨用户重放对重定向目录只命中当前进程用户那一份）、真实游戏进程占用下的
+卸载。这些要在目标桌面机器上按 runbook 的路线 B 手跑。
 
 ## 未验证项（阻塞）
 
@@ -404,6 +432,6 @@ builder 与冻结旧包拿到目标 Windows 机器上按 runbook 手跑。
   `native/utils/acl.rs` 的 SDDL 改回上游那串即可回退）、`Get-AuthenticodeSignature`
   的证书 Subject 布局（不匹配时 fail-closed，错误信息带实际 status 与 subject）、
   `%SystemRoot%\Temp` 在标准用户下的可写性、旧版本安装包的原地升级、H3 真实连接。
-- **未做的事**：P6 的跨版本重演与下游隔离打包尚未执行（冻结产物与方案已就绪，见上）；
-  tag 与 Release 需明确批准后才做；`docs/notes/` 里少数上游笔记仍把 `msquic` 列为
-  C 依赖示例，属于上游文档，未改动。
+- **未做的事**：tag 与 Release 需明确批准后才做；桌面交互路径（WebView2 界面、UAC
+  弹窗、OneDrive 重定向目录）要在目标 Windows 机器上按 runbook 路线 B 手跑；
+  `docs/notes/` 里少数上游笔记仍把 `msquic` 列为 C 依赖示例，属于上游文档，未改动。
