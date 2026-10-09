@@ -34,12 +34,23 @@ include!("gen/extracted.rs");
 static CHECKS: AtomicU32 = AtomicU32::new(0);
 static FAILURES: AtomicU32 = AtomicU32::new(0);
 
+/// 失败明细。断言的详细差异不跟断言一起打，而是攒起来在最后统一打印：
+/// devcheck 只回显子进程输出的**尾部**（`Invoke-Native -Tail`），失败夹在 160 条
+/// `ok` 中间时会被截掉 —— 真发生过一次：CI 上只有 1 条明细进了日志，另外 5 条
+/// 只剩一个「6 条失败」的汇总。
+static FAILURE_DETAILS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn record_failure(detail: String) {
+    FAILURE_DETAILS.lock().expect("失败明细锁").push(detail);
+}
+
 fn check(cond: bool, label: &str) {
     CHECKS.fetch_add(1, Ordering::Relaxed);
     if cond {
         println!("  ok    {label}");
     } else {
         FAILURES.fetch_add(1, Ordering::Relaxed);
+        record_failure(label.to_string());
         println!("  FAIL  {label}");
     }
 }
@@ -50,7 +61,8 @@ fn eq<T: std::fmt::Debug + PartialEq>(actual: T, expected: T, label: &str) {
         println!("  ok    {label}");
     } else {
         FAILURES.fetch_add(1, Ordering::Relaxed);
-        println!("  FAIL  {label}\n        actual:   {actual:?}\n        expected: {expected:?}");
+        record_failure(format!("{label}\n        actual:   {actual:?}\n        expected: {expected:?}"));
+        println!("  FAIL  {label}");
     }
 }
 
@@ -60,7 +72,8 @@ fn eqs(actual: String, expected: &str, label: &str) {
         println!("  ok    {label}");
     } else {
         FAILURES.fetch_add(1, Ordering::Relaxed);
-        println!("  FAIL  {label}\n        actual:   {actual:?}\n        expected: {expected:?}");
+        record_failure(format!("{label}\n        actual:   {actual:?}\n        expected: {expected:?}"));
+        println!("  FAIL  {label}");
     }
 }
 
@@ -87,8 +100,27 @@ fn hash32(hex_str: &str) -> [u8; 32] {
     hex_bytes(hex_str).try_into().expect("SHA-256 是 32 字节")
 }
 
+/// 用例里的路径都按 POSIX 写法给，再由它变成**本平台上真的绝对**的路径。
+///
+/// 不能直接用 `Path::new("/home/x")`：在 Windows 上那不是绝对路径（没有盘符 / UNC
+/// 前缀），`is_absolute()` 相关的判定会整组失去意义 —— 而「必须是绝对路径」正是这些
+/// 安全阀最关键的一条前提。补一个盘符后，同一组断言在两个平台上测的是同一件事。
+fn abs(posix: &str) -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from(format!("C:{}", posix.replace('/', "\\")))
+    } else {
+        PathBuf::from(posix)
+    }
+}
+
+/// 路径转成 `/` 分隔的字符串：Windows 的 `to_string_lossy` 给的是 `\`，直接断言会
+/// 变成平台相关的期望值。
+fn posix(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
 fn tail_str(path: &str) -> Option<String> {
-    profile_relative_tail(Path::new(path)).map(|p| p.to_string_lossy().replace('\\', "/"))
+    profile_relative_tail(&abs(path)).map(|p| posix(&p))
 }
 
 fn main() {
@@ -96,9 +128,10 @@ fn main() {
     let scratch = std::env::temp_dir().join(format!("kirara-devcheck-logic-{}", std::process::id()));
     std::fs::create_dir_all(&scratch).expect("建临时目录");
 
-    // 让判定与开发机环境无关：只保留我们显式设置的变量。
-    std::env::set_var("USERPROFILE", "/home/devcheck");
-    std::env::set_var("SystemRoot", "/sysroot");
+    // 让判定与开发机环境无关：只保留我们显式设置的变量（都用本平台的绝对路径，
+    // 否则 Windows 上 `path_eq` / `strip_prefix` 这些按路径比较的判定会对不上）。
+    std::env::set_var("USERPROFILE", abs("/home/devcheck"));
+    std::env::set_var("SystemRoot", abs("/sysroot"));
     for name in [
         "SystemDrive",
         "ProgramFiles",
@@ -129,59 +162,59 @@ fn main() {
     check(!is_safe_rel("\\abs"), "根路径拒绝");
     check(!is_safe_rel("C:evil"), "盘符相对路径拒绝");
     check(!is_safe_rel("a:b"), "含冒号拒绝");
-    let base = Path::new("/base");
+    let base = abs("/base");
     eq(
-        try_join_rel(base, "a\\b").map(|p| p.to_string_lossy().replace('\\', "/")),
-        Some("/base/a/b".to_string()),
+        try_join_rel(&base, "a\\b").map(|p| posix(&p)),
+        Some(format!("{}/a/b", posix(&base))),
         "try_join_rel 拼在 base 下",
     );
-    eq(try_join_rel(base, "..\\x"), None, "try_join_rel 拒绝越界");
+    eq(try_join_rel(&base, "..\\x"), None, "try_join_rel 拒绝越界");
 
     group("删目录安全阀 is_safe_delete_root");
     check(
         !is_safe_delete_root(Path::new("relative/dir")),
         "相对路径拒绝",
     );
-    check(!is_safe_delete_root(Path::new("/one")), "只有一段拒绝");
-    check(!is_safe_delete_root(Path::new("/a/../b")), "含 `..` 拒绝");
+    check(!is_safe_delete_root(&abs("/one")), "只有一段拒绝");
+    check(!is_safe_delete_root(&abs("/a/../b")), "含 `..` 拒绝");
     check(
-        !is_safe_delete_root(Path::new("/home/REPARSE/App")),
+        !is_safe_delete_root(&abs("/home/REPARSE/App")),
         "重解析点拒绝",
     );
     check(
-        !is_safe_delete_root(Path::new("/home/devcheck")),
+        !is_safe_delete_root(&abs("/home/devcheck")),
         "受保护位置本身（USERPROFILE）拒绝",
     );
     check(
-        !is_safe_delete_root(Path::new("/sysroot/app/data")),
+        !is_safe_delete_root(&abs("/sysroot/app/data")),
         "SystemRoot 之下拒绝",
     );
     check(
-        is_safe_delete_root(Path::new("/home/devcheck/AppData/Local/App")),
+        is_safe_delete_root(&abs("/home/devcheck/AppData/Local/App")),
         "用户数据目录放行",
     );
     check(
-        is_safe_delete_root(Path::new("/opt/Kirara/log")),
+        is_safe_delete_root(&abs("/opt/Kirara/log")),
         "普通两级目录放行",
     );
-    std::env::set_var("TEMP", "/tmpzone/sub");
+    std::env::set_var("TEMP", abs("/tmpzone/sub"));
     check(
-        !is_safe_delete_root(Path::new("/tmpzone/sub")),
+        !is_safe_delete_root(&abs("/tmpzone/sub")),
         "TEMP 指向的目录拒绝",
     );
     std::env::remove_var("TEMP");
     check(
-        is_safe_delete_root(Path::new("/tmpzone/sub")),
+        is_safe_delete_root(&abs("/tmpzone/sub")),
         "去掉 TEMP 后同一路径放行（证明上一条是被 TEMP 拦下的）",
     );
 
     group("快捷方式安全阀 is_safe_shortcut_path");
     check(
-        is_safe_shortcut_path(Path::new("/home/devcheck/Desktop/App.lnk")),
+        is_safe_shortcut_path(&abs("/home/devcheck/Desktop/App.lnk")),
         ".lnk 放行",
     );
     check(
-        is_safe_shortcut_path(Path::new("/home/devcheck/Desktop/App.LNK")),
+        is_safe_shortcut_path(&abs("/home/devcheck/Desktop/App.LNK")),
         "扩展名大小写不敏感",
     );
     check(
@@ -189,15 +222,15 @@ fn main() {
         "相对路径拒绝",
     );
     check(
-        !is_safe_shortcut_path(Path::new("/home/devcheck/Desktop/App.txt")),
+        !is_safe_shortcut_path(&abs("/home/devcheck/Desktop/App.txt")),
         "非 .lnk 拒绝",
     );
     check(
-        !is_safe_shortcut_path(Path::new("/home/devcheck/Desktop/REPARSE/App.lnk")),
+        !is_safe_shortcut_path(&abs("/home/devcheck/Desktop/REPARSE/App.lnk")),
         "重解析点拒绝",
     );
     check(
-        !is_safe_shortcut_path(Path::new("/home/devcheck/Desktop/../App.lnk")),
+        !is_safe_shortcut_path(&abs("/home/devcheck/Desktop/../App.lnk")),
         "含 `..` 拒绝",
     );
 
@@ -500,36 +533,34 @@ fn main() {
     );
 
     group("解包路径安全阀 builder/extract.rs");
+    let out_root = abs("/out");
     eq(
-        relative_under_root(Path::new("/out"), "a/b")
-            .map(|p| p.to_string_lossy().replace('\\', "/")),
-        Ok("/out/a/b".to_string()),
+        relative_under_root(&out_root, "a/b").map(|p| posix(&p)),
+        Ok(format!("{}/a/b", posix(&out_root))),
         "普通相对路径拼在输出根下",
     );
     check(
-        relative_under_root(Path::new("/out"), "../x").is_err(),
+        relative_under_root(&out_root, "../x").is_err(),
         "`..` 拒绝",
     );
     check(
-        relative_under_root(Path::new("/out"), "/abs").is_err(),
+        relative_under_root(&out_root, "/abs").is_err(),
         "绝对路径拒绝",
     );
     check(
-        relative_under_root(Path::new("/out"), "").is_err(),
+        relative_under_root(&out_root, "").is_err(),
         "空路径拒绝",
     );
     // `Path::components()` 会把中间的 `.` 归一掉（只有开头的 `.` 会留下 CurDir
     // 而被拒绝），所以 `a/./b` 落在输出根内，属于放行而不是越界。
     eqs(
-        relative_under_root(Path::new("/out"), "a/./b")
-            .expect("中间的 `.` 由 components() 归一，不越界")
-            .to_string_lossy()
-            .into_owned(),
-        "/out/a/b",
+        posix(&relative_under_root(&out_root, "a/./b")
+            .expect("中间的 `.` 由 components() 归一，不越界")),
+        &format!("{}/a/b", posix(&out_root)),
         "中间的 `.` 归一后仍在根内",
     );
     check(
-        relative_under_root(Path::new("/out"), "./a").is_err(),
+        relative_under_root(&out_root, "./a").is_err(),
         "开头的 `.` 拒绝",
     );
     eqs(sanitize_output_name(""), "_unnamed", "空名换成占位名");
@@ -685,6 +716,11 @@ fn main() {
     let failures = FAILURES.load(Ordering::Relaxed);
     println!("\n──── logic：{checks} 条断言，{failures} 条失败 ────");
     if failures > 0 {
+        // 明细放在最末尾：devcheck 只回显尾部输出，夹在中间会被截掉。
+        println!("\n──── 失败明细（{failures} 条）────");
+        for detail in FAILURE_DETAILS.lock().expect("失败明细锁").iter() {
+            println!("  ✗ {detail}");
+        }
         std::process::exit(1);
     }
 }

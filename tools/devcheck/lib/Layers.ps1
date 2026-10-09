@@ -387,7 +387,7 @@ function Test-RustLogic {
     $cargo = Get-Tool 'cargo'
     if (-not $cargo) { Skip-Layer 'cargo 不在 PATH（https://rustup.rs）' }
     $r = Invoke-Native -FilePath $cargo -Arguments @('run', '--quiet') `
-        -WorkingDirectory (Join-Path $DevCheckRoot 'rust/logic') -Tail 90
+        -WorkingDirectory (Join-Path $DevCheckRoot 'rust/logic') -Tail 120
     if ($r.ExitCode -ne 0) { throw '行为断言失败，见上方输出' }
     $summary = ($r.Output -split "`r?`n" | Where-Object { $_ -match '条断言' } | Select-Object -Last 1)
     if (-not $summary) { throw 'logic 没有打印断言条数 —— 抽取出来的 item 一条都没跑到？' }
