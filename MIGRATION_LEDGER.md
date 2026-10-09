@@ -360,6 +360,36 @@ Compare recorded dump with planner
   （`no history in common`），曾用一个树拷贝的桥接提交开 PR #2 供审查；改名后该 PR
   已关闭、桥接分支已删除，审查记录留在 PR #2 与本文档。
 
+## P6 准备：冻结产物与结构校验
+
+执行方案（作用、步骤、命令、回退）在仓库外
+`~/workspace/Kirara-p6-e2e-runbook.md`。冻结产物放在 WSL `~/workspace/kirara-p6/`，
+不进仓库；下载与校验都已完成：
+
+| 角色 | 来源 | 大小 | SHA256 |
+| --- | --- | --- | --- |
+| 旧 builder | Kirara Release `v0.5.2` | 13080576 | `512fed838cdba9e699053a21f36d841a3da05e83871c3ca6d4515f8aa54d1e01` |
+| 冻结旧安装包 | HoYoEnhance Release `v1.0.0` 的 `HoYoEnhance.Install.1.0.0.exe` | 16069024 | `d02fe92671b796c1f8e4cbe7e716ca967eeeff2b74d341fbed4856bd7bdc015a` |
+| 新 builder（迁移后 `main` 的 CI 产物） | run `37917876572` artifact 的 `kachina-builder.exe`（= bundle） | 7019520 | `95d812c867ddf56c8d6cedf70ee9117cb9040c660a41ef1f265d3fca8605ad53` |
+| 同上，未拼接 builder | 同一 artifact 的 `kachina-builder-standalone.exe` | 2908160 | `4c284eff0fcb00a0044d52a60106f7f62b14ee058c663b6620adf1984d7a33aa` |
+| 同上，安装器映像 | 同一 artifact 的 `kachina-installer.exe` | 4111360 | `0552ca33cf1ed4aa13450c8c8503da1189c80ab10643ec2fbecd99bc31b685d4` |
+
+WSL 内可做的校验已做完（不需要 Windows）：
+
+- 旧包完整性：HoYoEnhance 发布自带的 `SHA256SUMS.txt` 三个资产全部 `OK`。
+- 拼接不变量：`bundle == standalone ++ installer`（逐字节比对），且
+  `2908160 + 4111360 = 7019520`，说明交付的 `kachina-builder.exe` 确实是拼接体而不是
+  cargo 的裸 builder。
+- 旧包结构：按 TLV 解析出 33 个条目（`\0CONFIG` 6768B、`\0INDEX`、`\0META` 与 30 个载荷），
+  内嵌配置含 `extraUninstallRegistry` / `extraUninstallScheduledTasks` /
+  `extraUninstallLnkNames` / `userDataPath` / `runtimes` 与内联 `agreement`，与下游
+  `packaging.config.json` 同形，可以直接作为升级重演的输入。
+
+**尚未执行**：重演与隔离打包都要跑 Windows PE（安装器写注册表 / 快捷方式 / 计划任务，
+builder 做 PE 拼接），本机 WSL 无 MSVC、无 WebView2、也无交互桌面，因此按「未验证」记。
+两条路线：Kirara 加手动触发的 `p6-e2e.yml` 在 windows runner 上重演；或把固定 SHA 的
+builder 与冻结旧包拿到目标 Windows 机器上按 runbook 手跑。
+
 ## 未验证项（阻塞）
 
 - **本机没有 Windows 运行环境**：开发机是 WSL，无 MSVC 工具链与 WebView2。本机证据
@@ -374,5 +404,6 @@ Compare recorded dump with planner
   `native/utils/acl.rs` 的 SDDL 改回上游那串即可回退）、`Get-AuthenticodeSignature`
   的证书 Subject 布局（不匹配时 fail-closed，错误信息带实际 status 与 subject）、
   `%SystemRoot%\Temp` 在标准用户下的可写性、旧版本安装包的原地升级、H3 真实连接。
-- **未做的事**：P6 的端到端发布（tag、Release 资产、下游隔离打包）尚未执行；
-  `docs/notes/` 里少数上游笔记仍把 `msquic` 列为 C 依赖示例，属于上游文档，未改动。
+- **未做的事**：P6 的跨版本重演与下游隔离打包尚未执行（冻结产物与方案已就绪，见上）；
+  tag 与 Release 需明确批准后才做；`docs/notes/` 里少数上游笔记仍把 `msquic` 列为
+  C 依赖示例，属于上游文档，未改动。
