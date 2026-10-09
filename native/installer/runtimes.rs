@@ -172,6 +172,9 @@ pub async fn install_dotnet(
     // close streams
     drop(stream);
     drop(target);
+    // 落地目录由提权进程决定（提权时在安装目录旁、普通用户进不去），但文件在
+    // 「写完 → 启动」之间仍可能被替换，且下载源本身也可能被劫持：运行前验微软签名。
+    crate::utils::secure_temp::verify_microsoft_signed(&installer_path).await?;
     notify(Progress::Stage(
         crate::session::state::ProgressStage::InstallRuntime,
     ));
@@ -258,6 +261,8 @@ pub async fn install_vcredist(
     // close streams
     drop(stream);
     drop(target);
+    // 见 install_dotnet：运行前验微软签名，不通过就删掉文件并报错。
+    crate::utils::secure_temp::verify_microsoft_signed(&installer_path).await?;
     notify(Progress::Stage(
         crate::session::state::ProgressStage::InstallRuntime,
     ));

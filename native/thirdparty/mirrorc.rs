@@ -153,6 +153,13 @@ pub fn run_mirrorc_install_sync(
                 .into_ta_result()
                 .context("CREATE_DIR_ERR")?;
         }
+        // 条目路径已经过 `is_safe_rel`，这里再挡一次重解析点：预置的符号链接 / junction
+        // 会让提权进程把解包内容写到 staging 之外。
+        if crate::fs::staging::has_reparse_point(&out_path) {
+            return Err(anyhow::Error::from(Coded::bare(MIRRORC_FAILED))
+                .context("reparse point in archive path")
+                .into());
+        }
         let mut out_file = std::fs::File::create(&out_path)
             .into_ta_result()
             .context(format!("CREATE_FILE_ERR: {}", out_path.display()))?;

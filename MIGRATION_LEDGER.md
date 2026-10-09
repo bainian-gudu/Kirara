@@ -25,7 +25,7 @@
 | P0 冻结基线与建立隔离分支 | 完成 | 分支 `codex/migrate-upstream-main` 起自 `05a1410` |
 | P1 标准目标 + 构建入口 + 产物接口 | 部分 | 目标与产物接口已改；**Windows 构建未执行**（本环境无 MSVC/WebView2） |
 | P2 配置、打包与升级兼容 | 部分 | 协议内联（第 2 项）与改名兼容（第 12 项）已落地；未识别字段检测、打包器修复（第 17 项）待办 |
-| P3 卸载、提权与事务性安全 | 部分 | 卸载侧安全阀与扩展清理已落地（第 1/1b/1c/8 项）；提权管道 ACL 收紧、日志/暂存重解析点拦截已落地（第 3/9 项）；下载后执行验签待办 |
+| P3 卸载、提权与事务性安全 | 完成 | 卸载侧安全阀与扩展清理（第 1/1b/1c/8 项）、提权管道 ACL、重解析点拦截、下载后执行验签（第 3/9 项）均已落地 |
 | P4 前端体验与隐私 | 部分 | 遥测移除（第 7 项）、协议弹窗与 footer 布局（第 2/5 项）已完成；历史版本提示待核 |
 | P5 依赖、文档与 CI 门禁 | 部分 | CI 已关闭 release PDB；依赖替换（第 4/14/15/16 项）待办 |
 | P6 端到端兼容、发布与回退 | 待办 | |
@@ -36,13 +36,13 @@
 | --- | --- | --- |
 | 1 / 1b / 1c 卸载注册表、快捷方式、计划任务扩展 | 完成 | 见下「P3 已落地改动与证据」 |
 | 2 协议文件、格式、标题、弹窗 | 完成 | 见下「P2 / P4 已落地改动与证据」 |
-| 3 删除范围与提权面安全阀 | 部分 | 卸载侧四类判定 + 清单路径越界拦截 + 提权管道 ACL 已落地；下载后执行验签待办 |
+| 3 删除范围与提权面安全阀 | 完成 | 卸载侧四类判定、清单路径越界拦截、提权管道 ACL、下载后执行验签均已落地；宿主侧 `UninstallLauncher` / `ResolveDotNetCli` 不在本仓库（见下） |
 | 4 vendored rcedit 兼容 | 待办 | 上游仍用 `Devolutions/rcedit-rs` git 依赖；核对 MSVC 14.51 是否需要 vendoring |
 | 5 弹窗 footer | 完成 | `.dialog` 改纵向 flex、footer 回文档流；见下 |
 | 6 多用户与临时残留清理 | 完成 | `%VAR%` 展开、跨用户重放、`%TEMP%` 白名单、卸载前结束进程，见下 |
 | 7 物理移除遥测 | 完成 | 见下「P4 已落地改动与证据」 |
-| 8 卸载收尾、路径比较、提权状态、ARP 静默入口 | 部分 | ARP 加引号 + 静默入口已落地；提权状态由上游等价实现覆盖 |
-| 9 安全临时文件、下载验签、提权管道 | 部分 | 清单越界、提权管道 ACL、日志/暂存重解析点已落地（见下）；下载后执行的验签待办 |
+| 8 卸载收尾、路径比较、提权状态、ARP 静默入口 | 完成 | ARP 加引号 + 静默入口 + 卸载时清 Mirror酱 CDK 凭据已落地；收尾顺序与路径比较由上游 `normalize_full` / 错误收集覆盖；提权状态由上游等价实现覆盖 |
+| 9 安全临时文件、下载验签、提权管道 | 完成 | 清单越界、提权管道 ACL、日志/暂存重解析点、下载后执行验签与 `get_userprofile` 修复均已落地（见下） |
 | 10 DFS 拆分/注释 | 待办 | 旧 `src/dfs.ts` 与新 `native/session/`（含 `download_plan.rs`、`rate.rs`）职责映射 |
 | 11 编译告警治理 | 部分 | 上游 `05a1410` 已清理一批；剩余待构建后确认 |
 | 12 改名后的升级兼容 | 完成 | `legacyExeNames` / `legacyProgramFilesPaths` / `legacyUninstallNames`，见下 |
@@ -121,7 +121,7 @@
 | 提权管道存活 | `native/ipc/manager.rs` | 不适用：上游已用 `fail_all_pending` 让在途请求立刻报错，`run()` 在发送失败时也提前返回 `IPC_ERR`；且 `ManagedElevate` 按会话创建，重试即新起 helper，不存在「永远转圈」 |
 | 环境变量展开（第 6 项） | `native/installer/uninstall.rs` 的 `expand_env_vars` / `expand_path_list` | 在**卸载器进程内**展开 `%VAR%`（提权后 `%LOCALAPPDATA%` 是执行账户的），未知变量原样保留、`%%` 是字面 `%`；展开发生在安全阀之前 |
 | 跨用户清理（第 6 项） | `native/installer/uninstall.rs` 的 `profile_relative_tail` / `loaded_profile_roots` / `collect_all_users_cleanup_targets` / `clean_per_user_leftovers` | 从 `ProfileList\<SID>\ProfileImagePath` 枚举已加载用户，把「相对用户目录的尾巴」重放到每个用户；只放行 `AppData` / `Documents` / `Desktop` 下的产品目录，`Desktop` 只认 `.lnk`，叶子命中 Shell 容器黑名单即拒绝；勾选语义自动跟随（没勾就没有 `userDataPath`） |
-| `%TEMP%` 白名单（第 6 项） | `native/installer/uninstall.rs` 的 `is_installer_temp_artifact` / `clean_installer_temp_files` | 只认固定形状：日志、WebView2 引导器、协议查看临时文件；只删文件不递归。运行时安装包与卸载器副本已由 staging 目录回收，不再单列 |
+| `%TEMP%` 白名单（第 6 项） | `native/installer/uninstall.rs` 的 `is_installer_temp_artifact` / `clean_installer_temp_files` | 只认固定形状：WebView2 引导器、协议查看临时文件；只删文件不递归。运行时安装包与卸载器副本已由 staging 目录回收，不再单列。`KachinaInstaller.log` **不删**：它是本次会话的诊断记录，行为测试也要在进程退出后读它（见下「CI 回归」） |
 | 卸载前结束进程（第 6 项） | `native/session/run.rs` 的 `prepare_process` / `run_uninstall_inner` | 卸载前按当前名与历史名找安装目录内的实例，询问后结束（静默卸载直接结束）；结束后等 1s 让 WebView2 缓存释放；用户拒绝则回到卸载页（`SessionResult::uninstall_cancelled`） |
 
 验证证据（本机 WSL，非 Windows 运行验证）：
@@ -180,6 +180,53 @@
 - `cargo check --target x86_64-pc-windows-msvc --all-targets` 通过，**0 warning / 0 error**。
 - SDDL 合法性由 `ConvertStringSecurityDescriptorToSecurityDescriptorW` 在真机运行时校验，
   `CO` / `ML;;NW;;;ME` 是标准 SDDL 记号；真机提权安装 / 卸载流程需 Windows 上确认。
+
+## P3 已落地改动与证据（第 3 / 9 项：下载后执行链路的落地与验签）
+
+「下载一个可执行文件、然后运行它」这条链路在新架构里有三处（.NET 运行时、VC++ 运行库、
+WebView2 引导器）。上游的写法是 `%TEMP%` 里的固定文件名 + `CREATE_ALWAYS` 写入（会跟随
+符号链接）+ 下完不验签直接运行，普通权限进程可以在「写完 → 启动」之间把文件换成自己的
+exe，下载源被劫持时也照样执行。这里统一收口到 `native/utils/secure_temp.rs`。
+
+| 改动 | 落点 | 说明 |
+| --- | --- | --- |
+| 新增落地 / 验签模块 | `native/utils/secure_temp.rs` | `package_dir`（优先 `%SystemRoot%\Temp`，退回 `%TEMP%`）、`package_path`（UUID 文件名）、`create_exclusive_file`（`create_new`，不跟随已存在链接）、`is_trusted_microsoft_signature`（纯函数）、`verify_microsoft_signed`（走 PowerShell `Get-AuthenticodeSignature`，失败删文件并报错） |
+| WebView2 引导器 | `native/module/wv2.rs` | 由 `%TEMP%` 固定名 + `tokio::fs::write` 改为 `package_path` + 独占创建 + 写入 + 执行前验签，失败删文件并走原有错误对话框 |
+| 运行时安装包验签 | `native/installer/runtimes.rs` | .NET 与 VC++ 两处在 `progressed_copy` 之后、`process::spawn` 之前调用 `verify_microsoft_signed`；落地目录仍是 staging `dl\`（提权时在安装目录旁、由提权进程写入，且 `create_staged_file` 已拒重解析点） |
+| profile 目录解析 | `native/utils/dir.rs` | `get_userprofile` 由 `GetUserProfileDirectoryW(HANDLE::default(), …)` 改为 `FOLDERID_Profile`：前者需要有效用户令牌句柄，传空句柄会以 `ERROR_INVALID_HANDLE` 失败并让私有目录判定失效。新增 `path_is_equal_or_child`（统一分隔符、忽略大小写、整段比较）替换 `Path::starts_with` |
+| Mirrorc ZIP 条目 | `native/thirdparty/mirrorc.rs` | 条目路径已过 `is_safe_rel`（绝对 / `..` / 系统目录），新增重解析点拦截；条目遍历用 `archive.len()`，不漏最后一项（上游已如此） |
+| 卸载器镜像落盘 | `native/installer/uninstall.rs` 的 `stage_self_image` | 名字已过 `is_safe_rel`，新增重解析点拦截，避免提权进程跟随预置链接写到 staging 之外 |
+| 卸载清 CDK 凭据 | `native/session/run.rs` 的 `run_uninstall_inner` | 卸载收尾时删除 Windows 凭据管理器里的 `KachinaInstaller_MirrorChyanCDK_<app>`；凭据不是注册表也不是文件，卸载器脚本覆盖不到 |
+
+不在本仓库：旧 `LOCAL_PATCHES.md` 第 3 节列的 `UninstallLauncher.IsTrustworthyUninstaller`
+与 `RuntimePrerequisite.ResolveDotNetCli` 属于**已安装产品**的宿主（`src/Host/`），两个分支
+的安装器仓库里都没有这份代码，迁移不涉及。
+
+验证证据（本机 WSL，非 Windows 运行验证）：
+
+- `cargo check --target x86_64-pc-windows-msvc --all-targets` 通过，**0 warning / 0 error**
+  （检查管道已用注入的编译错误验证过会真的失败）。
+- 新增单测：`secure_temp` 的 4 个验签判定用例（有效微软签名 / 他人签名 / 冒名 Subject /
+  非 Valid 状态）、`dir` 的 `private_folder_matching_ignores_case_and_separators`。
+- 真机需确认两点：`Get-AuthenticodeSignature` 的证书 Subject 布局（不匹配时 fail-closed，
+  错误信息带实际 status 与 subject）、`%SystemRoot%\Temp` 在标准用户下的可写性。
+
+## CI 回归：卸载时删日志文件
+
+第 6 项的 `%TEMP%` 白名单第一版把 `KachinaInstaller.log` 也列进了回收范围，行为测试
+`test (uninstall registry)` 随即失败（run `37910792940`）：
+
+```
+Test failed: Helper uninstall removes the HKLM record:
+  - elevation helper: operations did not go through the helper process
+Log file not found at: ...\Temp\KachinaInstaller.log
+```
+
+`tests/registry.mjs` 的 `expectHelperUsed` 在卸载进程退出后读 `%TEMP%\KachinaInstaller.log`
+断言提权助手确实被拉起；卸载时删掉日志等于把刚结束的会话现场一起销毁。日志是会话的
+诊断产物（下一次运行继续追加），不是需要回收的残留，已从白名单移除并补断言
+（`temp_artifact_whitelist_is_shape_based`）。其余 15 个测试 job 在该 run 中全绿，
+说明失败点只有这一处。
 
 ## 未验证项（阻塞）
 

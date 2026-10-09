@@ -3632,6 +3632,11 @@ async fn run_uninstall_inner(
             errors.push(format!("remove registry failed: {err:#}"));
         }
     }
+    // Mirror酱 CDK 存在 Windows 凭据管理器里（既不是注册表也不是文件），卸载器不管
+    // 这块，由会话自己清掉；没有这条凭据时 `CredDeleteW` 报错，忽略即可。
+    let _ = crate::utils::wincred::wincred_delete(&crate::session::commands::mirrorc_target(
+        &project.app_name,
+    ));
     if !errors.is_empty() {
         for err in &errors {
             tracing::warn!("uninstall: {err}");

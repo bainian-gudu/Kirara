@@ -1,13 +1,12 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 use windows::{
-    core::{GUID, PCWSTR, PWSTR},
+    core::{GUID, PCWSTR},
     Win32::{
-        Foundation::HANDLE,
         Storage::FileSystem::{GetDriveTypeW, QueryDosDeviceW},
         UI::Shell::{
             FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_LocalAppData,
-            FOLDERID_LocalAppDataLow, FOLDERID_RoamingAppData, GetUserProfileDirectoryW,
+            FOLDERID_LocalAppDataLow, FOLDERID_Profile, FOLDERID_RoamingAppData,
             SHGetKnownFolderPath, KF_FLAG_DEFAULT,
         },
     },
@@ -22,13 +21,23 @@ pub fn get_dir(dir: &GUID) -> Result<String> {
     Ok(pwstr)
 }
 
+/// 当前用户的 profile 目录。`GetUserProfileDirectoryW` 需要一个有效的用户令牌句柄，
+/// 传默认 / 空句柄会以 `ERROR_INVALID_HANDLE` 失败并让私有目录判定失效；Shell 的
+/// `FOLDERID_Profile` 对交互用户直接解析，不需要令牌句柄，提权后同样可用。
 pub fn get_userprofile() -> Result<String> {
-    let mut buffer = [0u16; 1024];
-    let pwstr = PWSTR::from_raw(buffer.as_mut_ptr());
-    let mut size = buffer.len() as u32;
-    unsafe { GetUserProfileDirectoryW(HANDLE::default(), Some(pwstr), &mut size) }
-        .context("GET_KNOWNFOLDER_ERR")?;
-    Ok(unsafe { pwstr.to_string().context("INTERNAL_ERROR")? })
+    get_dir(&FOLDERID_Profile)
+}
+
+/// `path` 等于 `parent` 或落在其下：统一分隔符方向、忽略大小写、按整段比较。
+fn path_is_equal_or_child(path: &Path, parent: &str) -> bool {
+    let path = path.to_string_lossy().replace('/', "\\");
+    let parent = parent.trim_end_matches(['\\', '/']).replace('/', "\\");
+    if parent.is_empty() {
+        return false;
+    }
+    let path = path.to_ascii_lowercase();
+    let parent = parent.to_ascii_lowercase();
+    path == parent || path.starts_with(&(parent + "\\"))
 }
 
 /// Whether `path` sits on a drive letter that is a network mapping or a `subst`
@@ -64,7 +73,7 @@ pub fn in_private_folder(path: &Path) -> bool {
     // first check userprofile
     let userprofile = get_userprofile();
     if let Ok(userprofile) = userprofile {
-        if path.starts_with(userprofile) {
+        if path_is_equal_or_child(path, &userprofile) {
             return true;
         }
     }
@@ -72,7 +81,7 @@ pub fn in_private_folder(path: &Path) -> bool {
     for id in path_ids {
         let known_folder = get_dir(&id);
         if let Ok(known_folder) = known_folder {
-            if path.starts_with(known_folder) {
+            if path_is_equal_or_child(path, &known_folder) {
                 return true;
             }
         }
@@ -90,5 +99,24 @@ mod tests {
         assert!(!on_session_drive(&temp.to_string_lossy()));
         assert!(!on_session_drive(r"\\server\share\app"));
         assert!(!on_session_drive("relative"));
+    }
+
+    #[test]
+    fn private_folder_matching_ignores_case_and_separators() {
+        let profile = r"C:\Users\Alice";
+        assert!(path_is_equal_or_child(Path::new(r"C:\Users\Alice"), profile));
+        assert!(path_is_equal_or_child(
+            Path::new(r"C:\Users\Alice\AppData\Local\App"),
+            profile
+        ));
+        assert!(path_is_equal_or_child(
+            Path::new("c:/users/alice/appdata/local/app"),
+            profile
+        ));
+        assert!(path_is_equal_or_child(Path::new(r"C:\Users\Alice\"), profile));
+        // 前缀相同但不是同一段，不能算在 profile 里。
+        assert!(!path_is_equal_or_child(Path::new(r"C:\Users\Alice2"), profile));
+        assert!(!path_is_equal_or_child(Path::new(r"C:\Users\Bob"), profile));
+        assert!(!path_is_equal_or_child(Path::new(r"C:\Users"), profile));
     }
 }

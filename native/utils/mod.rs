@@ -12,6 +12,7 @@ pub mod log;
 pub mod metadata;
 pub mod process;
 pub mod progressed_read;
+pub mod secure_temp;
 pub mod taskdialog;
 pub mod time;
 pub mod uac;

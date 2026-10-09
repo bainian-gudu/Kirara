@@ -636,17 +636,18 @@ async fn clean_per_user_leftovers(paths: &[String]) {
 
 /// `%TEMP%` 里属于本安装器的文件名白名单。只认固定形状，绝不按「含 kachina 就删」
 /// 这种模糊规则来：
-/// - `KachinaInstaller.log`：安装 / 卸载日志，一直在追加，从来没人删
 /// - `kachina.MicrosoftEdgeWebview2Setup.exe`：WebView2 引导安装器
 /// - `kachina-agreement.txt`：原生简化 UI 查看协议全文时写的临时文件
+///
+/// `KachinaInstaller.log` **不在这里**：它是这次安装 / 卸载会话的诊断记录，一直在追加，
+/// 卸载时删掉等于把刚出问题的会话现场一起销毁（行为测试也要在进程退出后读它）。它由
+/// 下一次运行继续追加，不构成需要回收的残留。
 ///
 /// 运行时安装包与卸载器副本不在这里：新架构把它们放在 staging 根目录下，随
 /// staging 一起回收（见 `fs/staging.rs` 的 `dl\` / `old\`）。
 fn is_installer_temp_artifact(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    lower == "kachinainstaller.log"
-        || lower == "kachina.microsoftedgewebview2setup.exe"
-        || lower == "kachina-agreement.txt"
+    lower == "kachina.microsoftedgewebview2setup.exe" || lower == "kachina-agreement.txt"
 }
 
 /// 清理 `%TEMP%` 里本安装器留下的东西。只删文件不删目录、不递归，失败只记日志
@@ -836,12 +837,12 @@ mod tests {
 
     #[test]
     fn temp_artifact_whitelist_is_shape_based() {
-        assert!(is_installer_temp_artifact("KachinaInstaller.log"));
         assert!(is_installer_temp_artifact(
             "kachina.MicrosoftEdgeWebview2Setup.exe"
         ));
         assert!(is_installer_temp_artifact("kachina-agreement.txt"));
-        // 目录名、别人的文件、形状不符的都不动
+        // 日志是会话诊断记录，不在回收范围；目录名、别人的文件、形状不符的也不动
+        assert!(!is_installer_temp_artifact("KachinaInstaller.log"));
         assert!(!is_installer_temp_artifact("kachina-staged"));
         assert!(!is_installer_temp_artifact("kachina-backup.exe"));
         assert!(!is_installer_temp_artifact("other.txt"));
@@ -1076,6 +1077,11 @@ pub async fn stage_self_image(args: StageSelfImageArgs) -> TAResult<Vec<StagedIm
             tokio::fs::create_dir_all(parent)
                 .await
                 .context("CREATE_DIR_ERR")?;
+        }
+        // 名字已过 `is_safe_rel`，这里再挡一次重解析点：提权进程不能跟着预置的
+        // 符号链接 / junction 把卸载器镜像写到 staging 之外。
+        if has_reparse_point(&staged) {
+            return Err(anyhow::Error::from(Coded::bare(FILE_IO_FAILED)).into());
         }
         match &args.copy_from {
             Some(src) => {

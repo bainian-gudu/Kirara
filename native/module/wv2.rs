@@ -70,9 +70,23 @@ pub async fn install_webview2() -> anyhow::Result<()> {
         Err(e) => return fail(dialog, e).await,
     };
 
-    let installer_path = crate::fs::staging::scratch_file("kachina.MicrosoftEdgeWebview2Setup.exe");
-    if let Err(e) = tokio::fs::write(&installer_path, wv2_installer_blob).await {
-        return fail(dialog, e.into()).await;
+    // 落地目录 / 随机文件名 / 独占创建 / 执行前验签：见 utils/secure_temp.rs。
+    // 上游这里是 %TEMP% 里的固定文件名 + tokio::fs::write（CREATE_ALWAYS，跟随符号
+    // 链接），且下完不验签就启动 —— 同会话的普通权限进程既能把下载内容引进系统文件，
+    // 也能在安装启动前把文件换掉。
+    let installer_path = crate::utils::secure_temp::package_path("kachina.MicrosoftEdgeWebview2Setup");
+    let written = async {
+        use tokio::io::AsyncWriteExt;
+        let mut file = crate::utils::secure_temp::create_exclusive_file(&installer_path).await?;
+        file.write_all(&wv2_installer_blob).await?;
+        file.flush().await?;
+        drop(file);
+        crate::utils::secure_temp::verify_microsoft_signed(&installer_path).await
+    }
+    .await;
+    if let Err(e) = written {
+        let _ = tokio::fs::remove_file(&installer_path).await;
+        return fail(dialog, e).await;
     }
 
     dialog.set_content(&i18n::t("webview2.progress_installing", &[]));
