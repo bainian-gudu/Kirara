@@ -7,7 +7,7 @@
 | 项目 | 值 |
 | --- | --- |
 | 迁移基线 | `upstream/main` `05a14107fc024645e1ad350fd3b4dffa62ae1368`（2026-09-25） |
-| 旧分支 | `refactor/v0.5.2` `18f95534fba82c1d0d3a41c028af9c23b1a25d1c` |
+| 旧分支 | `refactor/v0.5.2` `18f95534fba82c1d0d3a41c028af9c23b1a25d1c`（现为默认分支 `main`） |
 | 迁移分支 | `codex/migrate-upstream-main` |
 | 共同祖先 | 无（按行为逐项移植，不做 merge / cherry-pick） |
 
@@ -301,10 +301,24 @@ Log file not found at: ...\Temp\KachinaInstaller.log
 （`temp_artifact_whitelist_is_shape_based`）。其余 15 个测试 job 在该 run 中全绿，
 说明失败点只有这一处。
 
+另有一次与改动无关的偶发：zip 去 fork 那次 run（`37912788686`）的 `test (plugin-stub)`
+以 `PLUGIN_HOST_FAILED` 失败——`native/host/mod.rs` 的插件宿主在 10 秒内没收到
+`plugin_host_ready`（runner 上 WebView2 初始化慢）。同一个 zip 改动随后的两次 run
+（`37913270971`、`37913652820`）该 job 都通过，同一提交上重复执行结果不一致，按偶发
+处理，未改代码。
+
 ## 未验证项（阻塞）
 
-- **Windows 构建与运行验证尚未执行**：本环境为 WSL，无 MSVC 工具链与 WebView2，
-  `pnpm build`（cargo 交叉编译到 `x86_64-pc-windows-msvc`）无法在此完成。
-  P1 的退出门槛（干净 checkout 产出 exe、CLI 冒烟、二次拼接稳定）需要在 Windows 或
-  CI 上补齐后才能勾选。
-- 依赖替换（第 4 / 14 / 15 / 16 项）尚未开始。
+- **本机没有 Windows 运行环境**：开发机是 WSL，无 MSVC 工具链与 WebView2。本机证据
+  只到「`cargo check --target x86_64-pc-windows-msvc --all-targets` 0 warning / 0 error」
+  与前端 `tsc` + `vitest`；`pnpm build`、CLI 冒烟、二次拼接、以及所有真机行为
+  （快捷方式、H3 真实连接、运行时验签、卸载残留）都要靠 CI 与目标 Windows 机器。
+- **CI 已覆盖的部分**：`build`（Windows 真编 + 拼接）、`unit-test`、13+1 组行为测试
+  （含 `machine-acl`、`uninstall registry`、`builder-extract-replace`、
+  `userdata-ignore`、`dump-offline-install`）。这些是「移植完成」的证据来源。
+- **仍需 Windows 人工确认的部分**：提权管道 ACL 收紧后 UAC 流程能连通（失败时把
+  `native/utils/acl.rs` 的 SDDL 改回上游那串即可回退）、`Get-AuthenticodeSignature`
+  的证书 Subject 布局（不匹配时 fail-closed，错误信息带实际 status 与 subject）、
+  `%SystemRoot%\Temp` 在标准用户下的可写性、旧版本安装包的原地升级、H3 真实连接。
+- **未做的事**：P6 的端到端发布（tag、Release 资产、下游隔离打包）尚未执行；
+  `docs/notes/` 里少数上游笔记仍把 `msquic` 列为 C 依赖示例，属于上游文档，未改动。

@@ -18,9 +18,10 @@
 
 ## 分支关系
 
-迁移分支 `codex/migrate-upstream-main` 直接以 `05a1410` 为根建立，与本仓库旧分支
-`refactor/v0.5.2`（上游 `0.5.1` 快照 + 本地补丁）**没有共同 Git 祖先**。因此本地
-修改是按行为逐项移植，而不是合并或 cherry-pick。
+迁移分支 `codex/migrate-upstream-main` 直接以 `05a1410` 为根建立，与本仓库的旧分支
+（上游 `0.5.1` 快照 + 本地补丁，`18f9553`，现为默认分支 `main`，原名
+`refactor/v0.5.2`）**没有共同 Git 祖先**。因此本地修改是按行为逐项移植，而不是合并
+或 cherry-pick。迁移完成后的合并方向是 `codex/migrate-upstream-main` → `main`。
 
 ## 本地修改（重要）
 

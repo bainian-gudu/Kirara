@@ -2,6 +2,12 @@
 
 快速、多功能的通用安装程序。
 
+> **本仓库（Kirara 分支）**基于上游 [YuehaiTeam/kachina-installer](https://github.com/YuehaiTeam/kachina-installer)
+> 源码，交付给下游的产物名为 `kirara-builder.exe`（一个文件同时含打包器 CLI 与安装器
+> GUI 模板），构建方式见 `build.ps1`。与上游的差异（**无遥测**、卸载范围收敛、下载后
+> 执行验签、依赖替换、旧版升级兼容等）逐项记录在 [`MIGRATION_LEDGER.md`](MIGRATION_LEDGER.md)，
+> 基线与来源见 [`UPSTREAM.md`](UPSTREAM.md)。
+
 - 离线安装
   - 多线程安装，速度快
   - 安装后校验，避免错误
