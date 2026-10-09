@@ -114,7 +114,7 @@ jobs:
     runs-on: windows-2022
     strategy:
       matrix:
-        test: [offline-install, online-install, offline-update, online-update, dfs2, updater-survival, already-latest, 'uninstall registry', userdata-ignore, occupied-process, builder-extract-replace, plugin-stub, machine-acl]
+        test: [offline-install, online-install, offline-update, online-update, dfs2, updater-survival, already-latest, 'uninstall registry', userdata-ignore, occupied-process, builder-extract-replace, plugin-stub, machine-acl, dump-offline-install]
       fail-fast: false
     steps:
       - uses: actions/checkout@v4

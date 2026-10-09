@@ -25,7 +25,10 @@ tokio = { version = "1", features = [
     "macros",
     "net",
 ] }
-chksum-md5 = { version = "0.1", features = ["async-runtime-tokio"] }
+# 不开 async-runtime-tokio：只用同步的 `hash()` / `MD5::update`，哈希的异步包装由
+# utils/hash.rs 的 spawn_blocking 提供，这个 feature 会把 chksum-reader / chksum-writer
+# 一并拖进依赖树。
+chksum-md5 = "0.1"
 sha2 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = [
     "json",

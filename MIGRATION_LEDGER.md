@@ -26,7 +26,7 @@
 | P1 标准目标 + 构建入口 + 产物接口 | 部分 | 目标与产物接口已改；**Windows 构建未执行**（本环境无 MSVC/WebView2） |
 | P2 配置、打包与升级兼容 | 部分 | 协议内联（第 2 项）与改名兼容（第 12 项）已落地；未识别字段检测、打包器修复（第 17 项）待办 |
 | P3 卸载、提权与事务性安全 | 完成 | 卸载侧安全阀与扩展清理（第 1/1b/1c/8 项）、提权管道 ACL、重解析点拦截、下载后执行验签（第 3/9 项）均已落地 |
-| P4 前端体验与隐私 | 部分 | 遥测移除（第 7 项）、协议弹窗与 footer 布局（第 2/5 项）已完成；历史版本提示待核 |
+| P4 前端体验与隐私 | 完成 | 遥测移除（第 7 项）、协议内联 / 安全渲染 / 接受门槛（第 2 项）、弹窗 footer 布局（第 5 项）均已落地 |
 | P5 依赖、文档与 CI 门禁 | 部分 | CI 已关闭 release PDB；依赖替换与许可证全部落地（第 4/14/15/16 项）；README / 来源说明与快速检查门禁待收尾 |
 | P6 端到端兼容、发布与回退 | 待办 | |
 
@@ -43,15 +43,15 @@
 | 7 物理移除遥测 | 完成 | 见下「P4 已落地改动与证据」 |
 | 8 卸载收尾、路径比较、提权状态、ARP 静默入口 | 完成 | ARP 加引号 + 静默入口 + 卸载时清 Mirror酱 CDK 凭据已落地；收尾顺序与路径比较由上游 `normalize_full` / 错误收集覆盖；提权状态由上游等价实现覆盖 |
 | 9 安全临时文件、下载验签、提权管道 | 完成 | 清单越界、提权管道 ACL、日志/暂存重解析点、下载后执行验签与 `get_userprofile` 修复均已落地（见下） |
-| 10 DFS 拆分/注释 | 待办 | 旧 `src/dfs.ts` 与新 `native/session/`（含 `download_plan.rs`、`rate.rs`）职责映射 |
-| 11 编译告警治理 | 部分 | 上游 `05a1410` 已清理一批；剩余待构建后确认 |
+| 10 DFS 拆分/注释 | 不适用 | 旧 `src/dfs/session.ts` 的 DFS2 会话创建、挑战重试与会话清理在新架构里是 `native/session/source.rs` + `native/dfs.rs` 的 Rust 实现，行为逐条对上（见下） |
+| 11 编译告警治理 | 完成 | 上游 `05a1410` 已吸收：`libs/*/src/lib.rs` 有 `#![allow(suspicious_runtime_symbol_definitions)]`，`native/cli/arg.rs` 的 builder 侧类型有 `#[allow(dead_code)]`；本机 `cargo check --all-targets` 0 warning |
 | 12 改名后的升级兼容 | 完成 | `legacyExeNames` / `legacyProgramFilesPaths` / `legacyUninstallNames`，见下 |
 | 13 Windows 10/11 标准目标 | 部分 | 目标、`-Z build-std`、`rust-src`、`ctor` patch、`STATIC_VCRUNTIME` 已处理（见下）；CI 的 `CARGO_PROFILE_RELEASE_DEBUG` 等细节待补 |
 | 14 zip 去 fork 与中文名解码 | 完成 | 改用 crates.io `zip 8.6`；`native/thirdparty/mirrorc.rs` 按 `name_raw()` 自己解条目名（见下） |
 | 15 H3 改 `quinn`/`rustls` | 完成 | `native/capabilities/h3.rs` 整份换成 quinn + rustls + h3-quinn；`[patch.crates-io]` 的 msquic fork 删除（见下） |
 | 16 旧依赖替换与许可证 | 完成 | `mslnk` → Shell Link API、`nt_version` → ntdll、`libs/` 许可证补齐（见下） |
-| 17 打包器修复 | 待办 | PE 识别、嵌入名、extract 路径约束、`replace-bin`；可能已有上游等价实现，测试通过才标记已覆盖 |
-| 18 安装行为测试与单测 | 部分 | 上游行为矩阵保留；旧分支特有的 `userdata-ignore` / `builder-extract-replace` 断言待补 |
+| 17 打包器修复 | 完成 | 上游 `05a1410` 已含等价实现，逐条核对见下；额外去掉 `chksum-md5` 的 `async-runtime-tokio` feature |
+| 18 安装行为测试与单测 | 完成 | 上游行为矩阵保留且 `userdata-ignore` / `builder-extract-replace` 场景断言在位；`dump-offline-install` 补进 `test:all` 与 CI 矩阵（见下） |
 
 ## P1 已落地改动与证据
 
@@ -244,6 +244,45 @@ exe，下载源被劫持时也照样执行。这里统一收口到 `native/utils
   在正式安装流程里默认不会被走到。
 - 快捷方式的**行为**只能实机验证：装一次看桌面 / 开始菜单的快捷方式能启动、工作目录正确，
   再卸载确认被清干净。
+
+## P2 已落地改动与证据（第 17 项：打包器修复逐条核对）
+
+旧分支第 17 节把上游 `a52a4c66` 之后重写前的那批打包器修复单独搬了过来。新底座
+`05a1410` 就在那次重写之后，这批修复已在上游树里，逐条核对如下（都能指出落点与反例测试）。
+
+| 旧补丁 | 新架构落点 | 证据 |
+| --- | --- | --- |
+| 17a 只认真正的 PE 映像（不再按 `MZ\x90\x00` 扫） | `native/builder/local.rs` 的 `pe_image_starts` / `is_pe_at` | 校验 `MZ` + `e_lfanew` 落在 `0x40..=0x1000` 且指向 `PE\0\0`；单测 `pe_at_requires_pe_signature`、`bundle_uses_last_real_pe_not_last_mz90`（体内埋 `MZ\x90\x00` 的反例） |
+| 17b 嵌入名写入端与读取端同一套规则 | `native/embedded_name.rs`、`native/builder/local.rs`（读取端 `is_embedded_name`）、`native/builder/append.rs`（写入端 `check_tlv_name`） | 读取端先判名称长度 / UTF-8 / 内容长度越界再读；单测 `allows_win32_file_names` 覆盖空名、含 `\0`、超长与非法字符 |
+| 17c `--extract` 不许写到输出根之外 | `native/builder/extract.rs` 的 `relative_under_root` / `verify_within_root` | 只允许 Normal 组件，再逐组件 canonicalize 确认解析符号链接后仍在根内，且先规划完所有路径再落盘；单测覆盖 `..` 与绝对路径负例 |
+| 17d 打包临时文件与摘要 | `native/builder/pack.rs`、`native/utils/hash.rs` | 临时文件名带进程号 + UUID、交给 rcedit 前 `sync_all()`、加载失败打印大小；`hash_file` 的 md5 与 xxh 走同一条 1 MB 顺序读循环并带 `FILE_FLAG_SEQUENTIAL_SCAN`，整段在 `spawn_blocking` 里 |
+| 17d 去掉 `chksum-md5` 的 async feature | 根 `Cargo.toml` | 代码只用同步的 `hash()` / `MD5::update`，异步包装由 `utils/hash.rs` 的 `spawn_blocking` 提供。去掉 `async-runtime-tokio` 后 `cargo metadata` 的包集合里 `chksum-reader` / `chksum-writer` 消失，无新增包 |
+
+`get_reader_for_bundle` 失败在新架构里以 `Result` 上抛，由 CLI 主流程映射成非零退出码
+（旧分支那次 `return` → `exit(1)` 的修复针对的是 Tauri command，没有对应落点）。
+
+## 第 10 / 11 / 18 项的核对结论
+
+**第 10 项（DFS）——不机械移植。** 旧分支把 `src/dfs.ts` 拆成 `src/dfs/session.ts`，
+是把 DFS2 会话创建、挑战重试与会话清理从 Vue 侧挪进独立模块。新架构把这段整个搬到了
+Rust：`native/session/source.rs` 的 `create_dfs2_session_with_challenge` 用
+`[200, 600, 1000]` 毫秒退避重试 3 次网络错误，`create_dfs2_session_once` 做 3 次挑战
+尝试（`web` 挑战返回 `SOURCE_NEEDS_VERIFICATION` 交给前端），`native/dfs.rs` 的
+`solve_dfs2_challenge` 支持 md5 / sha256 / web。与旧 `session.ts` 的判定顺序、次数、
+退避一致，没有缺失行为可迁；前端模块拆分本身在 Preact 架构下没有对应落点。
+
+**第 11 项（告警）——上游已吸收。** `libs/hdiff-sys/src/lib.rs` 与
+`libs/hpatch-sys/src/lib.rs` 都在 crate 根关掉了 `suspicious_runtime_symbol_definitions`
+（bindgen 生成的 MSVC CRT extern 声明），`native/cli/arg.rs` 在 builder 侧类型上带
+`#[allow(dead_code)]`。本机 `cargo check --target x86_64-pc-windows-msvc --all-targets`
+0 warning，说明旧分支那两处收敛没有遗漏的落点。
+
+**第 18 项（测试）——保留并扩充。** 上游矩阵已含 `userdata-ignore`
+（`userDataPath` 保留用户改过的文件、`ignoreFolderPath` 整目录不动）与
+`builder-extract-replace`（`extract --list` / `--all` 与 `replace-bin` 端到端），
+夹具里也有 `User/settings.json`、`cache/keep.dat` 与三处路径配置，与旧分支的场景断言
+等价。`dump-offline-install` 原来只有脚本、不在 `test:all`，已同时补进 `test:all` 与
+CI 的 `test` job 矩阵（脚本把 dump 写到 gitignore 覆盖的 `tests/plan-dumps/`）。
 
 ## CI 回归：卸载时删日志文件
 
