@@ -35,3 +35,7 @@ rustc-ice*
 fixtures/
 
 /target/
+
+# 构建产物：kirara-builder.exe 由 build.ps1 生成，CI 里用 artifact / cache 传递
+tools/*.exe
+tools/*.pdb

@@ -20,7 +20,6 @@ jobs:
           (Get-Content rust-toolchain.toml) -replace 'channel = "nightly"', 'channel = "${{ env.RUST_NIGHTLY_VERSION }}"' | Set-Content rust-toolchain.toml
       - run: |
           rustup toolchain install ${{ env.RUST_NIGHTLY_VERSION }} --profile minimal
-          rustup component add rust-src --toolchain ${{ env.RUST_NIGHTLY_VERSION }}
           rustup default ${{ env.RUST_NIGHTLY_VERSION }}
       - uses: Swatinem/rust-cache@v2
         with:
@@ -47,22 +46,22 @@ jobs:
           echo "version=$TAG-$PKGVER+$BUILDMETA" >> $env:GITHUB_OUTPUT
       - name: Build
         run: pnpm build
-      - name: Publish bundle as kachina-builder.exe
+      - name: Publish bundle as kirara-builder.exe
         run: |
-          $rel = "target\x86_64-win7-windows-msvc\release"
+          $rel = "target\x86_64-pc-windows-msvc\release"
           $bundle = Join-Path $rel "kachina-builder-bundle.exe"
           $builder = Join-Path $rel "kachina-builder.exe"
           if ((Get-Item $bundle).Length -le (Get-Item $builder).Length) {
             throw "bundle $($bundle) is not larger than cargo builder; merge-release-bundle did not run"
           }
           Copy-Item $bundle $builder -Force
-          Copy-Item $bundle "kachina-builder.exe" -Force
+          Copy-Item $bundle "kirara-builder.exe" -Force
       - name: Artifact
         uses: actions/upload-artifact@v4.6.0
         with:
           path: |
-            target/x86_64-win7-windows-msvc/release/*.exe
-            target/x86_64-win7-windows-msvc/release/*.pdb
+            target/x86_64-pc-windows-msvc/release/*.exe
+            target/x86_64-pc-windows-msvc/release/*.pdb
   unit-test:
     runs-on: windows-2022
     steps:
@@ -74,7 +73,6 @@ jobs:
           (Get-Content rust-toolchain.toml) -replace 'channel = "nightly"', 'channel = "${{ env.RUST_NIGHTLY_VERSION }}"' | Set-Content rust-toolchain.toml
       - run: |
           rustup toolchain install ${{ env.RUST_NIGHTLY_VERSION }} --profile minimal
-          rustup component add rust-src --toolchain ${{ env.RUST_NIGHTLY_VERSION }}
           rustup default ${{ env.RUST_NIGHTLY_VERSION }}
       - uses: Swatinem/rust-cache@v2
         with:
@@ -100,7 +98,8 @@ jobs:
         with:
           path: artifacts
       - name: Copy Binary
-        run: Copy-Item "artifacts/artifact/kachina-builder.exe" "kachina-builder.exe" -Force
+        # artifact 里的 kachina-builder.exe 已由 build job 用拼接体覆盖，这里只改名交付
+        run: Copy-Item "artifacts/artifact/kachina-builder.exe" "kirara-builder.exe" -Force
       - name: Sentry upload
         continue-on-error: true
         env:
@@ -122,7 +121,7 @@ jobs:
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          files: kachina-builder.exe
+          files: kirara-builder.exe
           make_latest: true
           body: "${{ needs.build.outputs.version }}"
 
@@ -150,15 +149,15 @@ jobs:
         run: |
           # 复制构建的二进制文件到正确位置
           New-Item -ItemType Directory -Force -Path "target/release"
-          New-Item -ItemType Directory -Force -Path "target/x86_64-win7-windows-msvc/release"
-          Copy-Item "artifacts/artifact/*.exe" "target/x86_64-win7-windows-msvc/release/" -Force
-          Copy-Item "artifacts/artifact/*.pdb" "target/x86_64-win7-windows-msvc/release/" -Force
+          New-Item -ItemType Directory -Force -Path "target/x86_64-pc-windows-msvc/release"
+          Copy-Item "artifacts/artifact/*.exe" "target/x86_64-pc-windows-msvc/release/" -Force
+          Copy-Item "artifacts/artifact/*.pdb" "target/x86_64-pc-windows-msvc/release/" -Force
           Copy-Item "artifacts/artifact/*.exe" "target/release/" -Force
           Copy-Item "artifacts/artifact/*.pdb" "target/release/" -Force
           # merge 已写出更大的 kachina-builder-bundle.exe 时不要用 cargo builder 覆盖
           $src = "artifacts/artifact/kachina-builder.exe"
           foreach ($rel in @(
-            "target/x86_64-win7-windows-msvc/release",
+            "target/x86_64-pc-windows-msvc/release",
             "target/release"
           )) {
             $bundle = Join-Path $rel "kachina-builder-bundle.exe"

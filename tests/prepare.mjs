@@ -231,7 +231,7 @@ async function buildCompletePackages() {
   const builderPath = path.join(
     '..',
     'target',
-    dev ? 'debug' : 'x86_64-win7-windows-msvc/release',
+    dev ? 'debug' : 'x86_64-pc-windows-msvc/release',
     'kachina-builder-bundle.exe',
   );
   const iconPath = path.resolve('../resources/icons/icon.ico');

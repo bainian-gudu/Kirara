@@ -13,7 +13,7 @@ usePwsh();
 const builderPath = path.resolve(
   '..',
   'target',
-  'x86_64-win7-windows-msvc',
+  'x86_64-pc-windows-msvc',
   'release',
   'kachina-builder-bundle.exe',
 );
