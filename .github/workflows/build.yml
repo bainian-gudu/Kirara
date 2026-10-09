@@ -81,6 +81,26 @@ jobs:
           cache-targets: false
       - name: Rust unit tests
         run: cargo test
+      - uses: pnpm/action-setup@v4.0.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'pnpm'
+      - name: Install NPM Dependencies
+        run: pnpm i
+      # session dump 编译在 `cfg(debug_assertions)` 后面，只有 debug 产物写得出来，
+      # 所以 dump 用例不进跑 release 产物的 `test` 矩阵。这里复用上面 debug 依赖的
+      # 编译结果建出 debug 二进制，用静默会话记录 dump，再让 plan 对比单测读到它。
+      - name: Build debug binaries
+        run: cargo build
+      - name: Record offline install plan dump
+        env:
+          DEV: '1'
+        run: |
+          npm run test:prepare
+          npm run test:dump-offline-install
+      - name: Compare recorded dump with planner
+        run: cargo test compare_offline_install_dump_if_present
 
   release:
     needs: [build, test, unit-test]
@@ -114,7 +134,7 @@ jobs:
     runs-on: windows-2022
     strategy:
       matrix:
-        test: [offline-install, online-install, offline-update, online-update, dfs2, updater-survival, already-latest, 'uninstall registry', userdata-ignore, occupied-process, builder-extract-replace, plugin-stub, machine-acl, dump-offline-install]
+        test: [offline-install, online-install, offline-update, online-update, dfs2, updater-survival, already-latest, 'uninstall registry', userdata-ignore, occupied-process, builder-extract-replace, plugin-stub, machine-acl]
       fail-fast: false
     steps:
       - uses: actions/checkout@v4

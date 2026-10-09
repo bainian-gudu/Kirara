@@ -51,7 +51,7 @@
 | 15 H3 改 `quinn`/`rustls` | 完成 | `native/capabilities/h3.rs` 整份换成 quinn + rustls + h3-quinn；`[patch.crates-io]` 的 msquic fork 删除（见下） |
 | 16 旧依赖替换与许可证 | 完成 | `mslnk` → Shell Link API、`nt_version` → ntdll、`libs/` 许可证补齐（见下） |
 | 17 打包器修复 | 完成 | 上游 `05a1410` 已含等价实现，逐条核对见下；额外去掉 `chksum-md5` 的 `async-runtime-tokio` feature |
-| 18 安装行为测试与单测 | 完成 | 上游行为矩阵保留且 `userdata-ignore` / `builder-extract-replace` 场景断言在位；`dump-offline-install` 补进 `test:all` 与 CI 矩阵（见下） |
+| 18 安装行为测试与单测 | 完成 | 上游行为矩阵保留且 `userdata-ignore` / `builder-extract-replace` 场景断言在位；`dump-offline-install` 由 `unit-test` job 用 debug 产物执行（见下） |
 
 ## P1 已落地改动与证据
 
@@ -281,8 +281,10 @@ Rust：`native/session/source.rs` 的 `create_dfs2_session_with_challenge` 用
 （`userDataPath` 保留用户改过的文件、`ignoreFolderPath` 整目录不动）与
 `builder-extract-replace`（`extract --list` / `--all` 与 `replace-bin` 端到端），
 夹具里也有 `User/settings.json`、`cache/keep.dat` 与三处路径配置，与旧分支的场景断言
-等价。`dump-offline-install` 原来只有脚本、不在 `test:all`，已同时补进 `test:all` 与
-CI 的 `test` job 矩阵（脚本把 dump 写到 gitignore 覆盖的 `tests/plan-dumps/`）。
+等价。`dump-offline-install` 原来只有脚本、既不在 `test:all` 也不在 CI，现在由
+`unit-test` job 用 debug 产物执行，dump 落在 gitignore 覆盖的 `tests/plan-dumps/`，
+紧随其后的 `compare_offline_install_dump_if_present` 直接拿它做 plan 对比
+（见下「CI 回归：dump 用例跑在 release 产物上」）。
 
 ## CI 回归：卸载时删日志文件
 
@@ -307,15 +309,43 @@ Log file not found at: ...\Temp\KachinaInstaller.log
 （`37913270971`、`37913652820`）该 job 都通过，同一提交上重复执行结果不一致，按偶发
 处理，未改代码。
 
+## CI 回归：dump 用例跑在 release 产物上
+
+第 18 项第一版把 `dump-offline-install` 加进了跑 release 产物的 `test` job 矩阵，
+run `37913652820` 上该 job 失败（其余 13 个 job 与 `build` / `unit-test` 全绿）：
+
+```
+=== Dump offline install plan ===
+Test failed: missing dump 01-settings.json
+```
+
+失败点是构建配置而不是脚本：`native/session/dump.rs` 的 `session_dump!` 与
+`InstallPlan` 等类型的 `Serialize` 都在 `cfg(debug_assertions)` 后面（
+`docs/notes/implemented/2026-08-28-ipc-external-tagging.md` 也把 session dump 记为
+debug 构建的产物），而 `test` 矩阵下载的是 `build` job 的 release 产物——安装本身
+成功退出（`assertExitOk` 通过），只是二进制里没有写 dump 的代码。
+
+按「用例存在但不执行」的风险口径，没有把它退回成 dev-only 脚本，而是挪到本来就做
+debug 编译的 `unit-test` job：`cargo test` 之后 `cargo build` 建出 debug 二进制（复用
+同一次 debug 依赖编译），`DEV=1 npm run test:prepare` 用它们打夹具，再跑
+`test:dump-offline-install`，最后 `cargo test compare_offline_install_dump_if_present`
+让 plan 对比单测读到刚写出的 dump（此前它因 dump 不存在而直接 return）。
+
+`tests/dump-offline-install.mjs` 同时固定用 `-S`：dump 由会话直接写出，静默会话足够，
+而 `-I` 在 debug 构建下会拉起指向 rsbuild dev server 的 UI 窗口（`native/host/mod.rs`
+里 debug 的起始地址是 `http://localhost:1420`），跑 debug 产物的 CI 环境没有 dev
+server。`test:all` 保持上游的 release 口径，不含该脚本。
+
 ## 未验证项（阻塞）
 
 - **本机没有 Windows 运行环境**：开发机是 WSL，无 MSVC 工具链与 WebView2。本机证据
   只到「`cargo check --target x86_64-pc-windows-msvc --all-targets` 0 warning / 0 error」
   与前端 `tsc` + `vitest`；`pnpm build`、CLI 冒烟、二次拼接、以及所有真机行为
   （快捷方式、H3 真实连接、运行时验签、卸载残留）都要靠 CI 与目标 Windows 机器。
-- **CI 已覆盖的部分**：`build`（Windows 真编 + 拼接）、`unit-test`、13+1 组行为测试
-  （含 `machine-acl`、`uninstall registry`、`builder-extract-replace`、
-  `userdata-ignore`、`dump-offline-install`）。这些是「移植完成」的证据来源。
+- **CI 已覆盖的部分**：`build`（Windows 真编 + 拼接）、`unit-test`（含 debug 产物的
+  dump 记录与 plan 对比）、13 组 release 行为测试（含 `machine-acl`、
+  `uninstall registry`、`builder-extract-replace`、`userdata-ignore`）。这些是
+  「移植完成」的证据来源。
 - **仍需 Windows 人工确认的部分**：提权管道 ACL 收紧后 UAC 流程能连通（失败时把
   `native/utils/acl.rs` 的 SDDL 改回上游那串即可回退）、`Get-AuthenticodeSignature`
   的证书 Subject 布局（不匹配时 fail-closed，错误信息带实际 status 与 subject）、

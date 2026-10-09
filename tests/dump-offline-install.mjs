@@ -1,7 +1,6 @@
 import {
   cleanupTestDir,
   getTestDir,
-  FLAGS,
   runInstaller,
   assertExitOk,
   clearLogFile,
@@ -9,6 +8,10 @@ import {
 import 'zx/globals';
 import { usePwsh } from 'zx';
 usePwsh();
+
+// dump 由会话直接写出，静默会话就够；`-I` 在 debug 构建下会拉起指向 rsbuild
+// dev server 的 UI 窗口，跑 debug 产物的环境（CI）没有它，所以固定用 `-S`。
+const FLAGS_SILENT = '-S';
 
 async function test() {
   const testDir = getTestDir('dump-offline-install');
@@ -22,7 +25,7 @@ async function test() {
     await clearLogFile();
     const result = await runInstaller(
       installerPath,
-      [FLAGS, '-D', testDir, '--dump-dir', dumpDir],
+      [FLAGS_SILENT, '-D', testDir, '--dump-dir', dumpDir],
       'Offline install dump',
     );
     assertExitOk(result, 'Offline install dump');
