@@ -41,13 +41,13 @@ use crate::session::state::{
     ByteProgress, CancelState, FileAction, FileProgress, Phase, Progress as UiProgress,
     ProgressCounter, ProgressStage, ProgressUnit, Prompt, UiState,
 };
-use crate::session::types::{version_gt, ProjectConfig, SessionResult, Settings, SourceField};
-use crate::session::ui::{send_ev_insight, SessionUi, SilentPluginUi};
+use crate::session::types::{version_gt, ProjectConfig, SessionResult, Settings};
+use crate::session::ui::{SessionUi, SilentPluginUi};
 use crate::thirdparty::mirrorc::get_mirrorc_status;
 use crate::utils::code::{
     attach_download, attach_download_or, attach_metadata, coded_for_mirrorc_response,
-    coded_from_error, extract, fail_kind, tag_session, Attach, Cancelled, Coded, Extracted,
-    DISK_FULL, ELEVATED_DRIVE_UNAVAILABLE, FILE_IO_FAILED, HASH_ALGORITHM_UNSUPPORTED,
+    coded_from_error, extract, fail_kind, log_line, tag_session, Attach, Cancelled, Coded,
+    Extracted, DISK_FULL, ELEVATED_DRIVE_UNAVAILABLE, FILE_IO_FAILED, HASH_ALGORITHM_UNSUPPORTED,
     METADATA_UNREACHABLE, MIRRORC_CDK_MISSING, MIRRORC_CONFIG_INVALID, MIRRORC_FAILED,
     MIRRORC_UNREACHABLE, NO_DOWNLOAD_NODE, PKG_BROKEN, PROCESS_KILL_FAILED, REGISTRY_WRITE_FAILED,
     RUNTIME_INSTALL_FAILED, SHORTCUT_FAILED, UNINSTALL_INCOMPLETE, UNINSTALL_INFO_MISSING,
@@ -1069,96 +1069,6 @@ fn log_task_plan(tasks: &[InstallTask], ranges: &[String]) {
     }
 }
 
-fn source_id(project: &ProjectConfig, uri: &str) -> String {
-    match &project.source {
-        SourceField::Single(_) => "default".to_string(),
-        SourceField::List(list) => list
-            .iter()
-            .find(|s| s.uri == uri)
-            .map(|s| s.id.clone())
-            .unwrap_or_else(|| "unknown".to_string()),
-    }
-}
-
-fn insight_base(
-    project: &ProjectConfig,
-    settings: &Settings,
-    config: &InstallerConfig,
-    uninstall: bool,
-) -> String {
-    let mut qs = Vec::new();
-    if settings.non_interactive {
-        qs.push("non_interactive=1");
-    }
-    if settings.silent {
-        qs.push("silent=1");
-    }
-    if uninstall {
-        qs.push("uninstall=1");
-    }
-    if settings.online {
-        qs.push("online=1");
-    }
-    if config
-        .embedded_index
-        .as_ref()
-        .is_some_and(|index| !index.is_empty())
-    {
-        qs.push("pack=1");
-    }
-    format!("/{}?{}", project.app_name, qs.join("&"))
-}
-
-fn prepare_event(
-    settings: &Settings,
-    config: &InstallerConfig,
-    source_id: &str,
-    version: &str,
-    used_online: bool,
-) -> String {
-    let action = if settings.is_update {
-        "update"
-    } else {
-        "install"
-    };
-    let packed = config
-        .embedded_index
-        .as_ref()
-        .is_some_and(|index| !index.is_empty());
-    if packed {
-        if used_online {
-            format!("{action}/packed+{source_id}/{version}")
-        } else {
-            format!("{action}/packed/{version}")
-        }
-    } else {
-        format!("{action}/{source_id}/{version}")
-    }
-}
-
-fn txn_status(result: &anyhow::Result<SessionResult>) -> &'static str {
-    match result {
-        Ok(r) if r.cancelled => "cancelled",
-        Ok(_) => "ok",
-        Err(_) => "internal_error",
-    }
-}
-
-fn emit_insight(
-    project: &ProjectConfig,
-    settings: &Settings,
-    config: &InstallerConfig,
-    event: &str,
-    data: Option<Value>,
-    uninstall: bool,
-) {
-    let url = insight_base(project, settings, config, uninstall);
-    let event = event.to_string();
-    tokio::spawn(async move {
-        send_ev_insight(&url, &event, data).await;
-    });
-}
-
 pub async fn run_install(
     settings: &Settings,
     config: &InstallerConfig,
@@ -1170,18 +1080,10 @@ pub async fn run_install(
     log_session_start("install", settings, config, project);
     ensure_helper_sees_path(settings, mgr)?;
     let ui = LiveUi::new(ui, base);
-    let txn = crate::utils::sentry::Transaction::start(
-        if settings.is_update {
-            "update"
-        } else {
-            "install"
-        },
-        "session",
-    );
     let result = if settings.source_uri.starts_with("mirrorc://") {
         run_mirrorc(settings, config, project, &ui, mgr).await
     } else {
-        run_dfs_install(settings, config, project, &ui, mgr, &txn).await
+        run_dfs_install(settings, config, project, &ui, mgr).await
     };
     // a phase-one cancel is a user decision, not a failure
     let result = match result {
@@ -1191,17 +1093,9 @@ pub async fn run_install(
         }
         other => other,
     };
-    txn.finish(txn_status(&result));
     if let Err(err) = &result {
-        // fail counter：低基数分类维度，不携带自由文本（见遥测通道职责收敛）
-        emit_insight(
-            project,
-            settings,
-            config,
-            "fail",
-            Some(json!({ "kind": fail_kind(err) })),
-            false,
-        );
+        // 遥测已移除；失败分类只写本地日志
+        tracing::warn!("install failed: kind={} {}", fail_kind(err), log_line(err));
     }
     result
 }
@@ -1212,7 +1106,6 @@ async fn run_dfs_install(
     project: &ProjectConfig,
     ui: &LiveUi<'_>,
     mgr: &ManagedElevate,
-    txn: &crate::utils::sentry::Transaction,
 ) -> anyhow::Result<SessionResult> {
     progress(ui, 0, 1.0, ProgressStage::FetchMetadata, None, None, None);
     session_dump!(
@@ -1237,24 +1130,20 @@ async fn run_dfs_install(
     source_ctx.attach_plugin(ui.plugin_host());
     // span 只包网络部分；pick_metadata 可能弹版本选择框，用户等待不计入
     let mut online_err = None;
-    let online_meta = txn
-        .timed("metadata", async {
-            match fetch_metadata(
-                &settings.source_uri,
-                settings.dfs_extras.as_deref(),
-                &mut source_ctx,
-            )
-            .await
-            {
-                Ok(meta) => Some(meta),
-                Err(err) => {
-                    tracing::warn!("online metadata failed: {err:#}");
-                    online_err = Some(attach_metadata(err));
-                    None
-                }
-            }
-        })
-        .await;
+    let online_meta = match fetch_metadata(
+        &settings.source_uri,
+        settings.dfs_extras.as_deref(),
+        &mut source_ctx,
+    )
+    .await
+    {
+        Ok(meta) => Some(meta),
+        Err(err) => {
+            tracing::warn!("online metadata failed: {err:#}");
+            online_err = Some(attach_metadata(err));
+            None
+        }
+    };
 
     let (mut latest, used_online) =
         pick_metadata(settings, config, ui, embedded_meta, online_meta, online_err).await?;
@@ -1286,20 +1175,6 @@ async fn run_dfs_install(
     if settings.elevate {
         let _ = run_op(mgr, true, IpcOperation::Ping, progress_noop()).await;
     }
-    emit_insight(
-        project,
-        settings,
-        config,
-        &prepare_event(
-            settings,
-            config,
-            &source_id(project, &settings.source_uri),
-            &latest.tag_name,
-            used_online,
-        ),
-        None,
-        false,
-    );
     if !prepare_process(settings, project, ui, mgr, &latest.tag_name).await? {
         tracing::info!("install cancelled at process-running prompt");
         return Ok(SessionResult::cancelled(settings.is_update));
@@ -1337,7 +1212,6 @@ async fn run_dfs_install(
         project,
         ui,
         mgr,
-        txn,
         &latest,
         hash_key,
         algo,
@@ -1367,7 +1241,6 @@ async fn dfs_staged(
     project: &ProjectConfig,
     ui: &LiveUi<'_>,
     mgr: &ManagedElevate,
-    txn: &crate::utils::sentry::Transaction,
     latest: &RepoMetadata,
     hash_key: HashKey,
     algo: &str,
@@ -1395,27 +1268,17 @@ async fn dfs_staged(
         }
     }
     progress(ui, 1, 5.0, ProgressStage::ScanFiles, None, None, None);
-    let (local, scan) = txn
-        .timed(
-            "hash-scan",
-            scan_local(
-                settings,
-                project,
-                latest,
-                hash_key,
-                &ignore_nonempty,
-                ui,
-                mgr,
-            ),
-        )
-        .await?;
+    let (local, scan) = scan_local(
+        settings,
+        project,
+        latest,
+        hash_key,
+        &ignore_nonempty,
+        ui,
+        mgr,
+    )
+    .await?;
     ui.check_cancel()?;
-    txn.set_measurement("hash_scan_files", local.len() as f64, "none");
-    txn.set_measurement(
-        "hash_scan_bytes",
-        local.iter().map(|f| f.size).sum::<u64>() as f64,
-        "byte",
-    );
 
     let plan = build_plan(&PlanInput {
         install_path: settings.install_path.clone(),
@@ -1516,11 +1379,7 @@ async fn dfs_staged(
             )
             .await?
         };
-        txn.timed(
-            "finalize",
-            finish_install(settings, config, project, Some(latest), None, ui, mgr),
-        )
-        .await;
+        finish_install(settings, project, Some(latest), None, ui, mgr).await;
         return Ok((
             SessionResult::install(true, settings.is_update),
             self_replaced,
@@ -1572,9 +1431,7 @@ async fn dfs_staged(
                 Some(InstallItem { item })
             })
             .collect();
-        txn.set_measurement("download_files", install_items.len() as f64, "none");
         let download_bytes: u64 = install_items.iter().map(|i| i.item.size).sum();
-        txn.set_measurement("download_bytes", download_bytes as f64, "byte");
         // phase one holds every produced file next to the existing install
         ensure_space(staged, download_bytes)?;
 
@@ -1630,23 +1487,19 @@ async fn dfs_staged(
             None,
             None,
         );
-        let ops = txn
-            .timed(
-                "download",
-                install_files(
-                    settings,
-                    config,
-                    latest,
-                    hash_key,
-                    &tasks,
-                    &local,
-                    source_ctx,
-                    &staged.staging,
-                    ui,
-                    mgr,
-                ),
-            )
-            .await;
+        let ops = install_files(
+            settings,
+            config,
+            latest,
+            hash_key,
+            &tasks,
+            &local,
+            source_ctx,
+            &staged.staging,
+            ui,
+            mgr,
+        )
+        .await;
         cleanup_dfs2(source_ctx).await;
         #[cfg_attr(not(debug_assertions), allow(unused_variables))]
         let ops = ops.map_err(tag_sid)?;
@@ -1686,35 +1539,23 @@ async fn dfs_staged(
         self_units,
     );
     session_dump!(settings.dump_dir.as_deref(), "05-commit-units.json", units);
-    let self_replaced = txn
-        .timed(
-            "commit",
-            commit_staged(
-                settings,
-                staged,
-                Journal {
-                    hash_algorithm: algo.to_string(),
-                    archive: None,
-                    units,
-                },
-                ui,
-                mgr,
-            ),
-        )
-        .await
-        .map_err(tag_sid)?;
+    let self_replaced = commit_staged(
+        settings,
+        staged,
+        Journal {
+            hash_algorithm: algo.to_string(),
+            archive: None,
+            units,
+        },
+        ui,
+        mgr,
+    )
+    .await
+    .map_err(tag_sid)?;
 
-    txn.timed(
-        "runtimes",
-        install_runtimes(settings, config, project, &staged.staging, ui, mgr),
-    )
-    .await;
+    install_runtimes(settings, config, project, &staged.staging, ui, mgr).await;
     progress(ui, 3, 98.0, ProgressStage::Finalize, None, None, None);
-    txn.timed(
-        "finalize",
-        finish_install(settings, config, project, Some(latest), None, ui, mgr),
-    )
-    .await;
+    finish_install(settings, project, Some(latest), None, ui, mgr).await;
     Ok((
         SessionResult::install(false, settings.is_update),
         self_replaced,
@@ -3121,7 +2962,6 @@ async fn write_registration(
 
 async fn finish_install(
     settings: &Settings,
-    config: &InstallerConfig,
     project: &ProjectConfig,
     latest: Option<&RepoMetadata>,
     partial_version: Option<&str>,
@@ -3171,7 +3011,6 @@ async fn finish_install(
         mgr,
     )
     .await;
-    emit_insight(project, settings, config, "finish", None, false);
 }
 
 async fn create_shortcuts(
@@ -3321,7 +3160,6 @@ async fn run_mirrorc(
         finish_staging(&staged, recovered_self, mgr).await;
         finish_install(
             settings,
-            config,
             project,
             None,
             Some(&version_name),
@@ -3331,20 +3169,6 @@ async fn run_mirrorc(
         .await;
         return Ok(SessionResult::install(true, settings.is_update));
     }
-    emit_insight(
-        project,
-        settings,
-        config,
-        &prepare_event(
-            settings,
-            config,
-            &source_id(project, &settings.source_uri),
-            &version_name,
-            true,
-        ),
-        None,
-        false,
-    );
     if !prepare_process(settings, project, ui, mgr, &version_name).await? {
         finish_staging(&staged, recovered_self, mgr).await;
         return Ok(SessionResult::cancelled(settings.is_update));
@@ -3527,7 +3351,6 @@ async fn mirrorc_staged(
     install_runtimes(settings, config, project, &staged.staging, ui, mgr).await;
     finish_install(
         settings,
-        config,
         project,
         meta.as_ref(),
         Some(version_name),
@@ -3550,19 +3373,9 @@ pub async fn run_uninstall(
     mgr: &ManagedElevate,
 ) -> anyhow::Result<SessionResult> {
     let ui = LiveUi::new(ui, base);
-    let txn = crate::utils::sentry::Transaction::start("uninstall", "session");
-    emit_insight(project, settings, config, "uninstall", None, true);
     let result = run_uninstall_inner(settings, config, project, &ui, mgr).await;
-    txn.finish(txn_status(&result));
     if let Err(err) = &result {
-        emit_insight(
-            project,
-            settings,
-            config,
-            "fail",
-            Some(json!({ "kind": fail_kind(err) })),
-            true,
-        );
+        tracing::warn!("uninstall failed: kind={} {}", fail_kind(err), log_line(err));
     }
     result
 }

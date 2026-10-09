@@ -125,7 +125,6 @@ export function failed(code = 'PKG_BROKEN'): UiState {
       detail: 'boom',
       subject: null,
       sid: null,
-      event_id: null,
     },
   });
 }

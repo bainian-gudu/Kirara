@@ -575,12 +575,8 @@ async fn handle_start(
             Ok(r) => sess.state.phase = Phase::Done(r),
             Err(err) => {
                 let coded = coded_from_error(&err);
-                let event_id = TACommandError::new(err).report_if_needed();
                 sess.state.phase = match coded {
-                    Some(mut coded) => {
-                        coded.event_id = event_id;
-                        Phase::Failed(coded)
-                    }
+                    Some(coded) => Phase::Failed(coded),
                     None => Phase::Ready,
                 };
             }

@@ -53,9 +53,8 @@ WEBVIEW2_FAULT	安装界面无法显示，请重新运行安装器
 WEBVIEW2_REQUIRED	该安装源需要 WebView2，请使用「高级安装」
 dialog.cancel	取消
 dialog.copy	复制
-dialog.crash	安装程序发生内部错误，已终止运行。请重新运行安装程序；若问题持续出现，请凭以下编号反馈：{event_id}
+dialog.crash	安装程序发生内部错误，已终止运行。请重新运行安装程序。
 dialog.error	出错了
-dialog.event_id	事件编号：{event_id}
 dialog.mirrorc_cdk_get	获取 CDK
 dialog.mirrorc_cdk_hint	Mirror酱是独立的第三方软件下载平台，提供付费的软件下载加速服务。如果你有 Mirror酱的 CDK，可以在这里输入。
 dialog.mirrorc_cdk_placeholder	请输入 Mirror酱 CDK
@@ -64,7 +63,6 @@ dialog.no	否
 dialog.ok	确定
 dialog.prompt	提示
 dialog.session_id	下载会话：{sid}
-dialog.unknown_event	未知
 dialog.yes	是
 done.close	关闭
 done.install	安装完成

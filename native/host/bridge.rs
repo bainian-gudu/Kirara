@@ -33,10 +33,7 @@ pub fn on_message(ctx: &Arc<HostCtx>, handle: &HostHandle, json: &str) {
         let result = dispatch(&ctx, &handle, &msg.cmd, msg.args).await;
         let (ok, data) = match result {
             Ok(data) => (true, data),
-            Err(err) => {
-                let event_id = err.report_if_needed();
-                (false, error_payload(&err, event_id))
-            }
+            Err(err) => (false, error_payload(&err)),
         };
         handle.send(UiAction::Reply {
             id: msg.id,
@@ -51,7 +48,7 @@ pub fn on_message(ctx: &Arc<HostCtx>, handle: &HostHandle, json: &str) {
 
 /// Same shape as `Coded` plus `insight`, so the renderer can hand it straight to
 /// `error_dialog`. `code` is null for cancelled and uncoded errors.
-fn error_payload(err: &TACommandError, event_id: Option<String>) -> Value {
+fn error_payload(err: &TACommandError) -> Value {
     let (code, detail, subject, sid) = match extract(&err.error) {
         Extracted::Coded(c) => (
             Value::String(c.code.to_string()),
@@ -77,7 +74,6 @@ fn error_payload(err: &TACommandError, event_id: Option<String>) -> Value {
         "detail": detail,
         "subject": subject,
         "sid": sid,
-        "event_id": json_opt(event_id.as_deref()),
         "insight": err.insight,
     })
 }
@@ -172,7 +168,6 @@ async fn dispatch(
             let detail = opt_str(&args, &["detail"]);
             let subject = opt_str(&args, &["subject"]);
             let sid = opt_str(&args, &["sid"]);
-            let event_id = opt_str(&args, &["event_id", "eventId"]);
             let parent = handle.hwnd().0 as isize;
             tokio::task::spawn_blocking(move || {
                 show_error(
@@ -181,7 +176,6 @@ async fn dispatch(
                         detail: detail.as_deref(),
                         subject: subject.as_deref(),
                         sid: sid.as_deref(),
-                        event_id: event_id.as_deref(),
                     },
                     windows::Win32::Foundation::HWND(parent as *mut _),
                 );

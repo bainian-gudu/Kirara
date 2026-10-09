@@ -384,12 +384,6 @@ pub async fn handle_pipe(
                 Err(err) => Err(err),
             };
             match msg {
-                Ok(PipeMsg::Envelope(envelope)) => {
-                    crate::utils::sentry::forward_raw_envelope(envelope);
-                }
-                Ok(PipeMsg::Breadcrumb(crumb)) => {
-                    crate::utils::sentry::add_breadcrumb_json(&crumb);
-                }
                 Ok(PipeMsg::Progress(id, p)) => {
                     let _ = progress_tx.send((id, p));
                 }
@@ -477,7 +471,6 @@ pub async fn uac_ipc_main(args: crate::cli::arg::UacArgs) {
     let mut clientrx = tokio::io::BufReader::with_capacity(PIPE_BUFFER_SIZE, clientrx);
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<PipeMsg>(500);
-    let mut sentry_rx = crate::utils::sentry::PIPE_OUTBOX.rx.write().await;
 
     // 创建一个取消通知器
     let (cancel_tx, cancel_rx) = tokio::sync::broadcast::channel(1);
@@ -569,7 +562,7 @@ pub async fn uac_ipc_main(args: crate::cli::arg::UacArgs) {
         })
     };
 
-    // 第二个线程：处理发送和sentry消息
+    // 第二个线程：处理发送消息
     let write_handle = {
         let cancel_tx = cancel_tx.clone();
         let mut cancel_rx = cancel_rx.resubscribe();
@@ -598,11 +591,6 @@ pub async fn uac_ipc_main(args: crate::cli::arg::UacArgs) {
                             tracing::warn!("Client: Failed to receive message from channel");
                             let _ = cancel_tx.send(());
                             break;
-                        }
-                    }
-                    v = sentry_rx.recv() => {
-                        if let Some(msg) = v {
-                            let _ = tx.send(msg).await;
                         }
                     }
                 }

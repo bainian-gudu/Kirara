@@ -160,16 +160,4 @@ impl TACommandError {
 
         Self { error, insight }
     }
-
-    /// 会话失败上报咽喉。非 pipe、无 insight、且码的类要求上报时发错误事件，
-    /// 返回事件 id。提权进程把错误送回主进程再报；带 insight 的走 DFS。
-    pub fn report_if_needed(&self) -> Option<String> {
-        if !crate::utils::sentry::is_pipe_mode()
-            && self.insight.is_none()
-            && crate::utils::code::should_report_error(&self.error)
-        {
-            return Some(super::sentry::capture_anyhow(&self.error));
-        }
-        None
-    }
 }

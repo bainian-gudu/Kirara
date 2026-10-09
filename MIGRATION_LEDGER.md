@@ -26,7 +26,7 @@
 | P1 标准目标 + 构建入口 + 产物接口 | 部分 | 目标与产物接口已改；**Windows 构建未执行**（本环境无 MSVC/WebView2） |
 | P2 配置、打包与升级兼容 | 待办 | |
 | P3 卸载、提权与事务性安全 | 待办 | |
-| P4 前端体验与隐私 | 待办 | 遥测移除属此项 |
+| P4 前端体验与隐私 | 部分 | 遥测移除已完成（第 7 项）；协议/弹窗 footer 等待办 |
 | P5 依赖、文档与 CI 门禁 | 待办 | |
 | P6 端到端兼容、发布与回退 | 待办 | |
 
@@ -40,7 +40,7 @@
 | 4 vendored rcedit 兼容 | 待办 | 上游仍用 `Devolutions/rcedit-rs` git 依赖；核对 MSVC 14.51 是否需要 vendoring |
 | 5 弹窗 footer | 待办 | 新 Preact UI 与原生 TaskDialog 重做 |
 | 6 多用户与临时残留清理 | 待办 | 与上游新清理逻辑合并前先比行为 |
-| 7 物理移除遥测 | 待办 | `native/utils/sentry.rs`、`native/main.rs`、`native/session/ui.rs`、Cargo/pnpm lock、Release 上传步骤 |
+| 7 物理移除遥测 | 完成 | 见下「P4 已落地改动与证据」 |
 | 8 卸载收尾、路径比较、提权状态、ARP 静默入口 | 待办 | 与上游 `07452f0` / `5dda0c5` 合并验证 |
 | 9 安全临时文件、下载验签、提权管道 | 待办 | 与上游 `native/fs/staging.rs`、`native/ipc/` 协同 |
 | 10 DFS 拆分/注释 | 待办 | 旧 `src/dfs.ts` 与新 `native/session/`（含 `download_plan.rs`、`rate.rs`）职责映射 |
@@ -64,10 +64,44 @@
 | 新增构建入口 | `build.ps1` | `pwsh` 解析通过；取拼接体并校验体积大于 cargo builder |
 | 产物/发布资产改名 `kirara-builder.exe` | `.github/workflows/build.yml` | YAML 解析通过 |
 
+## P4 已落地改动与证据（第 7 项：物理移除遥测）
+
+两条外发通道（Sentry 错误上报、`77.cocogoat.cn` 使用统计）连依赖一起删除，
+不是运行时关开关。
+
+| 改动 | 落点 |
+| --- | --- |
+| 删除手写 Sentry 客户端 | `native/utils/sentry.rs`（整份删除），`native/utils/mod.rs` 去掉 `pub mod sentry;` 与 `get_device_id()` |
+| 时间格式化独立 | 新增 `native/utils/time.rs`（`rfc3339`），`log.rs` / `taskdialog.rs` 改用它 |
+| 崩溃收尾去遥测 | 新增 `native/utils/crash.rs`（panic hook 写 stderr + 日志 + 拉起 `crash-dialog`，不再上报、不再带事件号） |
+| 错误对话框去掉事件号 | `native/utils/taskdialog.rs` 的 `ErrorDialog.event_id` 字段、footer 行与复制内容里的 `event:` 行 |
+| 码表去掉上报判定 | `native/utils/code.rs` 删除 `Coded.event_id`、`should_report` / `should_report_error` |
+| 错误类型去掉上报入口 | `native/utils/error.rs` 删除 `report_if_needed()` |
+| IPC 去掉遥测通道 | `native/ipc/mod.rs` 删除 `PipeMsg::Envelope` / `PipeMsg::Breadcrumb`；`native/ipc/manager.rs` 删除 envelope/breadcrumb 分支与 outbox |
+| 会话不再发事务与计数 | `native/session/run.rs` 删除 `Transaction`（含 5 处 `timed` / 4 处 `set_measurement`）、`emit_insight` / `insight_base` / `prepare_event` / `source_id` / `txn_status`；失败分类改为本地 `tracing::warn!` |
+| 使用统计函数删除 | `native/session/ui.rs` 删除 `send_ev_insight` 与 `encode_uri` |
+| 安装配置不再上报 | `native/installer/config.rs` 的 `set_context` 换成一条本地 `tracing::info!` |
+| CLI 去掉事件号参数 | `native/cli/arg.rs`、`native/cli/mod.rs`：`Command::CrashDialog` 变单元变体 |
+| 前端契约去掉事件号 | `web/state.ts`、`web/__tests__/fixtures.ts` |
+| 文案去掉事件号 | `locales/{en-US,zh-CN}.tsv`：`dialog.crash` 去掉 `{event_id}`，删除 `dialog.event_id` / `dialog.unknown_event` |
+| 构建期依赖删除 | `package.json` 去掉 `@sentry/cli`；`pnpm-workspace.yaml` 去掉白名单项；`pnpm-lock.yaml` 用 `pnpm install --lockfile-only` 重新生成（净减 165 行，无版本顺带升级） |
+| CI 去掉上传步骤 | `.github/workflows/build.yml` 删除 Release job 的 "Sentry upload" |
+| `whoami` 降为 dev-dependency | `Cargo.toml`（`get_device_id()` 删除后只剩 `session::state` 测试用） |
+
+验证证据（本机 WSL，非 Windows 运行验证）：
+
+- `cargo check --target x86_64-pc-windows-msvc --all-targets` 通过，**0 warning / 0 error**
+  （含 `--force-warn=unused_crate_dependencies` 与全部单测目标）。
+  本机没有 MSVC/CMake，native 依赖的 build script 用一次性假工具链（`cl.exe` / `lib.exe` / `cmake`，
+  仅存在于 `/tmp`）绕过；不产生可链接产物，也不写入仓库。
+- `pnpm exec tsc --noEmit` 通过；`pnpm test`（vitest）3 个文件 30 个用例全绿。
+- `rg -n "sentry|77\.cocogoat|capture_anyhow|report_if_needed|event_id"` 在源码、配置、
+  工作流与两个锁文件中均无残留（`docs/notes/` 里的历史设计文档除外）。
+
 ## 未验证项（阻塞）
 
 - **Windows 构建与运行验证尚未执行**：本环境为 WSL，无 MSVC 工具链与 WebView2，
   `pnpm build`（cargo 交叉编译到 `x86_64-pc-windows-msvc`）无法在此完成。
   P1 的退出门槛（干净 checkout 产出 exe、CLI 冒烟、二次拼接稳定）需要在 Windows 或
   CI 上补齐后才能勾选。
-- 依赖替换（第 4 / 14 / 15 / 16 项）与遥测移除（第 7 项）等仍未开始。
+- 依赖替换（第 4 / 14 / 15 / 16 项）尚未开始。

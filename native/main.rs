@@ -1,7 +1,7 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-// The Send proof for on_message → handle_intent → run_install → run_dfs_install →
-// Transaction::timed exceeds the default depth (recursion_depth_exceeding_limit,
+// The Send proof for on_message → handle_intent → run_install → run_dfs_install
+// exceeds the default depth (recursion_depth_exceeding_limit,
 // future-incompatible); raise it instead of boxing the chain.
 #![recursion_limit = "256"]
 
@@ -104,20 +104,18 @@ fn main() {
             utils::uac::assume_unelevated();
         }
     }
-    // 崩溃提示进程只弹框，不初始化遥测与网络探测
-    if let Command::CrashDialog { event_id } = &command {
-        crash_dialog(event_id.as_deref());
+    // 崩溃提示进程只弹框，不初始化网络探测
+    if let Command::CrashDialog = &command {
+        crash_dialog();
         return;
     }
-    utils::sentry::init(matches!(command, Command::HeadlessUac(_)));
-    utils::sentry::set_app_info();
     let show_crash_dialog = match &command {
         Command::Install(a) => !a.silent,
         _ => true,
     };
-    utils::sentry::install_panic_hook(show_crash_dialog);
+    utils::crash::install_panic_hook(show_crash_dialog);
 
-    // 日志：控制台 + %TEMP%\KachinaInstaller.log + Sentry 面包屑，INFO 级全局过滤；
+    // 日志：控制台 + %TEMP%\KachinaInstaller.log，INFO 级全局过滤；
     // 提权子进程写启动进程传来的文件。
     let log_path = match &command {
         Command::HeadlessUac(uac) => uac.log_path.clone(),
@@ -131,11 +129,6 @@ fn main() {
     // command is not  Command::Install, can be anything
     match command {
         Command::HeadlessUac(args) => {
-            utils::sentry::add_breadcrumb(
-                "app",
-                "info",
-                "KachinaInstaller started as UAC Thread".into(),
-            );
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -143,11 +136,6 @@ fn main() {
                 .block_on(ipc::manager::uac_ipc_main(args));
         }
         Command::InstallWebview2 => {
-            utils::sentry::add_breadcrumb(
-                "app",
-                "info",
-                "KachinaInstaller started as Webview2 Installer".into(),
-            );
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -156,35 +144,19 @@ fn main() {
                     if module::wv2::install_webview2().await.is_ok() {
                         host_main(InstallArgs::default(), None, None);
                     }
-                    utils::sentry::flush(Duration::from_secs(3));
                 });
         }
         Command::NativeUi(args) => {
-            utils::sentry::add_breadcrumb(
-                "app",
-                "info",
-                "KachinaInstaller started (native-ui)".into(),
-            );
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .unwrap()
                 .block_on(async move {
                     native_entry(args).await;
-                    utils::sentry::flush(Duration::from_secs(3));
                 });
         }
-        Command::CrashDialog { .. } => unreachable!("handled before telemetry init"),
+        Command::CrashDialog => unreachable!("handled before crash handling init"),
         Command::Install(install) => {
-            utils::sentry::add_breadcrumb(
-                "app",
-                "info",
-                if install.silent {
-                    "KachinaInstaller started (silent)".into()
-                } else {
-                    "KachinaInstaller started".into()
-                },
-            );
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -196,17 +168,11 @@ fn main() {
                                 "silent install failed: {}",
                                 utils::code::log_line(&err)
                             );
-                            if utils::code::should_report_error(&err) {
-                                let event_id = utils::sentry::capture_anyhow(&err);
-                                tracing::error!("reported as event {event_id}");
-                            }
-                            utils::sentry::flush(Duration::from_secs(3));
                             std::process::exit(1);
                         }
                     } else {
                         gui_entry(install).await;
                     }
-                    utils::sentry::flush(Duration::from_secs(3));
                 });
         }
     }
@@ -216,17 +182,13 @@ fn main() {
     installer::uninstall::delete_self_on_exit();
 }
 
-fn crash_dialog(event_id: Option<&str>) {
+fn crash_dialog() {
     use crate::utils::i18n::t;
     use crate::utils::taskdialog::{task_dialog, CommandLink, TaskDialogRequest};
-    let unknown = t("dialog.unknown_event", &[]);
     task_dialog(
         TaskDialogRequest {
             title: t("dialog.error", &[]),
-            content: t(
-                "dialog.crash",
-                &[("event_id", event_id.unwrap_or(&unknown))],
-            ),
+            content: t("dialog.crash", &[]),
             expanded: None,
             footer: None,
             buttons: vec![CommandLink {
@@ -272,18 +234,10 @@ fn host_main(
     }
 }
 
-/// Host-level failure with no renderer alive: report, show the default error
-/// dialog with the event id, exit 1.
+/// Host-level failure with no renderer alive: show the default error dialog, exit 1.
 fn fatal_error(err: &anyhow::Error) -> ! {
-    let event_id = if utils::code::should_report_error(err) {
-        Some(utils::sentry::capture_anyhow(err))
-    } else {
-        None
-    };
-    if let Some(mut coded) = utils::code::coded_from_error(err) {
-        coded.event_id = event_id;
+    if let Some(coded) = utils::code::coded_from_error(err) {
         utils::taskdialog::show_error_coded(&coded, windows::Win32::Foundation::HWND::default());
     }
-    utils::sentry::flush(Duration::from_secs(3));
     std::process::exit(1);
 }

@@ -102,24 +102,6 @@ jobs:
       - name: Copy Binary
         # artifact 里的 kachina-builder.exe 已由 build job 用拼接体覆盖，这里只改名交付
         run: Copy-Item "artifacts/artifact/kachina-builder.exe" "kirara-builder.exe" -Force
-      - name: Sentry upload
-        continue-on-error: true
-        env:
-          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
-          SENTRY_ORG: yuehaiteam
-          SENTRY_PROJECT: kachina-installer
-          SENTRY_URL: ${{ secrets.SENTRY_URL }}
-        run: |
-          $ErrorActionPreference = "Stop"
-          $env:SENTRY_LOG_LEVEL = "info"
-          echo "Creating Sentry release for version ${{ needs.build.outputs.version }}"
-          pnpm exec sentry-cli releases new "${{ needs.build.outputs.version }}"
-          echo "Setting release metadata for version ${{ needs.build.outputs.version }}"
-          pnpm exec sentry-cli releases set-commits --auto "${{ needs.build.outputs.version }}"
-          echo "Uploading debug files for version ${{ needs.build.outputs.version }}"
-          pnpm exec sentry-cli debug-files upload ./artifacts/artifact/kachina_installer.pdb
-          echo "Finalizing release for version ${{ needs.build.outputs.version }}"
-          pnpm exec sentry-cli releases finalize "${{ needs.build.outputs.version }}"
       - name: Release
         uses: softprops/action-gh-release@v2
         with:

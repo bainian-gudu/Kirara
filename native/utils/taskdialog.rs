@@ -712,7 +712,6 @@ pub struct ErrorDialog<'a> {
     pub detail: Option<&'a str>,
     pub subject: Option<&'a str>,
     pub sid: Option<&'a str>,
-    pub event_id: Option<&'a str>,
 }
 
 impl<'a> ErrorDialog<'a> {
@@ -729,7 +728,6 @@ impl<'a> ErrorDialog<'a> {
             detail: coded.detail.as_deref(),
             subject: coded.subject.as_deref(),
             sid: coded.sid.as_deref(),
-            event_id: coded.event_id.as_deref(),
         }
     }
 }
@@ -739,15 +737,14 @@ fn non_empty(s: Option<&str>) -> Option<&str> {
 }
 
 /// Layout: instruction = copy[code], content = subject then detail, footer =
-/// the ids the other side can look up (DFS session, Sentry event). The Copy
-/// button appears only for errors someone else can act on (`copy_useful`) and
-/// keeps the dialog open.
+/// the ids the other side can look up (DFS session id). The Copy button
+/// appears only for errors someone else can act on (`copy_useful`) and keeps
+/// the dialog open.
 pub fn show_error(dialog: ErrorDialog<'_>, parent: HWND) {
     use crate::utils::i18n::t;
     let subject = non_empty(dialog.subject);
     let detail = non_empty(dialog.detail);
     let sid = non_empty(dialog.sid);
-    let event_id = non_empty(dialog.event_id);
 
     // When the copy already names the subject ("安装{subject}失败"), repeating it
     // in the body would read as a second, unrelated fact.
@@ -763,14 +760,9 @@ pub fn show_error(dialog: ErrorDialog<'_>, parent: HWND) {
         .flatten()
         .collect::<Vec<_>>()
         .join("\n\n");
-    let footer = [
-        sid.map(|s| t("dialog.session_id", &[("sid", s)])),
-        event_id.map(|e| t("dialog.event_id", &[("event_id", e)])),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>()
-    .join("\n");
+    let footer = sid
+        .map(|s| t("dialog.session_id", &[("sid", s)]))
+        .unwrap_or_default();
 
     let mut buttons = Vec::new();
     let copy = if crate::utils::code::copy_useful(dialog.code) {
@@ -778,7 +770,7 @@ pub fn show_error(dialog: ErrorDialog<'_>, parent: HWND) {
             id: ID_COPY,
             text: t("dialog.copy", &[]),
         });
-        Some(copy_body(dialog.code, subject, sid, event_id, detail))
+        Some(copy_body(dialog.code, subject, sid, detail))
     } else {
         None
     };
@@ -804,14 +796,8 @@ pub fn show_error_coded(coded: &crate::utils::code::Coded, parent: HWND) {
 }
 
 /// One `key: value` per line, empty fields omitted; the UTC time lets the DFS
-/// side (which has no Sentry event) find the matching server log by `sid`.
-fn copy_body(
-    code: &str,
-    subject: Option<&str>,
-    sid: Option<&str>,
-    event_id: Option<&str>,
-    detail: Option<&str>,
-) -> String {
+/// side find the matching server log by `sid`.
+fn copy_body(code: &str, subject: Option<&str>, sid: Option<&str>, detail: Option<&str>) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -823,10 +809,7 @@ fn copy_body(
     if let Some(s) = sid {
         lines.push(format!("sid: {s}"));
     }
-    if let Some(e) = event_id {
-        lines.push(format!("event: {e}"));
-    }
-    lines.push(format!("time: {}", crate::utils::sentry::rfc3339(now)));
+    lines.push(format!("time: {}", crate::utils::time::rfc3339(now)));
     if let Some(d) = detail {
         lines.push(format!("detail: {d}"));
     }

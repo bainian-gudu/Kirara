@@ -38,7 +38,6 @@
     "@fullhuman/postcss-purgecss": "^7.0.2",
     "@rsbuild/core": "^1.5.10",
     "@rsbuild/plugin-preact": "^1.5.2",
-    "@sentry/cli": "^2.46.0",
     "@testing-library/preact": "^3.2.4",
     "compression-webpack-plugin": "^11.1.0",
     "cross-env": "^7.0.3",

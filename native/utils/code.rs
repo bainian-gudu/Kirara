@@ -5,7 +5,7 @@ use std::fmt;
 
 use serde::Serialize;
 
-// --- N: download itself, do not report ---
+// --- N: download itself ---
 pub const DOWNLOAD_TIMEOUT: &str = "DOWNLOAD_TIMEOUT";
 pub const DOWNLOAD_REFUSED: &str = "DOWNLOAD_REFUSED";
 pub const DOWNLOAD_FAILED: &str = "DOWNLOAD_FAILED";
@@ -14,7 +14,7 @@ pub const SERVER_HTTP_ERROR: &str = "SERVER_HTTP_ERROR";
 pub const HASH_MISMATCH: &str = "HASH_MISMATCH";
 pub const SOURCE_NEEDS_VERIFICATION: &str = "SOURCE_NEEDS_VERIFICATION";
 
-// --- E: machine environment, do not report ---
+// --- E: machine environment ---
 pub const PERMISSION_DENIED: &str = "PERMISSION_DENIED";
 pub const DISK_FULL: &str = "DISK_FULL";
 pub const FILE_IN_USE: &str = "FILE_IN_USE";
@@ -33,7 +33,7 @@ pub const WEBVIEW2_FAULT: &str = "WEBVIEW2_FAULT";
 pub const SELF_UPDATE_FAILED: &str = "SELF_UPDATE_FAILED";
 pub const STAGING_IN_USE: &str = "STAGING_IN_USE";
 
-// --- U: user input, do not report ---
+// --- U: user input ---
 pub const MIRRORC_CDK_MISSING: &str = "MIRRORC_CDK_MISSING";
 pub const MIRRORC_CDK_EXPIRED: &str = "MIRRORC_CDK_EXPIRED";
 pub const MIRRORC_CDK_INVALID: &str = "MIRRORC_CDK_INVALID";
@@ -43,7 +43,7 @@ pub const MIRRORC_CDK_BANNED: &str = "MIRRORC_CDK_BANNED";
 pub const INSTALL_PATH_INVALID: &str = "INSTALL_PATH_INVALID";
 pub const ELEVATED_DRIVE_UNAVAILABLE: &str = "ELEVATED_DRIVE_UNAVAILABLE";
 
-// --- C: packager config, report ---
+// --- C: packager config ---
 pub const PKG_BROKEN: &str = "PKG_BROKEN";
 pub const SOURCE_INVALID: &str = "SOURCE_INVALID";
 pub const VERSION_REGEX_INVALID: &str = "VERSION_REGEX_INVALID";
@@ -56,7 +56,7 @@ pub const RUNTIME_UNSUPPORTED: &str = "RUNTIME_UNSUPPORTED";
 pub const UNINSTALL_INFO_MISSING: &str = "UNINSTALL_INFO_MISSING";
 pub const HASH_ALGORITHM_UNSUPPORTED: &str = "HASH_ALGORITHM_UNSUPPORTED";
 
-// --- S: server / third-party, report ---
+// --- S: server / third-party ---
 pub const SOURCE_METADATA_INVALID: &str = "SOURCE_METADATA_INVALID";
 pub const REMOTE_FILE_MISSING: &str = "REMOTE_FILE_MISSING";
 pub const NO_DOWNLOAD_NODE: &str = "NO_DOWNLOAD_NODE";
@@ -64,7 +64,7 @@ pub const EXTRACT_FAILED: &str = "EXTRACT_FAILED";
 pub const MIRRORC_FAILED: &str = "MIRRORC_FAILED";
 pub const MIRRORC_UNREACHABLE: &str = "MIRRORC_UNREACHABLE";
 
-// --- M: first-party metadata API, report ---
+// --- M: first-party metadata API ---
 pub const METADATA_UNREACHABLE: &str = "METADATA_UNREACHABLE";
 pub const METADATA_HTTP_ERROR: &str = "METADATA_HTTP_ERROR";
 pub const METADATA_INVALID: &str = "METADATA_INVALID";
@@ -150,9 +150,6 @@ pub struct Coded {
     pub detail: Option<String>,
     pub subject: Option<String>,
     pub sid: Option<String>,
-    /// Sentry event id, filled at the session boundary once the error has been
-    /// reported, so the user can quote it (the copy button includes it).
-    pub event_id: Option<String>,
     #[serde(skip)]
     source: Option<anyhow::Error>,
 }
@@ -164,7 +161,6 @@ impl Clone for Coded {
             detail: self.detail.clone(),
             subject: self.subject.clone(),
             sid: self.sid.clone(),
-            event_id: self.event_id.clone(),
             source: None,
         }
     }
@@ -176,7 +172,6 @@ impl PartialEq for Coded {
             && self.detail == other.detail
             && self.subject == other.subject
             && self.sid == other.sid
-            && self.event_id == other.event_id
     }
 }
 
@@ -187,7 +182,6 @@ impl Coded {
             detail: None,
             subject: None,
             sid: None,
-            event_id: None,
             source: None,
         }
     }
@@ -198,7 +192,6 @@ impl Coded {
             detail: None,
             subject: Some(subject.into()),
             sid: None,
-            event_id: None,
             source: None,
         }
     }
@@ -307,9 +300,9 @@ pub fn extract(err: &anyhow::Error) -> Extracted {
 
 /// Whether the copy button is worth showing: someone on the other end can act
 /// on the copied text. Download (N), server (S) and metadata API (M) failures
-/// carry a session / event id the operator can look up; uncoded errors are our
-/// defects. Environment (E), user input (U) and packager config (C) failures
-/// can only be fixed locally, and a broken package cannot report anyway.
+/// carry a session id the operator can look up; uncoded errors are our defects.
+/// Environment (E), user input (U) and packager config (C) failures can only be
+/// fixed locally.
 pub fn copy_useful(code: &str) -> bool {
     match class_of(code) {
         Some(Class::N | Class::S | Class::M) | None => true,
@@ -340,7 +333,6 @@ fn attach_error(err: anyhow::Error, code: &'static str, subject: Option<String>)
             detail: None,
             subject,
             sid: None,
-            event_id: None,
             source: None,
         },
         err,
@@ -430,14 +422,6 @@ pub fn class_of(code: &str) -> Option<Class> {
         | MIRRORC_UNREACHABLE => Some(Class::S),
         METADATA_UNREACHABLE | METADATA_HTTP_ERROR | METADATA_INVALID => Some(Class::M),
         _ => None,
-    }
-}
-
-pub fn should_report(code: &str) -> bool {
-    match class_of(code) {
-        Some(Class::N | Class::E | Class::U) => false,
-        Some(Class::C | Class::S | Class::M) => true,
-        None => true,
     }
 }
 
@@ -538,14 +522,6 @@ pub fn fail_kind(err: &anyhow::Error) -> &'static str {
         Extracted::Cancelled => "cancelled",
         Extracted::Coded(c) => class_of(c.code).map(Class::as_str).unwrap_or("uncoded"),
         Extracted::Uncoded { .. } => "uncoded",
-    }
-}
-
-pub fn should_report_error(err: &anyhow::Error) -> bool {
-    match extract(err) {
-        Extracted::Cancelled => false,
-        Extracted::Coded(c) => should_report(c.code),
-        Extracted::Uncoded { .. } => true,
     }
 }
 
@@ -798,31 +774,16 @@ mod tests {
     }
 
     #[test]
-    fn class_table_and_should_report_one_per_class() {
+    fn class_table_one_per_class() {
         assert_eq!(class_of(DOWNLOAD_TIMEOUT), Some(Class::N));
-        assert!(!should_report(DOWNLOAD_TIMEOUT));
-
         assert_eq!(class_of(PERMISSION_DENIED), Some(Class::E));
-        assert!(!should_report(PERMISSION_DENIED));
-
         assert_eq!(class_of(MIRRORC_CDK_MISSING), Some(Class::U));
-        assert!(!should_report(MIRRORC_CDK_MISSING));
-
         assert_eq!(class_of(PKG_BROKEN), Some(Class::C));
-        assert!(should_report(PKG_BROKEN));
         assert_eq!(class_of(PLUGIN_FAILED), Some(Class::C));
-        assert!(should_report(PLUGIN_FAILED));
         assert_eq!(class_of(PLUGIN_HOST_FAILED), Some(Class::C));
-        assert!(should_report(PLUGIN_HOST_FAILED));
-
         assert_eq!(class_of(NO_DOWNLOAD_NODE), Some(Class::S));
-        assert!(should_report(NO_DOWNLOAD_NODE));
-
         assert_eq!(class_of(METADATA_INVALID), Some(Class::M));
-        assert!(should_report(METADATA_INVALID));
-
         assert_eq!(class_of(INTERNAL_ERROR), None);
-        assert!(should_report(INTERNAL_ERROR));
     }
 
     #[test]

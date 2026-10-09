@@ -91,19 +91,17 @@ pub async fn get_config_pre(
             .as_ref()
             .and_then(|c| c["source"].as_str())
             .unwrap_or("Unknown");
-        crate::utils::sentry::set_context(
-            "config",
-            serde_json::json!({
-                "Name": embed_name,
-                "Source": embed_source,
-                "HasMetadata": enbedded_metadata.is_some(),
-                "HasFiles": embedded_files.is_some(),
-                "HasIndex": embedded_index.is_some(),
-                "IsUninstall": args.uninstall,
-                "OverrideSource": format!("{:?}", args.source),
-                "NonInteractive": args.non_interactive,
-                "Silent": args.silent,
-            }),
+        tracing::info!(
+            "installer config: name={embed_name} source={embed_source} \
+             metadata={} files={} index={} uninstall={} override_source={:?} \
+             non_interactive={} silent={}",
+            enbedded_metadata.is_some(),
+            embedded_files.is_some(),
+            embedded_index.is_some(),
+            args.uninstall,
+            args.source,
+            args.non_interactive,
+            args.silent,
         );
     }
     Ok(InstallerConfig {

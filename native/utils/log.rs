@@ -1,7 +1,7 @@
 //! 最小 tracing 后端：直接实现 `tracing::Subscriber`，不依赖 tracing-subscriber。
 //!
-//! 单个全局 Subscriber 同时完成三件事：INFO 级别过滤、控制台/日志文件输出、
-//! Sentry 面包屑写入。仓库内没有任何 span 使用，span 相关方法均为空实现。
+//! 单个全局 Subscriber 完成两件事：INFO 级别过滤、控制台/日志文件输出。
+//! 仓库内没有任何 span 使用，span 相关方法均为空实现。
 
 use std::fs::File;
 use std::io::Write;
@@ -58,7 +58,7 @@ fn timestamp() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    let base = crate::utils::sentry::rfc3339(now.as_secs());
+    let base = crate::utils::time::rfc3339(now.as_secs());
     // "....SSZ" → 去掉 Z 补毫秒
     format!("{}.{:03}Z", &base[..base.len() - 1], now.subsec_millis())
 }
@@ -75,13 +75,6 @@ impl tracing::Subscriber for LogSubscriber {
             message: String::new(),
         };
         event.record(&mut visitor);
-
-        let level_str = match level {
-            tracing::Level::ERROR => "error",
-            tracing::Level::WARN => "warning",
-            _ => "info",
-        };
-        crate::utils::sentry::add_breadcrumb(meta.target(), level_str, visitor.message.clone());
 
         let color = match level {
             tracing::Level::ERROR => "\x1b[31m",

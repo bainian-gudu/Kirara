@@ -53,9 +53,8 @@ WEBVIEW2_FAULT	The installer window could not be displayed. Run the installer ag
 WEBVIEW2_REQUIRED	This source requires WebView2. Use "Advanced install"
 dialog.cancel	Cancel
 dialog.copy	Copy
-dialog.crash	The installer encountered an internal error and has stopped. Please run it again; if the problem persists, report it with this ID: {event_id}
+dialog.crash	The installer encountered an internal error and has stopped. Please run it again.
 dialog.error	Something went wrong
-dialog.event_id	Event ID: {event_id}
 dialog.mirrorc_cdk_get	Get a CDK
 dialog.mirrorc_cdk_hint	Mirror酱 is an independent third-party download platform offering paid download acceleration. If you have a Mirror酱 CDK, enter it here.
 dialog.mirrorc_cdk_placeholder	Enter your Mirror酱 CDK
@@ -64,7 +63,6 @@ dialog.no	No
 dialog.ok	OK
 dialog.prompt	Notice
 dialog.session_id	Download session: {sid}
-dialog.unknown_event	Unknown
 dialog.yes	Yes
 done.close	Close
 done.install	Installation complete

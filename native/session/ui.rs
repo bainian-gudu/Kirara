@@ -131,60 +131,6 @@ impl SessionUi for SilentUi {
     }
 }
 
-fn encode_uri(s: &str) -> String {
-    let mut out = String::new();
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b';'
-            | b','
-            | b'/'
-            | b'?'
-            | b':'
-            | b'@'
-            | b'&'
-            | b'='
-            | b'+'
-            | b'$'
-            | b'-'
-            | b'_'
-            | b'.'
-            | b'!'
-            | b'~'
-            | b'*'
-            | b'\''
-            | b'('
-            | b')'
-            | b'#' => out.push(b as char),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
-pub async fn send_ev_insight(url: &str, event: &str, data: Option<Value>) {
-    let body = serde_json::json!({
-        "type": "event",
-        "payload": {
-            "website": "16d32274-7313-4db6-80d3-340ce9db7689",
-            "url": encode_uri(url),
-            "name": event,
-            "data": data,
-        }
-    });
-    if let Err(err) = crate::REQUEST_CLIENT
-        .post("https://77.cocogoat.cn/ev")
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await
-    {
-        tracing::debug!("insight failed: {err}");
-    }
-}
-
 #[derive(Default)]
 pub struct PromptHub {
     pending: Mutex<HashMap<String, oneshot::Sender<bool>>>,
