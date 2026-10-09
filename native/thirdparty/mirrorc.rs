@@ -87,7 +87,14 @@ pub fn run_mirrorc_install_sync(
     let mut archive = zip::ZipArchive::new(file).into_ta_result()?;
     let total_len = archive.len();
 
-    let names: Vec<String> = archive.file_names().map(|s| s.to_string()).collect();
+    // 条目名一律按 UTF-8 解码：部分打包工具写中文文件名时不置 zip 的 UTF-8 标志位，
+    // 按标志位解码会退回 CP437 得到乱码（「中文」→「Σ╕¡µûç」），MirrorChyan 下发的
+    // 包正好属于这一类。`file_names()` 走的是标志位，所以逐个取 `name_raw()` 自己解。
+    let mut names: Vec<String> = Vec::with_capacity(total_len);
+    for i in 0..total_len {
+        let file = archive.by_index(i).into_ta_result()?;
+        names.push(decode_entry_name(file.name_raw()));
+    }
     let prefix = archive_wrapper_prefix(&names);
 
     // changes.json
@@ -128,11 +135,8 @@ pub fn run_mirrorc_install_sync(
     let mut files = Vec::new();
     for i in 0..total_len {
         let mut file = archive.by_index(i).into_ta_result()?;
-        let file_name = file
-            .name()
-            .strip_prefix(&prefix)
-            .unwrap_or(file.name())
-            .to_string();
+        let raw_name = decode_entry_name(file.name_raw());
+        let file_name = raw_name.strip_prefix(&prefix).unwrap_or(&raw_name).to_string();
         if file_name == "changes.json"
             || file_name == ".metadata.json"
             || file_name == format!("{prefix}.metadata.json")
@@ -284,6 +288,12 @@ pub async fn run_mirrorc_download(
 /// Zip-root `.metadata.json` means the archive is already at package root
 /// (files may still share a directory like `Assets/`). Otherwise strip the
 /// shared parent of remaining entries (`root/` in the changeset layout).
+/// zip 条目名按 UTF-8 解码，字节序列不是合法 UTF-8 时走 lossy（替换字符），
+/// 与原来那个 fork 的分支逐字一致。
+fn decode_entry_name(raw: &[u8]) -> String {
+    String::from_utf8_lossy(raw).into_owned()
+}
+
 fn archive_wrapper_prefix(names: &[String]) -> String {
     if names.iter().any(|n| n == ".metadata.json") {
         return String::new();
@@ -330,6 +340,18 @@ mod tests {
             crate::fs::staging::scratch_file(&format!("kachina-mirrorc-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn entry_names_decode_as_utf8_regardless_of_the_flag() {
+        // 未置 UTF-8 标志位的中文名：按 UTF-8 还原，不是 CP437 乱码
+        assert_eq!(decode_entry_name("中文/应用.exe".as_bytes()), "中文/应用.exe");
+        // 合法 UTF-8 但非 ASCII 的其它语言同理
+        assert_eq!(decode_entry_name("日本語.txt".as_bytes()), "日本語.txt");
+        // 非法 UTF-8 走 lossy，不 panic
+        assert_eq!(decode_entry_name(&[0xff, 0xfe, b'a']), "\u{fffd}\u{fffd}a");
+        // ASCII 名不受影响
+        assert_eq!(decode_entry_name(b"changes.json"), "changes.json");
     }
 
     fn make_zip(path: &Path, entries: &[(&str, &[u8])]) {

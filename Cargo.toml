@@ -81,8 +81,13 @@ console = "0.15.10"
 # `std::locale::empty()`，MSVC 14.51 起编不过。差异与升级方式见 vendor/rcedit-rs/LOCAL_PATCHES.md。
 rcedit = { path = "vendor/rcedit-rs" }
 windows-registry = "0.5"
-zip = { git = "https://github.com/xytoki/zip2.git", default-features = false, features = [
-    "deflate",
+# 不再用 xytoki/zip2 fork：它只把 `read.rs` 的 UTF-8 判定写死成 true。这里改用
+# crates.io 的 zip，并在 native/thirdparty/mirrorc.rs 里按 name_raw() 自己解条目名。
+# deflate 走纯 Rust 的 zlib-rs 后端，不引入新的 C 依赖。
+zip = { version = "8.6", default-features = false, features = [
+    "deflate-flate2-zlib-rs",
+    "deflate64",
+    "zstd",
 ] }
 anyhow = "1.0"
 reqwest-middleware = { version = "0.4", features = ["json"] }

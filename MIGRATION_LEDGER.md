@@ -47,7 +47,7 @@
 | 11 编译告警治理 | 部分 | 上游 `05a1410` 已清理一批；剩余待构建后确认 |
 | 12 改名后的升级兼容 | 完成 | `legacyExeNames` / `legacyProgramFilesPaths` / `legacyUninstallNames`，见下 |
 | 13 Windows 10/11 标准目标 | 部分 | 目标、`-Z build-std`、`rust-src`、`ctor` patch、`STATIC_VCRUNTIME` 已处理（见下）；CI 的 `CARGO_PROFILE_RELEASE_DEBUG` 等细节待补 |
-| 14 zip 去 fork 与中文名解码 | 待办 | 上游仍用 `xytoki/zip2`；`native/thirdparty/mirrorc.rs` |
+| 14 zip 去 fork 与中文名解码 | 完成 | 改用 crates.io `zip 8.6`；`native/thirdparty/mirrorc.rs` 按 `name_raw()` 自己解条目名（见下） |
 | 15 H3 改 `quinn`/`rustls` | 待办 | 上游仍用 `msquic-async` 系列 fork |
 | 16 旧依赖替换与许可证 | 完成 | `mslnk` → Shell Link API、`nt_version` → ntdll、`libs/` 许可证补齐（见下） |
 | 17 打包器修复 | 待办 | PE 识别、嵌入名、extract 路径约束、`replace-bin`；可能已有上游等价实现，测试通过才标记已覆盖 |
@@ -222,6 +222,7 @@ exe，下载源被劫持时也照样执行。这里统一收口到 `native/utils
 | 版本号改 ntdll（第 16b 项） | `native/utils/os_version.rs`、`native/host/window.rs`、`native/capabilities/mod.rs` | `nt_version 0.1` 换成自己声明 `#[link(name = "ntdll")] RtlGetNtVersionNumbers`；`build` 的高 16 位标志位统一在 `get()` 里裁掉，两处调用点不再各自 `& 0xffff`。H3 的 Win11 门槛（`10.0` 且 build ≥ 22000）未放宽 |
 | `libs/` 许可证（第 16c 项） | `libs/hdiff-sys/LICENSE`、`libs/hpatch-sys/LICENSE`、`libs/THIRDPARTY.md` | 补齐 HDiffPatch（MIT，Copyright (c) 2012-2023 housisong）与 libdivsufsort（MIT，Copyright (c) 2003-2008 Yuta Mori）的许可文本，并记录上游地址、快照版本 `v4.8.0`、本地四类差异（include 路径、`extern "C"` 出口、hpatch 具体错误码、注释中文化）与升级步骤 |
 | 依赖删除 | 根 `Cargo.toml`、`Cargo.lock` | 去掉 `nt_version`、`mslnk`；`rcedit` / `rcedit-sys` 去掉 `source = "git+…"`。锁文件净减 27 行，只少了 `mslnk`、`nt_version` 与仅供 `mslnk` 使用的 `bitflags 1.3.2`，无版本变动 |
+| zip 去 fork（第 14 项） | 根 `Cargo.toml`、`native/thirdparty/mirrorc.rs` | 上游的 `xytoki/zip2` fork 相对上游只把 `read.rs` 的 UTF-8 判定写死成 `true`（部分打包工具写中文名时不置该标志位，按标志位解码会退回 CP437 得到乱码，MirrorChyan 下发的包正属于这类）。改用 crates.io `zip 8.6` 后复刻同一语义：新增 `decode_entry_name`（`String::from_utf8_lossy`，与 fork 分支逐字一致），条目清单由 `file_names()`（按标志位解码）改为逐个 `by_index(i)` 取 `name_raw()` 再解码，前缀计算与路径安全判定都建立在这份名字上。`by_name()` 保留：zip 8.x 的名字索引按原始字节建表（`index_for_name` 用 `name.as_bytes()`），UTF-8 名字查得到。feature 保持与原 fork 相同的解压能力（`deflate-flate2-zlib-rs` / `deflate64` / `zstd`），flate2 走纯 Rust 的 zlib-rs 后端，不引入新的 C 依赖 |
 
 验证证据（本机 WSL，非 Windows 运行验证）：
 
