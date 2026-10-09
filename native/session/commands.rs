@@ -215,6 +215,7 @@ async fn ready_runtime(
             description: project.description.clone(),
             borderless: project.window_borderless.unwrap_or(false),
             lang: crate::utils::i18n::lang().to_string(),
+            agreement: project.agreement.clone(),
         },
         options: Options {
             install_path: install_path.clone(),

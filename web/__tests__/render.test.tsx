@@ -72,6 +72,33 @@ describe('screens', () => {
     expect(screen.getByText('同时删除用户数据')).toBeTruthy();
   });
 
+  it('shows a plain-text agreement link when nothing is inlined', async () => {
+    await mount(ready());
+    expect(document.querySelector('.agreement-link')).toBeNull();
+    expect(document.querySelector('.agreement-link-off')?.textContent).toBe(
+      '用户协议',
+    );
+  });
+
+  it('gates install behind the inlined agreement', async () => {
+    const ui = ready();
+    ui.project = {
+      ...ui.project,
+      agreement: { title: '用户协议', format: 'text', content: '第一条 正文' },
+    };
+    await mount(ui);
+    // 内联了正文：默认不勾选，安装按钮不可用。
+    expect((screen.getByText('安装') as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByText('用户协议'));
+    expect(document.querySelector('.agreement-body')?.textContent).toContain(
+      '第一条 正文',
+    );
+    // 勾选文案与按钮文案相同（`ready.agree` / `dialog.agreement_accept`），
+    // 这里只点弹窗里的按钮。
+    fireEvent.click(screen.getByText('我已阅读并同意', { selector: 'button' }));
+    expect((screen.getByText('安装') as HTMLButtonElement).disabled).toBe(false);
+  });
+
   it('renders running progress; cancel asks for confirmation first', async () => {
     await mount(running());
     expect(screen.getByText('app.exe')).toBeTruthy();

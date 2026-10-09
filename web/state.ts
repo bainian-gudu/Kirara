@@ -85,6 +85,15 @@ export type ProjectView = {
   description: string;
   borderless: boolean;
   lang: string;
+  /** 打包期内联的用户协议；`null` 时链接退化为纯文字。 */
+  agreement: AgreementConfig | null;
+};
+
+/** 打包期内联的协议正文。`format` 是 `text` / `markdown` / `html`。 */
+export type AgreementConfig = {
+  title: string;
+  format: string;
+  content: string;
 };
 
 export type Options = {

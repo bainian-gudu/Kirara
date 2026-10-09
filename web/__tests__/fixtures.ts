@@ -6,6 +6,7 @@ const project = {
   description: 'A demo',
   borderless: false,
   lang: 'zh-CN',
+  agreement: null as UiState['project']['agreement'],
 };
 
 const options = {

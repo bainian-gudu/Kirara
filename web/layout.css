@@ -252,6 +252,96 @@
   bottom: 0;
   background: var(--colorNeutralBackground1, #111);
   z-index: 5;
+  /* 弹窗是纵向 flex：正文吃剩余高度，footer 回到文档流，两者不可能重叠。 */
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 4px 8px 0;
+  box-sizing: border-box;
+}
+.dialog-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.dialog-footer {
+  flex: 0 0 auto;
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0 10px;
+}
+/* `.btn-install` 是给主界面右下角设计的绝对定位按钮，弹窗里要回到流内。 */
+.dialog-footer .btn-install {
+  position: static;
+  height: 28px;
+  width: auto;
+  min-width: 72px;
+  padding: 0 14px;
+  font-size: 12.5px;
+}
+.agreement-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 2px 4px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  user-select: text;
+  app-region: no-drag;
+}
+.agreement-body h2,
+.agreement-body h3,
+.agreement-body h4,
+.agreement-body h5,
+.agreement-body h6 {
+  font-size: 14px;
+  margin: 10px 0 4px;
+}
+.agreement-body p {
+  margin: 6px 0;
+}
+.agreement-body ul,
+.agreement-body ol {
+  margin: 6px 0;
+  padding-left: 20px;
+}
+.agreement-body blockquote {
+  margin: 6px 0;
+  padding-left: 8px;
+  border-left: 2px solid currentColor;
+  opacity: 0.85;
+}
+.agreement-body pre {
+  margin: 6px 0;
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: rgba(127, 127, 127, 0.18);
+  overflow-x: auto;
+}
+.agreement-body code {
+  font-family: Consolas, monospace;
+}
+.agreement-body a {
+  color: #6cb6ff;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.agreement-body img {
+  max-width: 100%;
+}
+.agreement-plain {
+  white-space: pre-wrap;
+}
+.agreement-link {
+  cursor: pointer;
+  text-decoration: underline;
+  margin-left: 4px;
+}
+.agreement-link-off {
+  margin-left: 4px;
 }
 .prompt-items {
   font-size: 12px;

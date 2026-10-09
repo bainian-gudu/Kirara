@@ -118,6 +118,8 @@ pub struct ProjectView {
     pub description: String,
     pub borderless: bool,
     pub lang: String,
+    /// 打包期内联的用户协议；`None` 时链接退化为纯文字。
+    pub agreement: Option<crate::session::types::AgreementConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -412,6 +414,7 @@ impl Default for UiState {
                 description: String::new(),
                 borderless: false,
                 lang: "zh-CN".into(),
+                agreement: None,
             },
             options: Options {
                 install_path: String::new(),

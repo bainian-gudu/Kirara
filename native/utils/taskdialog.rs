@@ -33,6 +33,7 @@ pub const ID_CHANGE_PATH: i32 = 102;
 pub const ID_ADVANCED: i32 = 103;
 pub const ID_LAUNCH: i32 = 104;
 pub const ID_CLOSE: i32 = 105;
+pub const ID_AGREEMENT: i32 = 106;
 pub const ID_RADIO_BASE: i32 = 200;
 
 fn wide(s: &str) -> Vec<u16> {

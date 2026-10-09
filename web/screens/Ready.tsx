@@ -2,6 +2,8 @@ import { useState } from 'preact/hooks';
 import { t } from '../i18n';
 import { intent, type UiState } from '../state';
 import { invoke } from '../host';
+import { hasAgreementContent } from '../agreement';
+import { AgreementPanel } from '../panels/AgreementPanel';
 import { Checkbox } from '../ui/Checkbox';
 import { IconEdit, IconShield } from '../ui/icons';
 
@@ -14,8 +16,12 @@ export function Ready({
 }) {
   const uninstall = ui.mode === 'uninstall';
   const update = ui.mode === 'update';
-  // Renderer-local view state (not in UiState); pre-checked as the Vue UI was.
-  const [agree, setAgree] = useState(true);
+  // Renderer-local view state (not in UiState). 内联了协议正文时必须手动勾选；
+  // 没有正文时保持上游的默认勾选。
+  const agreement = ui.project.agreement;
+  const hasAgreement = hasAgreementContent(agreement);
+  const [agree, setAgree] = useState(!hasAgreement);
+  const [showAgreement, setShowAgreement] = useState(false);
   const source = ui.sources.find((s) => s.uri === ui.options.source_uri);
   const mirrorc = ui.options.source_uri.startsWith('mirrorc://');
   const markedKey = ui.options.mirrorc_cdk
@@ -56,7 +62,13 @@ export function Ready({
         <div class="read">
           <Checkbox checked={agree} onChange={setAgree} />
           {t('ready.agree')}
-          <a>{t('ready.eula')}</a>
+          {hasAgreement ? (
+            <a class="agreement-link" onClick={() => setShowAgreement(true)}>
+              {agreement?.title || t('ready.eula')}
+            </a>
+          ) : (
+            <span class="agreement-link-off">{t('ready.eula')}</span>
+          )}
         </div>
       ) : null}
       {uninstall ? (
@@ -103,6 +115,16 @@ export function Ready({
         ) : null}
         {verb}
       </button>
+      {showAgreement && agreement && hasAgreement ? (
+        <AgreementPanel
+          agreement={agreement}
+          onClose={() => setShowAgreement(false)}
+          onAccept={() => {
+            setAgree(true);
+            setShowAgreement(false);
+          }}
+        />
+      ) : null}
     </div>
   );
 }

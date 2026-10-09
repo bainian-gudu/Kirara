@@ -31,7 +31,7 @@ use crate::utils::i18n;
 use crate::utils::taskdialog::{
     prompt_text, show_error, show_error_coded, show_ready, task_dialog, CommandLink, ErrorDialog,
     ProgressDialog, ProgressHwnd, ReadySpec, TaskDialogRequest, ID_ADVANCED, ID_CHANGE_PATH,
-    ID_CLOSE, ID_INSTALL, ID_LAUNCH, ID_RADIO_BASE,
+    ID_AGREEMENT, ID_CLOSE, ID_INSTALL, ID_LAUNCH, ID_RADIO_BASE,
 };
 
 #[allow(clippy::large_enum_variant)] // returned once; Web is not stored in a collection
@@ -157,6 +157,7 @@ async fn ui_session_from(
             description: project.description.clone(),
             borderless: project.window_borderless.unwrap_or(false),
             lang: i18n::lang().to_string(),
+            agreement: project.agreement.clone(),
         },
         options: Options {
             install_path: install_path.clone(),
@@ -244,6 +245,8 @@ async fn show_ready_page(
     project: &ProjectConfig,
     sess: &mut UiSession,
 ) -> anyhow::Result<Option<Intent>> {
+    // 内联了协议正文的新装必须先接受协议；接受后本次会话不再重复询问。
+    let mut agreement_accepted = false;
     loop {
         let sources = sess.state.sources.clone();
         // 只要可见源非空而当前选择不在其中就必须改选——与是否显示单选框
@@ -337,14 +340,39 @@ async fn show_ready_page(
             ),
         });
 
-        let verification = match sess.state.mode {
-            Mode::Uninstall => Some(t(&sess.state, "ready.delete_user_data")),
-            Mode::Install => Some(t(&sess.state, "ready.create_lnk")),
-            Mode::Update => None,
+        // 协议正文只在打包期内联时存在；空正文等于没配协议，链接与勾选都不出现。
+        let agreement = sess
+            .state
+            .project
+            .agreement
+            .as_ref()
+            .filter(|a| !a.content.is_empty() && matches!(sess.state.mode, Mode::Install))
+            .map(|a| (a.title.clone(), a.content.clone()));
+        if let Some((title, _)) = &agreement {
+            links.push(CommandLink {
+                id: ID_AGREEMENT,
+                text: title.clone(),
+            });
+        }
+        // 新装且协议有正文时，第一遍弹窗只问协议：勾选项让位给「我已阅读并同意」，
+        // 接受后第二遍才显示常规的建快捷方式选项。更新与卸载保持上游语义。
+        let agreement_gate = agreement.is_some() && !agreement_accepted;
+        let verification = if agreement_gate {
+            Some(t(&sess.state, "ready.agree"))
+        } else {
+            match sess.state.mode {
+                Mode::Uninstall => Some(t(&sess.state, "ready.delete_user_data")),
+                Mode::Install => Some(t(&sess.state, "ready.create_lnk")),
+                Mode::Update => None,
+            }
         };
-        let verification_checked = match sess.state.mode {
-            Mode::Uninstall => sess.state.options.delete_user_data,
-            _ => sess.state.options.create_lnk,
+        let verification_checked = if agreement_gate {
+            false
+        } else {
+            match sess.state.mode {
+                Mode::Uninstall => sess.state.options.delete_user_data,
+                _ => sess.state.options.create_lnk,
+            }
         };
 
         let spec = ReadySpec {
@@ -399,7 +427,23 @@ async fn show_ready_page(
         }
 
         match result.button {
-            ID_INSTALL => return Ok(Some(Intent::Start)),
+            ID_AGREEMENT => {
+                if let Some((_, content)) = &agreement {
+                    show_agreement(content).await;
+                }
+                continue;
+            }
+            ID_INSTALL => {
+                if agreement_gate {
+                    if !result.verified {
+                        continue;
+                    }
+                    // 第二遍：勾选项换回常规选项（新装是「创建桌面快捷方式」）。
+                    agreement_accepted = true;
+                    continue;
+                }
+                return Ok(Some(Intent::Start));
+            }
             ID_ADVANCED => return Ok(Some(Intent::Advanced)),
             ID_CHANGE_PATH => {
                 if let Some(path) = pick_path(
@@ -416,6 +460,24 @@ async fn show_ready_page(
             _ => return Ok(None),
         }
     }
+}
+
+/// 原生简化 UI 没有可滚动的正文控件：把协议写到 `%TEMP%` 再用系统默认文本查看器
+/// 打开（记事本），长文可滚动、可选中复制。文件名固定，重复查看只覆盖同一个文件，
+/// 不随查看次数堆积。
+async fn show_agreement(content: &str) {
+    let path = crate::fs::staging::scratch_file("kachina-agreement.txt");
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        if meta.file_type().is_symlink() || crate::fs::commit::is_reparse(&meta) {
+            tracing::warn!("refusing to write the agreement through a reparse point");
+            return;
+        }
+    }
+    if let Err(err) = std::fs::write(&path, content) {
+        tracing::warn!("failed to write the agreement file: {err}");
+        return;
+    }
+    crate::installer::launch(path.to_string_lossy().into_owned()).await;
 }
 
 async fn pick_path(

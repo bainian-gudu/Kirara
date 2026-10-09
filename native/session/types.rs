@@ -61,6 +61,9 @@ pub struct ProjectConfig {
     /// 安装期登记的登录计划任务名。
     #[serde(default)]
     pub extra_uninstall_scheduled_tasks: Vec<String>,
+    /// 打包期内联的用户协议正文（`text` / `markdown` / `html`）。
+    #[serde(default)]
+    pub agreement: Option<AgreementConfig>,
     pub title: String,
     pub description: String,
     pub window_title: String,
@@ -70,6 +73,17 @@ pub struct ProjectConfig {
     pub window_borderless: Option<bool>,
     #[serde(default = "default_true")]
     pub need_web_view2: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgreementConfig {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub format: String,
+    #[serde(default)]
+    pub content: String,
 }
 
 fn default_uac() -> String {

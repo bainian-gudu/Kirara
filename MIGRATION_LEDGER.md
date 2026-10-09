@@ -24,9 +24,9 @@
 | --- | --- | --- |
 | P0 冻结基线与建立隔离分支 | 完成 | 分支 `codex/migrate-upstream-main` 起自 `05a1410` |
 | P1 标准目标 + 构建入口 + 产物接口 | 部分 | 目标与产物接口已改；**Windows 构建未执行**（本环境无 MSVC/WebView2） |
-| P2 配置、打包与升级兼容 | 部分 | 改名兼容（第 12 项）已落地；协议内联（第 2 项）待办 |
+| P2 配置、打包与升级兼容 | 部分 | 协议内联（第 2 项）与改名兼容（第 12 项）已落地；未识别字段检测、打包器修复（第 17 项）待办 |
 | P3 卸载、提权与事务性安全 | 部分 | 卸载侧安全阀与扩展清理已落地（第 1/1b/1c/3/8 项）；提权管道已有上游等价实现 |
-| P4 前端体验与隐私 | 部分 | 遥测移除已完成（第 7 项）；协议/弹窗 footer 等待办 |
+| P4 前端体验与隐私 | 部分 | 遥测移除（第 7 项）、协议弹窗与 footer 布局（第 2/5 项）已完成；历史版本提示待核 |
 | P5 依赖、文档与 CI 门禁 | 部分 | CI 已关闭 release PDB；依赖替换（第 4/14/15/16 项）待办 |
 | P6 端到端兼容、发布与回退 | 待办 | |
 
@@ -35,10 +35,10 @@
 | 旧补丁 | 状态 | 落点 / 证据 |
 | --- | --- | --- |
 | 1 / 1b / 1c 卸载注册表、快捷方式、计划任务扩展 | 完成 | 见下「P3 已落地改动与证据」 |
-| 2 协议文件、格式、标题、弹窗 | 待办 | `native/builder/pack.rs` 内嵌正文；`web/` 与原生简化 UI 显示协议 |
+| 2 协议文件、格式、标题、弹窗 | 完成 | 见下「P2 / P4 已落地改动与证据」 |
 | 3 删除范围与提权面安全阀 | 部分 | 卸载侧四类判定已落地（见下）；协议正文侧的收紧随第 2 项 |
 | 4 vendored rcedit 兼容 | 待办 | 上游仍用 `Devolutions/rcedit-rs` git 依赖；核对 MSVC 14.51 是否需要 vendoring |
-| 5 弹窗 footer | 待办 | 新 Preact UI 与原生 TaskDialog 重做 |
+| 5 弹窗 footer | 完成 | `.dialog` 改纵向 flex、footer 回文档流；见下 |
 | 6 多用户与临时残留清理 | 部分 | 扩展注册表/计划任务清理已落地；`%VAR%` 展开、跨用户重放、`%TEMP%` 白名单、卸载前结束进程待办 |
 | 7 物理移除遥测 | 完成 | 见下「P4 已落地改动与证据」 |
 | 8 卸载收尾、路径比较、提权状态、ARP 静默入口 | 部分 | ARP 加引号 + 静默入口已落地；提权状态由上游等价实现覆盖 |
@@ -128,6 +128,33 @@
   `scheduled_task_names_must_belong_to_this_product`（通配符 / 目录形式 / 别人的任务名 /
   空名 / 超长名 / 命令行注入全部拒绝）。
 - 真机行为（旧目录原地升级、卸载后 ARP 与计划任务残留消失）需 Windows + CI 行为测试确认。
+
+## P2 / P4 已落地改动与证据（第 2 / 5 项：用户协议与弹窗布局）
+
+新架构的确认界面有两套：装了 WebView2 时是 Preact 的 `Ready` 页（`gui_entry` 直接进
+`prepare_gui`），没装 WebView2 时是原生 TaskDialog 的 ready 页（`native_entry`）。两套
+都要有协议合同，正文一律在**打包期**内联进配置，离线包 / 更新器 / 卸载器共用同一份。
+
+| 改动 | 落点 | 说明 |
+| --- | --- | --- |
+| 协议内联 | `native/builder/pack.rs` 的 `resolve_agreement` | 读 `agreementFile`（相对配置文件目录）、`agreementFormat`、`agreementTitle`，生成 `agreement: {title, format, content}` 并删掉三个源字段；BOM 去掉、CRLF 归一；读不到只警告，链接退化为纯文字 |
+| 配置字段 | `native/session/types.rs` 的 `AgreementConfig` | `ProjectConfig.agreement`，`#[serde(default)]` |
+| 渲染契约 | `native/session/state.rs` 的 `ProjectView.agreement` | 随 `UiState` 推给 WebView；原生路径直接用同一份 |
+| Web 净化渲染 | `web/agreement.ts`（新增） | 纯文本转义 + 极简 Markdown + HTML 统一过白名单净化：删 `script`/`style`/表单控件/`iframe`/`object`/`svg` 等，剥 `on*` 与 `style`/`srcdoc`，URI 只放行 `http(s)` / `mailto` / `#` |
+| Web 协议弹窗 | `web/panels/AgreementPanel.tsx`（新增）、`web/screens/Ready.tsx` | 链接打开弹窗看全文；正文可滚动、可选中；正文里的链接交给系统浏览器打开，不在窗口里导航；「我已阅读并同意」顺带勾选 |
+| 接受门槛 | `web/screens/Ready.tsx` | 有正文时默认**不勾选**，安装按钮禁用；没正文时保持上游的默认勾选 |
+| 原生路径合同 | `native/host/native.rs`、`native/utils/taskdialog.rs` | 新装且有正文时，第一遍弹窗的勾选项是「我已阅读并同意」，勾选后第二遍才显示常规选项；「查看协议」把正文写到 `%TEMP%\kachina-agreement.txt`（先拒重解析点）再交给系统默认文本查看器，长文可滚动 |
+| 弹窗 footer | `web/layout.css` | `.dialog` 纵向 flex + `overflow:hidden`；`.dialog-body` 吃剩余高度；`.dialog-footer` 回文档流；footer 里的 `.btn-install` 覆盖为 `position: static` 的 28px 小按钮，按钮与正文不再重叠 |
+
+验证证据（本机 WSL，非 Windows 运行验证）：
+
+- `cargo check --target x86_64-pc-windows-msvc --all-targets` 通过，**0 warning / 0 error**。
+- `pnpm exec tsc --noEmit` 通过；`pnpm test` 4 个文件 37 个用例全绿。
+- 新增单测：`agreement_inlines_the_file_and_drops_the_source_keys`（BOM/CRLF、缺文件、
+  未配置三种情形）、`web/__tests__/agreement.test.ts`（5 个：纯文本转义、Markdown 子集、
+  净化负例、注释剥离）、`render.test.tsx` 的接受门槛用例（默认禁用 → 打开弹窗 → 接受后可用）。
+- `pnpm exec rsbuild build` 通过，PurgeCSS 未误删 `.agreement-body` / `.dialog-footer .btn-install`。
+- 真机观感（窄窗、高 DPI、暗亮主题、原生弹窗两遍流程）需 Windows 上确认。
 
 ## 未验证项（阻塞）
 

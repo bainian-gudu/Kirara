@@ -51,6 +51,8 @@ VERSION_REGEX_INVALID	版本号规则无效
 WEBVIEW2_FAILED	WebView2 安装失败
 WEBVIEW2_FAULT	安装界面无法显示，请重新运行安装器
 WEBVIEW2_REQUIRED	该安装源需要 WebView2，请使用「高级安装」
+dialog.agreement_accept	我已阅读并同意
+dialog.agreement_close	关闭
 dialog.cancel	取消
 dialog.copy	复制
 dialog.crash	安装程序发生内部错误，已终止运行。请重新运行安装程序。

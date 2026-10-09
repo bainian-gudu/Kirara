@@ -46,7 +46,8 @@ pub async fn pack_cli(args: PackArgs) {
         eprintln!("Failed to parse config: {:?}", config.err());
         return;
     }
-    let config = config.unwrap();
+    let mut config = config.unwrap();
+    resolve_agreement(&mut config, &args.config);
     let metadata = if let Some(metadata) = args.metadata {
         let metadataf = tokio::fs::read(&metadata).await;
         if metadataf.is_err() {
@@ -190,6 +191,65 @@ pub async fn pack_cli(args: PackArgs) {
         config.files.len()
     );
     pack(reader, output, config).await;
+}
+
+/// 把协议源字段内联成 `agreement: { title, format, content }`，并删掉三个源字段。
+/// 安装器 / 卸载器 / 更新器都是单文件 exe，运行期没有仓库上下文，正文必须在打包期
+/// 写进配置。`agreementFile` 相对配置文件所在目录解析；读不到只警告，不中断打包
+/// （此时链接退化为纯文字）。
+fn resolve_agreement(config: &mut serde_json::Value, config_path: &std::path::Path) {
+    let Some(obj) = config.as_object_mut() else {
+        return;
+    };
+    let file = obj
+        .remove("agreementFile")
+        .and_then(|v| v.as_str().map(String::from));
+    let format = obj
+        .remove("agreementFormat")
+        .and_then(|v| v.as_str().map(String::from));
+    let title = obj
+        .remove("agreementTitle")
+        .and_then(|v| v.as_str().map(String::from));
+    let Some(file) = file.filter(|f| !f.is_empty()) else {
+        return;
+    };
+    let path = std::path::Path::new(&file);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        config_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join(path)
+    };
+    let content = match std::fs::read(&path) {
+        Ok(bytes) => {
+            // 容忍 BOM；CRLF / 单个 CR 统一成 LF，渲染端只需处理一种换行。
+            let text = String::from_utf8_lossy(&bytes);
+            let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+            text.replace("\r\n", "\n").replace('\r', "\n")
+        }
+        Err(err) => {
+            eprintln!(
+                "Warning: failed to read agreement file {}: {err}",
+                path.display()
+            );
+            return;
+        }
+    };
+    let format = match format.as_deref().map(str::trim) {
+        Some("markdown") | Some("md") => "markdown",
+        Some("html") => "html",
+        _ => "text",
+    };
+    obj.insert(
+        "agreement".to_string(),
+        serde_json::json!({
+            "title": title.filter(|t| !t.is_empty()).unwrap_or_else(|| "用户协议".to_string()),
+            "format": format,
+            "content": content,
+        }),
+    );
 }
 
 pub async fn pack(
@@ -549,7 +609,7 @@ fn get_file_pack_priority(
 
 #[cfg(test)]
 mod tests {
-    use super::{embed_metadata_bytes, index_to_bin, write_header};
+    use super::{embed_metadata_bytes, index_to_bin, resolve_agreement, write_header};
     use crate::local::{get_embedded, INDEX_NAME_MAX};
     use crate::utils::metadata::{FileMeta, InstallerInfo, PatchInfo, PatchSide, RepoMetadata};
     use serde::Serialize;
@@ -561,6 +621,45 @@ mod tests {
         assert!(index_to_bin(&ok).is_ok());
         let over = vec![("n".repeat(INDEX_NAME_MAX + 1), 1u32, 0u32)];
         assert!(index_to_bin(&over).is_err());
+    }
+
+    #[test]
+    fn agreement_inlines_the_file_and_drops_the_source_keys() {
+        let dir = std::env::temp_dir().join(format!("kachina-agreement-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("kachina.config.json");
+        std::fs::write(
+            dir.join("USER_AGREEMENT.txt"),
+            "\u{feff}第一行\r\n第二行\r\n".as_bytes(),
+        )
+        .unwrap();
+        let mut config = serde_json::json!({
+            "appName": "App",
+            "agreementFile": "USER_AGREEMENT.txt",
+            "agreementFormat": "md",
+            "agreementTitle": "用户协议",
+        });
+        resolve_agreement(&mut config, &config_path);
+        assert!(config.get("agreementFile").is_none());
+        assert!(config.get("agreementFormat").is_none());
+        assert!(config.get("agreementTitle").is_none());
+        let agreement = config.get("agreement").unwrap();
+        assert_eq!(agreement["format"], "markdown");
+        assert_eq!(agreement["title"], "用户协议");
+        // BOM 去掉、CRLF 归一，渲染端不必再处理两种换行。
+        assert_eq!(agreement["content"], "第一行\n第二行\n");
+
+        // 文件读不到：不留 agreement，链接退化为纯文字。
+        let mut missing = serde_json::json!({ "agreementFile": "nope.txt" });
+        resolve_agreement(&mut missing, &config_path);
+        assert!(missing.get("agreement").is_none());
+        assert!(missing.get("agreementFile").is_none());
+
+        // 没配协议时配置一个字节都不动。
+        let mut untouched = serde_json::json!({ "appName": "App" });
+        resolve_agreement(&mut untouched, &config_path);
+        assert_eq!(untouched, serde_json::json!({ "appName": "App" }));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
