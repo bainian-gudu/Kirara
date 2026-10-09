@@ -663,6 +663,21 @@ fn commit_sync(
     backoff: &[u64],
     stop_after: Option<usize>,
 ) -> anyhow::Result<CommitOutcome> {
+    // 计划侧已经过滤过一次；提交单元还可能来自 IPC / 恢复日志，这里再挡一道：
+    // 越界的 rel 会让 `join_rel` 退化成安装目录本身，等于把整个目录搬走。
+    for unit in &args.journal.units {
+        let rel = unit.rel();
+        let ok = match unit {
+            // 空 rel 是「安装目录本身」，只有整目录替换才会用到。
+            Unit::Dir { .. } => rel.is_empty() || is_safe_rel(rel),
+            _ => !rel.is_empty() && is_safe_rel(rel),
+        };
+        if !ok {
+            return Err(
+                anyhow::anyhow!("unsafe commit path").attach_with(FILE_IO_FAILED, rel)
+            );
+        }
+    }
     let staging = Staging::at(&args.staging_root);
     let install = PathBuf::from(&args.install_dir);
     let algo = args.journal.hash_algorithm.clone();
@@ -1112,6 +1127,41 @@ mod tests {
         assert!(Journal::parse("kachina-journal 0\nhash\tmd5\n").is_none());
         assert!(Journal::parse("").is_none());
         assert!(Journal::parse("kachina-journal 1\nbogus\tline\n").is_none());
+    }
+
+    #[test]
+    fn commit_refuses_paths_that_escape_the_install_dir() {
+        let fx = Fixture::new();
+        write(&fx.target("keep.txt"), b"keep");
+        for rel in ["..\\escape.txt", "C:\\Windows\\x.txt", "", "a/../../b"] {
+            let units = vec![Unit::Del {
+                rel: rel.into(),
+                old: None,
+            }];
+            let err =
+                commit_sync(fx.args(units), progress_notify(|_| {}), FAST, None).unwrap_err();
+            assert!(
+                matches!(
+                    crate::utils::code::extract(&err),
+                    crate::utils::code::Extracted::Coded(c)
+                        if c.code == crate::utils::code::FILE_IO_FAILED
+                ),
+                "{rel:?} must be refused"
+            );
+        }
+        // 整个目录单元用空 rel 表示安装目录本身，这条是合法用法。
+        let out = commit_sync(
+            fx.args(vec![Unit::Del {
+                rel: "keep.txt".into(),
+                old: Some(md5(b"keep")),
+            }]),
+            progress_notify(|_| {}),
+            FAST,
+            None,
+        )
+        .unwrap();
+        assert!(!out.self_replaced);
+        assert_eq!(read(&fx.target("keep.txt")), None);
     }
 
     #[test]

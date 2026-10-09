@@ -36,13 +36,13 @@
 | --- | --- | --- |
 | 1 / 1b / 1c 卸载注册表、快捷方式、计划任务扩展 | 完成 | 见下「P3 已落地改动与证据」 |
 | 2 协议文件、格式、标题、弹窗 | 完成 | 见下「P2 / P4 已落地改动与证据」 |
-| 3 删除范围与提权面安全阀 | 部分 | 卸载侧四类判定已落地（见下）；协议正文侧的收紧随第 2 项 |
+| 3 删除范围与提权面安全阀 | 部分 | 卸载侧四类判定 + 清单路径越界拦截已落地；下载验签、提权管道 ACL 待办 |
 | 4 vendored rcedit 兼容 | 待办 | 上游仍用 `Devolutions/rcedit-rs` git 依赖；核对 MSVC 14.51 是否需要 vendoring |
 | 5 弹窗 footer | 完成 | `.dialog` 改纵向 flex、footer 回文档流；见下 |
 | 6 多用户与临时残留清理 | 部分 | 扩展注册表/计划任务清理已落地；`%VAR%` 展开、跨用户重放、`%TEMP%` 白名单、卸载前结束进程待办 |
 | 7 物理移除遥测 | 完成 | 见下「P4 已落地改动与证据」 |
 | 8 卸载收尾、路径比较、提权状态、ARP 静默入口 | 部分 | ARP 加引号 + 静默入口已落地；提权状态由上游等价实现覆盖 |
-| 9 安全临时文件、下载验签、提权管道 | 待办 | 与上游 `native/fs/staging.rs`、`native/ipc/` 协同 |
+| 9 安全临时文件、下载验签、提权管道 | 部分 | 清单越界已挡（见下）；下载后执行的验签、管道 ACL、日志重解析点检查待办 |
 | 10 DFS 拆分/注释 | 待办 | 旧 `src/dfs.ts` 与新 `native/session/`（含 `download_plan.rs`、`rate.rs`）职责映射 |
 | 11 编译告警治理 | 部分 | 上游 `05a1410` 已清理一批；剩余待构建后确认 |
 | 12 改名后的升级兼容 | 完成 | `legacyExeNames` / `legacyProgramFilesPaths` / `legacyUninstallNames`，见下 |
@@ -116,6 +116,7 @@
 | 注册表清理 | `native/installer/uninstall.rs` | `clean_extra_registry`：`HKCU` 时额外遍历 `HKEY_USERS` 下已加载的用户配置单元（跳过 `*_Classes` / `.DEFAULT` / `S-1-5-18`），错误只记日志 |
 | 计划任务清理 | `native/installer/uninstall.rs` | `is_safe_task_name`（必须以 `regName` 开头、字符白名单、≤100）+ `clean_extra_scheduled_tasks`（`schtasks.exe` 参数数组、无 shell） |
 | 删除范围安全阀 | `native/installer/uninstall.rs` | 文件清单过 `is_safe_rel`；`userDataPath` / `extraUninstallPath` 过 `is_safe_delete_root`（绝对、无 `..`、非重解析点、不在 `%SystemRoot%`、至少两级、非受保护位置本身）；快捷方式过 `is_safe_shortcut_path`（只放行 `.lnk`） |
+| 清单越界拦截 | `native/session/plan.rs`、`native/fs/commit.rs` | 网络元数据里的文件名 / 残留清单先过 `is_safe_member`（非空 + `is_safe_rel`）；提交单元再做一次，越界的 `rel` 会让 `join_rel` 退化成安装目录本身，所以直接以 `FILE_IO_FAILED` 拒绝 |
 | ARP 卸载入口 | `native/installer/registry.rs` | `UninstallString` 整体加引号；新增 `QuietUninstallString`（`-U -S -I` 短选项，长名会被 clap 拒绝）；`tests/utils.mjs` / `tests/registry.mjs` 同步断言 |
 | 提权管道存活 | `native/ipc/manager.rs` | 不适用：上游已用 `fail_all_pending` 让在途请求立刻报错，`run()` 在发送失败时也提前返回 `IPC_ERR`；且 `ManagedElevate` 按会话创建，重试即新起 helper，不存在「永远转圈」 |
 

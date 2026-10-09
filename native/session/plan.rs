@@ -83,6 +83,13 @@ pub fn normalize_rel(path: &str) -> String {
         .to_lowercase()
 }
 
+/// 清单成员（要安装的文件名、要删除的残留文件名）必须是安装目录内的相对路径：
+/// 非空、无盘符 / UNC / `..`。空串在 `is_safe_rel` 里是合法的「目录本身」，
+/// 但作为文件名没有意义，这里一并拒绝。
+fn is_safe_member(rel: &str) -> bool {
+    !rel.trim().is_empty() && crate::fs::staging::is_safe_rel(rel)
+}
+
 pub fn normalize_full(path: &str) -> String {
     path.replace('/', "\\")
         .trim_end_matches('\\')
@@ -201,6 +208,12 @@ pub fn build_plan(input: &PlanInput) -> InstallPlan {
 
     let mut files = Vec::with_capacity(input.hashed.len());
     for item in &input.hashed {
+        // 清单来自网络元数据：只接受落在安装目录内的相对路径。越界项一旦进入
+        // 提交单元，`join_rel` 会退化成安装目录本身。
+        if !is_safe_member(&item.file_name) {
+            tracing::warn!("skip unsafe file entry from metadata: {:?}", item.file_name);
+            continue;
+        }
         let local = find_local(&input.local, &item.file_name);
         let full = join_install(&input.install_path, &item.file_name);
 
@@ -273,6 +286,13 @@ pub fn build_plan(input: &PlanInput) -> InstallPlan {
     let deletes = input
         .deletes
         .iter()
+        .filter(|delete_file| {
+            let ok = is_safe_member(delete_file);
+            if !ok {
+                tracing::warn!("skip unsafe delete entry from metadata: {delete_file:?}");
+            }
+            ok
+        })
         .filter(|delete_file| {
             if !input.is_update || ignore_dirs.is_empty() {
                 return true;
@@ -367,6 +387,30 @@ mod tests {
             ignore_nonempty: vec![],
             app_name: "Test".to_string(),
         }
+    }
+
+    #[test]
+    fn metadata_entries_that_escape_the_install_dir_are_dropped() {
+        let mut input = base_input();
+        input.hashed = vec![
+            hash_info("app.exe", "bbb"),
+            hash_info(r"..\..\Windows\System32\evil.dll", "bbb"),
+            hash_info(r"C:\Windows\evil.dll", "bbb"),
+        ];
+        input.deletes = vec![
+            "old.txt".to_string(),
+            r"..\..\Windows\System32\gone.dll".to_string(),
+            String::new(),
+        ];
+        let plan = build_plan(&input);
+        assert_eq!(
+            plan.files
+                .iter()
+                .map(|f| f.file_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["app.exe"]
+        );
+        assert_eq!(plan.deletes, vec!["old.txt".to_string()]);
     }
 
     #[test]
