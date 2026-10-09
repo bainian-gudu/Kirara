@@ -181,6 +181,7 @@ async fn ui_session_from(
         state,
         Renderer::Native,
         project.exe_name.clone(),
+        project.legacy_exe_names.clone(),
         project.app_name.clone(),
         project.uac_strategy.clone(),
         config.install_path.clone(),
@@ -404,6 +405,7 @@ async fn show_ready_page(
                 if let Some(path) = pick_path(
                     &sess.state.options.install_path,
                     &project.exe_name,
+                    &project.legacy_exe_names,
                     &project.app_name,
                 )
                 .await
@@ -416,9 +418,14 @@ async fn show_ready_page(
     }
 }
 
-async fn pick_path(current: &str, exe_name: &str, app_name: &str) -> Option<String> {
+async fn pick_path(
+    current: &str,
+    exe_name: &str,
+    legacy_exe_names: &[String],
+    app_name: &str,
+) -> Option<String> {
     let parent = HwndParent::from_hwnd(unsafe { GetDesktopWindow() });
-    crate::installer::pick_install_path(current, exe_name, app_name, parent).await
+    crate::installer::pick_install_path(current, exe_name, legacy_exe_names, app_name, parent).await
 }
 
 async fn ensure_mirrorc_cdk(

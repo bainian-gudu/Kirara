@@ -31,6 +31,11 @@ const HIVES = ['HKCU', 'HKLM'];
 const TMP = fs.realpathSync.native(os.tmpdir());
 const dirs = [];
 
+/** ARP 命令行整体带引号，比较路径前先剥掉。 */
+function unquote(command) {
+  return command.replace(/^"(.*)"$/, '$1');
+}
+
 function testDir(name) {
   const dir = path.join(TMP, `kachina-test-registry-${name}-${Date.now()}`);
   dirs.push(dir);
@@ -105,11 +110,31 @@ async function expectRecord(check, hive, dir, metadata) {
     normalizeInstallPath(record.InstallLocation ?? ''),
   );
   const uninstaller = path.join(dir, 'uninstall.exe');
+  // ARP 的命令行整体加引号：路径带空格时 `C:\Program Files\...` 才不会截断。
   check.equal(
     `${hive}.UninstallString`,
     normalizeInstallPath(uninstaller),
-    normalizeInstallPath(record.UninstallString ?? ''),
+    normalizeInstallPath(unquote(record.UninstallString ?? '')),
   );
+  // 静默卸载只能用短选项：这几个开关在 cli 里没有长名，写长名会被直接拒绝。
+  const quiet = (record.QuietUninstallString ?? '').match(/^"(.*)"\s+(.*)$/);
+  check.ok(
+    `${hive}.QuietUninstallString`,
+    quiet !== null,
+    `not a quoted command: ${JSON.stringify(record.QuietUninstallString)}`,
+  );
+  if (quiet) {
+    check.equal(
+      `${hive}.QuietUninstallString.path`,
+      normalizeInstallPath(uninstaller),
+      normalizeInstallPath(quiet[1]),
+    );
+    check.equal(
+      `${hive}.QuietUninstallString.flags`,
+      '-u -s -i',
+      quiet[2].toLowerCase(),
+    );
+  }
   check.ok(
     `${hive}.UninstallString`,
     await fs.pathExists(uninstaller),

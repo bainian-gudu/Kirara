@@ -1286,7 +1286,12 @@ async fn dfs_staged(
         hash_key,
         hashed: latest.hashed.clone(),
         patches: latest.patches.clone(),
-        deletes: latest.deletes.clone(),
+        deletes: latest
+            .deletes
+            .iter()
+            .cloned()
+            .chain(legacy_delete_names(project, settings.is_update))
+            .collect(),
         local: local.clone(),
         embedded_names: config
             .embedded_files
@@ -1636,24 +1641,33 @@ async fn prepare_process(
     mgr: &ManagedElevate,
     _version: &str,
 ) -> anyhow::Result<bool> {
-    let found = run_op(
-        mgr,
-        false,
-        IpcOperation::FindProcessByName(project.exe_name.clone()),
-        progress_noop(),
-    )
-    .await
-    .unwrap_or(IpcResult::FindProcessByName(Vec::new()));
-    let IpcResult::FindProcessByName(procs) = found else {
-        bail!("IPC_SHAPE_ERR");
-    };
-    let target = join_install(&settings.install_path, &project.exe_name)
-        .replace('\\', "/")
-        .to_lowercase();
-    let running: Vec<(u32, String)> = procs
-        .into_iter()
-        .filter(|(_, path)| path.replace('\\', "/").to_lowercase() == target)
-        .collect();
+    // 品牌改名后旧主程序可能仍在运行；按当前名与历史名一起找，只结束安装目录里的实例。
+    let names = std::iter::once(&project.exe_name)
+        .chain(project.legacy_exe_names.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut running: Vec<(u32, String)> = Vec::new();
+    for name in &names {
+        let found = run_op(
+            mgr,
+            false,
+            IpcOperation::FindProcessByName(name.clone()),
+            progress_noop(),
+        )
+        .await
+        .unwrap_or(IpcResult::FindProcessByName(Vec::new()));
+        let IpcResult::FindProcessByName(procs) = found else {
+            bail!("IPC_SHAPE_ERR");
+        };
+        let target = join_install(&settings.install_path, name)
+            .replace('\\', "/")
+            .to_lowercase();
+        running.extend(
+            procs
+                .into_iter()
+                .filter(|(_, path)| path.replace('\\', "/").to_lowercase() == target),
+        );
+    }
     if running.is_empty() {
         return Ok(true);
     }
@@ -1684,6 +1698,24 @@ async fn prepare_process(
         }
     }
     Ok(true)
+}
+
+/// 品牌改名后旧主程序/旧卸载器不在新清单里，更新时按配置显式清理。
+/// 只接受文件名：配置里的值不允许携带路径分隔符。
+fn legacy_delete_names(project: &ProjectConfig, is_update: bool) -> Vec<String> {
+    if !is_update {
+        return Vec::new();
+    }
+    let mut names: Vec<String> = project
+        .legacy_exe_names
+        .iter()
+        .chain(project.legacy_uninstall_names.iter())
+        .filter(|n| !n.is_empty() && !n.contains(['\\', '/']))
+        .cloned()
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 async fn scan_local(
@@ -3032,30 +3064,50 @@ async fn create_shortcuts(
         &[("subject", project.app_name.as_str())],
     );
     let uninstall_lnk = format!("{}\\{}\\{}.lnk", program, project.app_name, uninstall_name);
-    if settings.create_lnk && !settings.is_update {
+    // 桌面图标：新安装按用户勾选创建；更新只重建已经存在的图标（含历史命名），
+    // 不给当初没勾选的用户补一个。
+    let desktop_lnks: Vec<String> = if settings.is_update {
+        let mut lnks: Vec<String> = std::iter::once(desktop_lnk.clone())
+            .chain(
+                project
+                    .extra_uninstall_lnk_names
+                    .iter()
+                    .filter(|n| !n.is_empty() && !n.contains(['\\', '/']))
+                    .map(|n| format!("{desktop}\\{n}")),
+            )
+            .filter(|lnk| std::path::Path::new(lnk).is_file())
+            .collect();
+        lnks.sort();
+        lnks.dedup();
+        lnks
+    } else if settings.create_lnk {
+        vec![desktop_lnk.clone()]
+    } else {
+        Vec::new()
+    };
+    for lnk in desktop_lnks {
         create_lnk_or_notify(
             mgr,
             settings.elevate,
             CreateLnkArgs {
                 target: exe_path.to_string(),
-                lnk: desktop_lnk,
+                lnk,
             },
             ui,
         )
         .await;
     }
-    if !settings.is_update {
-        create_lnk_or_notify(
-            mgr,
-            settings.elevate,
-            CreateLnkArgs {
-                target: exe_path.to_string(),
-                lnk: program_lnk,
-            },
-            ui,
-        )
-        .await;
-    }
+    // 开始菜单项在更新时也要重建：改名后旧主程序名已不存在，旧项指向死目标。
+    create_lnk_or_notify(
+        mgr,
+        settings.elevate,
+        CreateLnkArgs {
+            target: exe_path.to_string(),
+            lnk: program_lnk,
+        },
+        ui,
+    )
+    .await;
     if !settings.reg_hives.is_empty() && std::path::Path::new(uninstaller_path).is_file() {
         create_lnk_or_notify(
             mgr,
@@ -3446,7 +3498,9 @@ async fn run_uninstall_inner(
     };
     let files = uninstall_files(
         meta.hashed.into_iter().map(|e| e.file_name),
-        meta.deletes,
+        meta.deletes
+            .into_iter()
+            .chain(legacy_delete_names(project, true)),
         &project.updater_name,
         &settings.install_path,
         &keep_user_data,
@@ -3467,6 +3521,27 @@ async fn run_uninstall_inner(
     // shortcuts behind; the launching user removes those, the helper the
     // machine-wide ones.
     let user_shortcuts = shortcuts(get_dirs(false).await.into_anyhow()?);
+    // 宿主自建/改名的快捷方式按文件名在公共与用户的桌面/开始菜单里展开。
+    let mut lnk_aliases: Vec<String> = project
+        .extra_uninstall_lnk_names
+        .iter()
+        .filter(|n| !n.is_empty() && !n.contains(['\\', '/']))
+        .cloned()
+        .collect();
+    lnk_aliases.sort();
+    lnk_aliases.dedup();
+    let mut extra_shortcuts: Vec<String> = Vec::new();
+    if !lnk_aliases.is_empty() {
+        for elevated in [false, true] {
+            let (program, desktop) = get_dirs(elevated).await.into_anyhow()?;
+            for name in &lnk_aliases {
+                extra_shortcuts.push(format!("{desktop}\\{name}"));
+                extra_shortcuts.push(format!("{program}\\{}\\{name}", project.app_name));
+            }
+        }
+        extra_shortcuts.sort();
+        extra_shortcuts.dedup();
+    }
     let mut extra: Vec<String> = project
         .extra_uninstall_path
         .iter()
@@ -3497,6 +3572,10 @@ async fn run_uninstall_inner(
             files,
             user_data_path: user_data,
             extra_uninstall_path: extra,
+            extra_uninstall_shortcuts: extra_shortcuts,
+            extra_uninstall_registry: project.extra_uninstall_registry.clone(),
+            extra_uninstall_scheduled_tasks: project.extra_uninstall_scheduled_tasks.clone(),
+            reg_name: project.reg_name.clone(),
             uninstall_name: project.uninstall_name.clone(),
         }),
         progress_noop(),
@@ -3565,9 +3644,12 @@ pub async fn silent_main(args: crate::cli::arg::InstallArgs) -> anyhow::Result<(
         } else {
             config.install_path.clone()
         };
-        let inspected =
-            crate::installer::inspect_dir(settings.install_path.clone(), project.exe_name.clone())
-                .await;
+        let inspected = crate::installer::inspect_dir(
+            settings.install_path.clone(),
+            project.exe_name.clone(),
+            project.legacy_exe_names.clone(),
+        )
+        .await;
         if let Some(dir) = inspected {
             settings.elevate =
                 crate::session::types::elevate_from_state(&dir.state, &project.uac_strategy);

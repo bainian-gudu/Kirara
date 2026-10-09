@@ -20,6 +20,7 @@ const RECORD_VALUES = [
   'DisplayVersion',
   'InstallLocation',
   'UninstallString',
+  'QuietUninstallString',
   'DisplayIcon',
   'Publisher',
   'EstimatedSize',

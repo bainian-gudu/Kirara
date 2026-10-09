@@ -392,6 +392,7 @@ pub struct UiSession {
     all_sources: Vec<SourceItem>,
     renderer: Renderer,
     exe_name: String,
+    legacy_exe_names: Vec<String>,
     #[allow(dead_code)] // native ReadyState (step 4); GUI pick_path uses ProjectConfig.app_name
     app_name: String,
     uac_strategy: String,
@@ -444,6 +445,7 @@ impl UiSession {
             state,
             renderer,
             String::new(),
+            Vec::new(),
             String::new(),
             String::new(),
             String::new(),
@@ -455,6 +457,7 @@ impl UiSession {
         state: UiState,
         renderer: Renderer,
         exe_name: String,
+        legacy_exe_names: Vec<String>,
         app_name: String,
         uac_strategy: String,
         discovered_path: String,
@@ -466,6 +469,7 @@ impl UiSession {
             all_sources,
             renderer,
             exe_name,
+            legacy_exe_names,
             app_name,
             uac_strategy,
             discovered_path,
@@ -543,7 +547,11 @@ impl UiSession {
     /// renderer shows and what the session runs with cannot disagree. A path
     /// that is an existing file is treated as unwritable.
     fn recompute_path(&mut self) {
-        let probe = probe_dir(Path::new(&self.state.options.install_path), &self.exe_name);
+        let probe = probe_dir(
+            Path::new(&self.state.options.install_path),
+            &self.exe_name,
+            &self.legacy_exe_names,
+        );
         let state = probe.map(|p| p.state()).unwrap_or(DirState::Unwritable);
         let upgrade = probe.is_some_and(|p| p.upgrade);
         if matches!(self.state.mode, Mode::Uninstall) {
@@ -581,7 +589,11 @@ impl UiSession {
 
     #[cfg(test)]
     fn force_identity(&mut self, identity: Identity) {
-        let probe = probe_dir(Path::new(&self.state.options.install_path), &self.exe_name);
+        let probe = probe_dir(
+            Path::new(&self.state.options.install_path),
+            &self.exe_name,
+            &self.legacy_exe_names,
+        );
         let state = probe.map(|p| p.state()).unwrap_or(DirState::Unwritable);
         let upgrade = probe.is_some_and(|p| p.upgrade);
         let dir_elevate = elevate_from_state(&state, &self.uac_strategy);
@@ -687,6 +699,7 @@ mod tests {
             UiState::default(),
             Renderer::Native,
             "app.exe".into(),
+            Vec::new(),
             "App".into(),
             "prefer-user".into(),
             String::new(),
@@ -755,6 +768,7 @@ mod tests {
             UiState::default(),
             Renderer::Native,
             "app.exe".into(),
+            Vec::new(),
             "App".into(),
             "prefer-user".into(),
             path.clone(),

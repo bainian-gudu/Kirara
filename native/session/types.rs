@@ -43,6 +43,24 @@ pub struct ProjectConfig {
     pub ignore_folder_path: Vec<String>,
     #[serde(default)]
     pub extra_uninstall_path: Vec<String>,
+    /// 历史主程序名。品牌改名后用来识别旧目录、结束旧进程并清理旧文件。
+    #[serde(default)]
+    pub legacy_exe_names: Vec<String>,
+    /// 历史卸载器名。旧卸载器仍要能认出自己是卸载器。
+    #[serde(default)]
+    pub legacy_uninstall_names: Vec<String>,
+    /// 注册表没有记录时按顺序兜底探测的旧默认安装目录（相对 `%ProgramFiles%`）。
+    #[serde(default)]
+    pub legacy_program_files_paths: Vec<String>,
+    /// 历史快捷方式名（含规范名）。卸载时清理，升级时只重建已存在的桌面图标。
+    #[serde(default)]
+    pub extra_uninstall_lnk_names: Vec<String>,
+    /// 宿主自己写过的注册表项（开机自启等）。
+    #[serde(default)]
+    pub extra_uninstall_registry: Vec<crate::installer::uninstall::RegistryCleanupItem>,
+    /// 安装期登记的登录计划任务名。
+    #[serde(default)]
+    pub extra_uninstall_scheduled_tasks: Vec<String>,
     pub title: String,
     pub description: String,
     pub window_title: String,
@@ -158,13 +176,17 @@ pub async fn settings_from_cli(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| config.install_path.clone());
     let source_uri = project.source_uri(args.source.as_deref())?;
-    let inspected = crate::installer::inspect_dir(install_path.clone(), project.exe_name.clone())
-        .await
-        .ok_or_else(|| {
-            anyhow::Error::from(crate::utils::code::Coded::bare(
-                crate::utils::code::INSTALL_PATH_INVALID,
-            ))
-        })?;
+    let inspected = crate::installer::inspect_dir(
+        install_path.clone(),
+        project.exe_name.clone(),
+        project.legacy_exe_names.clone(),
+    )
+    .await
+    .ok_or_else(|| {
+        anyhow::Error::from(crate::utils::code::Coded::bare(
+            crate::utils::code::INSTALL_PATH_INVALID,
+        ))
+    })?;
     Ok(Settings {
         install_path,
         source_uri,

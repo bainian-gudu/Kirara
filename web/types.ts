@@ -220,7 +220,8 @@ export interface InstallerConfig {
     | 'PARENT_DIR'
     | 'REG'
     | 'REG_FOLDED'
-    | 'DEFAULT';
+    | 'DEFAULT'
+    | 'DEFAULT_LEGACY';
   is_uninstall: boolean;
   embedded_files: Embedded[] | null;
   embedded_index: Embedded[] | null;

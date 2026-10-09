@@ -70,12 +70,19 @@ pub fn is_drive_root(path: &str) -> bool {
     n.len() == 2 && n.as_bytes()[1] == b':' && n.as_bytes()[0].is_ascii_alphabetic()
 }
 
+/// `legacy_exe_names` are the names this product used before the current one:
+/// a directory that only holds one of them is still an existing install.
+///
 /// Writability is tested by creating and removing a probe file in the directory,
 /// or in the nearest existing ancestor when the directory does not exist yet.
 /// `None` for an existing file, a drive root, and a path that is itself a
 /// reparse point (junction / symlink): all are rejected as install paths
 /// wherever the probe result feeds `Settings`.
-pub fn probe_dir(path: &std::path::Path, exe_name: &str) -> Option<DirProbe> {
+pub fn probe_dir(
+    path: &std::path::Path,
+    exe_name: &str,
+    legacy_exe_names: &[String],
+) -> Option<DirProbe> {
     if path.is_file() || is_drive_root(&path.to_string_lossy()) {
         return None;
     }
@@ -86,7 +93,8 @@ pub fn probe_dir(path: &std::path::Path, exe_name: &str) -> Option<DirProbe> {
     }
     let exists = path.is_dir();
     let (empty, upgrade) = if exists {
-        let upgrade = !exe_name.is_empty() && path.join(exe_name).is_file();
+        let upgrade = (!exe_name.is_empty() && path.join(exe_name).is_file())
+            || legacy_exe_names.iter().any(|n| path.join(n).is_file());
         let empty = !upgrade
             && std::fs::read_dir(path)
                 .map(|mut it| it.next().is_none())
@@ -124,8 +132,16 @@ fn can_create_probe_file(dir: &std::path::Path) -> bool {
     }
 }
 
-pub async fn inspect_dir(pathstr: String, exe_name: String) -> Option<SelectDirRes> {
-    let probe = probe_dir(std::path::Path::new(&pathstr), &exe_name)?;
+pub async fn inspect_dir(
+    pathstr: String,
+    exe_name: String,
+    legacy_exe_names: Vec<String>,
+) -> Option<SelectDirRes> {
+    let probe = probe_dir(
+        std::path::Path::new(&pathstr),
+        &exe_name,
+        &legacy_exe_names,
+    )?;
     Some(SelectDirRes {
         path: pathstr,
         state: probe.state(),
@@ -308,6 +324,7 @@ pub async fn confirm_dialog(
 pub async fn pick_install_path(
     current: &str,
     exe_name: &str,
+    legacy_exe_names: &[String],
     app_name: &str,
     parent: crate::host::HwndParent,
 ) -> Option<String> {
@@ -317,7 +334,7 @@ pub async fn pick_install_path(
     if is_drive_root(&path) {
         path = format!("{}\\{app_name}", path.trim_end_matches(['\\', '/']));
     }
-    let seldir = inspect_dir(path, exe_name.to_string()).await?;
+    let seldir = inspect_dir(path, exe_name.to_string(), legacy_exe_names.to_vec()).await?;
     apply_path_choice(seldir, app_name, parent).await
 }
 
@@ -364,13 +381,13 @@ mod tests {
         for root in ["C:\\", "d:/", "E:", "C:\\\\"] {
             assert!(is_drive_root(root), "{root}");
             assert!(
-                probe_dir(std::path::Path::new(root), "app.exe").is_none(),
+                probe_dir(std::path::Path::new(root), "app.exe", &[]).is_none(),
                 "{root}"
             );
         }
         assert!(!is_drive_root("C:\\App"));
         assert!(!is_drive_root("\\\\server\\share"));
-        assert!(probe_dir(std::path::Path::new("C:\\Windows"), "").is_some());
+        assert!(probe_dir(std::path::Path::new("C:\\Windows"), "", &[]).is_some());
     }
 
     #[test]
@@ -394,8 +411,24 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        assert!(probe_dir(&dir, "app.exe").is_none());
+        assert!(probe_dir(&dir, "app.exe", &[]).is_none());
         let _ = std::fs::remove_dir(&dir);
         let _ = std::fs::remove_dir_all(&real);
+    }
+
+    #[test]
+    fn legacy_exe_name_counts_as_an_existing_install() {
+        let dir = std::env::temp_dir().join(format!("kachina-legacy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("OldName.exe"), b"MZ").unwrap();
+        let legacy = vec!["OldName.exe".to_string()];
+        let probe = probe_dir(&dir, "NewName.exe", &legacy).unwrap();
+        assert!(probe.upgrade, "legacy exe must mark the dir as upgradeable");
+        assert!(!probe.empty);
+        // The same directory without the legacy name is a plain non-empty dir.
+        let probe = probe_dir(&dir, "NewName.exe", &[]).unwrap();
+        assert!(!probe.upgrade);
+        assert!(!probe.empty);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

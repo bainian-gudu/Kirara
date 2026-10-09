@@ -153,9 +153,15 @@ async fn dispatch(
                 .as_ref()
                 .map(|p| p.exe_name.clone())
                 .unwrap_or_default();
+            let legacy_exe_names = gui
+                .project
+                .as_ref()
+                .map(|p| p.legacy_exe_names.clone())
+                .unwrap_or_default();
             let path = crate::installer::pick_install_path(
                 &snap.options.install_path,
                 &exe_name,
+                &legacy_exe_names,
                 &app_name,
                 handle.parent(),
             )

@@ -116,7 +116,15 @@ pub fn write_at_hive(hive: RegHive, params: &WriteRegistryParams) -> Result<()> 
     {
         key.set_string("DisplayName", &params.name)?;
         key.set_string("DisplayVersion", &params.version)?;
-        key.set_string("UninstallString", &params.uninstaller)?;
+        // 路径带空格（默认就装在 `Program Files\` 下），ARP 的命令行必须加引号，
+        // 否则「应用和功能」的卸载按钮要靠 CreateProcess 的逐级猜测才能碰对。
+        key.set_string("UninstallString", &format!("\"{}\"", params.uninstaller))?;
+        // 静默卸载（winget / 自动化脚本走这个值）。只能用短选项：`cli` 的这几个
+        // 开关只声明了 `-U` / `-S` / `-I`，写长名会以「unexpected argument」退出。
+        key.set_string(
+            "QuietUninstallString",
+            &format!("\"{}\" -U -S -I", params.uninstaller),
+        )?;
         key.set_string("InstallLocation", &params.source)?;
         key.set_string("DisplayIcon", &params.exe)?;
         key.set_string("Publisher", &params.publisher)?;
