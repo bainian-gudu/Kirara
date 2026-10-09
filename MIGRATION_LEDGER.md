@@ -23,12 +23,12 @@
 | 阶段 | 状态 | 说明 |
 | --- | --- | --- |
 | P0 冻结基线与建立隔离分支 | 完成 | 分支起自 `05a1410`，完成后改名 `main` 并设为默认分支 |
-| P1 标准目标 + 构建入口 + 产物接口 | 部分 | 目标与产物接口已改；**Windows 构建未执行**（本环境无 MSVC/WebView2） |
-| P2 配置、打包与升级兼容 | 部分 | 协议内联（第 2 项）与改名兼容（第 12 项）已落地；未识别字段检测、打包器修复（第 17 项）待办 |
+| P1 标准目标 + 构建入口 + 产物接口 | 完成 | 目标、构建入口与产物接口已改；CI `Build` 在迁移后的 `main` 上真编并跑 13 组行为测试与单测（run `37923294286`，15 个 job 全绿），本机 WSL 只到类型检查 |
+| P2 配置、打包与升级兼容 | 部分 | 协议内联（第 2 项）、改名兼容（第 12 项）、打包器修复（第 17 项，上游等价）已落地；**未识别字段检测未做** |
 | P3 卸载、提权与事务性安全 | 完成 | 卸载侧安全阀与扩展清理（第 1/1b/1c/8 项）、提权管道 ACL、重解析点拦截、下载后执行验签（第 3/9 项）均已落地 |
 | P4 前端体验与隐私 | 完成 | 遥测移除（第 7 项）、协议内联 / 安全渲染 / 接受门槛（第 2 项）、弹窗 footer 布局（第 5 项）均已落地 |
-| P5 依赖、文档与 CI 门禁 | 部分 | CI 已关闭 release PDB；依赖替换与许可证全部落地（第 4/14/15/16 项）；README / 来源说明与快速检查门禁待收尾 |
-| P6 端到端兼容、发布与回退 | 待办 | |
+| P5 依赖、文档与 CI 门禁 | 部分 | 依赖替换与许可证（第 4/14/15/16 项）、CI 关闭 release PDB、README / 来源说明 / 台账均已收尾；**快速检查门禁（旧分支 `tools/devcheck` 与 `.github/workflows/devcheck.yml`）未移植** |
+| P6 端到端兼容、发布与回退 | 部分 | 隔离打包与旧包新装 / 升级 / 卸载重演已跑通（run `37920859476`，26 项断言全绿）；**桌面交互路径（WebView2 界面、UAC 弹窗、OneDrive 重定向目录、真实游戏进程占用）未在真机手跑；tag 与 Release 未做（需明确批准）** |
 
 ## 逐项处置
 
@@ -46,7 +46,7 @@
 | 10 DFS 拆分/注释 | 不适用 | 旧 `src/dfs/session.ts` 的 DFS2 会话创建、挑战重试与会话清理在新架构里是 `native/session/source.rs` + `native/dfs.rs` 的 Rust 实现，行为逐条对上（见下） |
 | 11 编译告警治理 | 完成 | 上游 `05a1410` 已吸收：`libs/*/src/lib.rs` 有 `#![allow(suspicious_runtime_symbol_definitions)]`，`native/cli/arg.rs` 的 builder 侧类型有 `#[allow(dead_code)]`；本机 `cargo check --all-targets` 0 warning |
 | 12 改名后的升级兼容 | 完成 | `legacyExeNames` / `legacyProgramFilesPaths` / `legacyUninstallNames`，见下 |
-| 13 Windows 10/11 标准目标 | 部分 | 目标、`-Z build-std`、`rust-src`、`ctor` patch、`STATIC_VCRUNTIME` 已处理（见下）；CI 的 `CARGO_PROFILE_RELEASE_DEBUG` 等细节待补 |
+| 13 Windows 10/11 标准目标 | 完成 | 目标、`-Z build-std`、`rust-src`、`ctor` patch、`STATIC_VCRUNTIME` 已处理（见下）；CI 的 `CARGO_PROFILE_RELEASE_DEBUG: "false"` 已落地（`bb7510b`），Build 工作流全绿 |
 | 14 zip 去 fork 与中文名解码 | 完成 | 改用 crates.io `zip 8.6`；`native/thirdparty/mirrorc.rs` 按 `name_raw()` 自己解条目名（见下） |
 | 15 H3 改 `quinn`/`rustls` | 完成 | `native/capabilities/h3.rs` 整份换成 quinn + rustls + h3-quinn；`[patch.crates-io]` 的 msquic fork 删除（见下） |
 | 16 旧依赖替换与许可证 | 完成 | `mslnk` → Shell Link API、`nt_version` → ntdll、`libs/` 许可证补齐（见下） |
