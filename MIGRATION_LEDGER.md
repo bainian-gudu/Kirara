@@ -336,6 +336,21 @@ debug 编译的 `unit-test` job：`cargo test` 之后 `cargo build` 建出 debug
 里 debug 的起始地址是 `http://localhost:1420`），跑 debug 产物的 CI 环境没有 dev
 server。`test:all` 保持上游的 release 口径，不含该脚本。
 
+改完后的 run `37914992871` 全绿（`build` 5m9s、`unit-test` 6m23s、13 组 release 行为
+测试），`unit-test` 里能看到这条链路真的跑完：
+
+```
+Build debug binaries      Finished `dev` profile ... in 26.98s
+Record offline install plan dump
+  ✓ Dumps written to D:\a\Kirara\Kirara\tests\plan-dumps\offline-install
+Compare recorded dump with planner
+  test session::plan::tests::compare_offline_install_dump_if_present ... ok
+  test result: ok. 1 passed; 0 failed; ... 189 filtered out
+```
+
+对比单测这次不是「0 tests / 提前 return」而是真跑到了 1 个用例，说明 dump 确实被写出
+并被 plan 对比消费。
+
 ## 未验证项（阻塞）
 
 - **本机没有 Windows 运行环境**：开发机是 WSL，无 MSVC 工具链与 WebView2。本机证据
