@@ -1,0 +1,86 @@
+name: P6 E2E
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_NIGHTLY_VERSION: nightly
+  CARGO_PROFILE_RELEASE_DEBUG: "false"
+
+# 手动触发：用本提交构建出的 builder 重演「冻结旧安装包 → 新包升级 → 卸载」，
+# 并在隔离目录跑一次下游配置的 pack → gen → pack。输入是冻结产物的地址与校验和，
+# 默认值对应 HoYoEnhance v1.0.0（旧 builder 打的包）与下游固定提交。
+on:
+  workflow_dispatch:
+    inputs:
+      old_package_url:
+        description: 冻结旧安装包地址
+        required: true
+        default: https://github.com/bainian-gudu/HoYoEnhance/releases/download/v1.0.0/HoYoEnhance.Install.1.0.0.exe
+      old_package_sha256:
+        description: 冻结旧安装包的 SHA256
+        required: true
+        default: d02fe92671b796c1f8e4cbe7e716ca967eeeff2b74d341fbed4856bd7bdc015a
+      downstream_repo:
+        description: 下游仓库（只读 packaging/packaging.config.json 与 USER_AGREEMENT.txt）
+        required: true
+        default: bainian-gudu/HoYoEnhance
+      downstream_ref:
+        description: 下游提交
+        required: true
+        default: b049be6d9e1e7af56401cb0e62d7e1c405a0d186
+      new_version:
+        description: 隔离打包的版本号（需高于旧包才会走升级）
+        required: true
+        default: "1.0.1"
+
+jobs:
+  p6-e2e:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Override rust-toolchain for CI
+        run: |
+          (Get-Content rust-toolchain.toml) -replace 'channel = "nightly"', 'channel = "${{ env.RUST_NIGHTLY_VERSION }}"' | Set-Content rust-toolchain.toml
+      - run: |
+          rustup toolchain install ${{ env.RUST_NIGHTLY_VERSION }} --profile minimal
+          rustup default ${{ env.RUST_NIGHTLY_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+      - uses: pnpm/action-setup@v4.0.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'pnpm'
+      - name: Install NPM Dependencies
+        run: pnpm i
+      - name: Build builder
+        run: pnpm build
+      - name: Publish bundle as kirara-builder.exe
+        # 与 build job 同一条规则：交付的是拼接体，不是 cargo 的裸 builder
+        run: |
+          $rel = "target\x86_64-pc-windows-msvc\release"
+          $bundle = Join-Path $rel "kachina-builder-bundle.exe"
+          $builder = Join-Path $rel "kachina-builder.exe"
+          if ((Get-Item $bundle).Length -le (Get-Item $builder).Length) {
+            throw "bundle $($bundle) is not larger than cargo builder; merge-release-bundle did not run"
+          }
+          Copy-Item $bundle "kirara-builder.exe" -Force
+      - name: P6 end-to-end replay
+        env:
+          P6_BUILDER: ${{ github.workspace }}\kirara-builder.exe
+          P6_OLD_URL: ${{ inputs.old_package_url }}
+          P6_OLD_SHA256: ${{ inputs.old_package_sha256 }}
+          P6_DOWNSTREAM_REPO: ${{ inputs.downstream_repo }}
+          P6_DOWNSTREAM_REF: ${{ inputs.downstream_ref }}
+          P6_NEW_VERSION: ${{ inputs.new_version }}
+          P6_WORK: ${{ runner.temp }}\p6-e2e
+        run: npm run test:p6-e2e
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4.6.0
+        with:
+          name: p6-e2e
+          path: ${{ runner.temp }}\p6-e2e
+          if-no-files-found: warn
