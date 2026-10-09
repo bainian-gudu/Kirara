@@ -400,6 +400,305 @@ pub async fn clean_extra_scheduled_tasks(product: &str, names: &[String]) {
     }
 }
 
+/// 展开 `%VAR%` 形式的环境变量。
+///
+/// 注册表里的 `ProfileImagePath` 常写成 `%SystemDrive%\Users\xxx`（REG_EXPAND_SZ），
+/// 配置里的用户数据目录也可能是 `%LOCALAPPDATA%\...`，不展开就不能当路径用。
+/// 未知变量原样保留：宁可少删，也不要拼出半个路径去删。`%%` 是一个字面 `%`，
+/// 末尾落单的 `%` 原样输出（`100% done` 不变）；不支持 Windows 的子串语法。
+fn expand_env_vars(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    loop {
+        let (head, tail) = match rest.split_once('%') {
+            Some(v) => v,
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        };
+        out.push_str(head);
+        match tail.split_once('%') {
+            None => {
+                out.push('%');
+                out.push_str(tail);
+                break;
+            }
+            Some((name, after)) => {
+                if name.is_empty() {
+                    out.push('%');
+                    rest = &tail[1..];
+                    continue;
+                }
+                match std::env::var(name) {
+                    Ok(value) => out.push_str(&value),
+                    Err(_) => {
+                        out.push('%');
+                        out.push_str(name);
+                        out.push('%');
+                    }
+                }
+                rest = after;
+            }
+        }
+    }
+    out
+}
+
+/// 批量展开路径里的 `%VAR%`，顺手去空白与空项、大小写不敏感去重。
+fn expand_path_list(paths: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(paths.len());
+    for path in paths {
+        let expanded = expand_env_vars(path.trim());
+        if expanded.is_empty() {
+            continue;
+        }
+        if !out.iter().any(|p| p.eq_ignore_ascii_case(&expanded)) {
+            out.push(expanded);
+        }
+    }
+    out
+}
+
+/// 允许做「多用户清理」的每用户容器（相对 `%USERPROFILE%` 的第一级目录）。
+///
+/// 只有落在这些容器下面的路径才会被映射到别的用户配置目录去删；安装目录、
+/// `ProgramData` 这类与「哪个用户」无关的路径不参与重放。
+const PER_USER_CLEANUP_ROOTS: &[&str] = &["AppData", "Documents", "Desktop"];
+
+/// 跨用户重放时禁止命中的「Shell 容器」名（大写比较）。
+///
+/// 重放会把「相对用户目录的尾巴」拼到每一个用户目录上，尾巴本身一旦是容器而不是
+/// 产品目录，后果就是**所有用户**的开始菜单 / 文档 / 桌面被整个端掉。产品自己的
+/// 目录名与历史快捷方式名都不在这张表里，所以功能不受影响 —— 命中即拒绝 + 记日志。
+const PER_USER_DENY_LEAVES: &[&str] = &[
+    "APPDATA",
+    "LOCAL",
+    "LOCALLOW",
+    "ROAMING",
+    "MICROSOFT",
+    "WINDOWS",
+    "START MENU",
+    "PROGRAMS",
+    "STARTUP",
+    "SYSTEM",
+    "SYSTEM32",
+    "TEMP",
+    "TMP",
+    "CACHE",
+    "CLASSES",
+    "SOFTWARE",
+    "USERS",
+    "PUBLIC",
+    "PROFILE",
+    "DESKTOP",
+    "DOCUMENTS",
+    "DOWNLOADS",
+    "MUSIC",
+    "PICTURES",
+    "VIDEOS",
+    "TEMPLATES",
+    "FAVORITES",
+    "CONTACTS",
+    "LINKS",
+    "SAVED GAMES",
+    "SEARCHES",
+    "3D OBJECTS",
+    "ONEDRIVE",
+];
+
+/// 取路径相对当前用户配置目录（`%USERPROFILE%`）的尾部，并校验它确实落在允许清理的
+/// 每用户容器里；不满足返回 `None`（说明这条路径与「哪个用户」无关）。额外限制：
+/// 尾部至少两级、`Desktop` 下只放行 `.lnk`、叶子不能是 Shell 容器、`AppData` 下至少三级。
+fn profile_relative_tail(path: &Path) -> Option<PathBuf> {
+    let profile = std::env::var_os("USERPROFILE").map(PathBuf::from)?;
+    if profile.as_os_str().is_empty() {
+        return None;
+    }
+    let tail = path.strip_prefix(profile.as_path()).ok()?;
+    if tail
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let first = match tail.components().next() {
+        Some(std::path::Component::Normal(s)) => s.to_str()?,
+        _ => return None,
+    };
+    if !PER_USER_CLEANUP_ROOTS
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case(first))
+    {
+        return None;
+    }
+    if tail.components().count() < 2 {
+        return None;
+    }
+    if first.eq_ignore_ascii_case("Desktop")
+        && !tail
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .ends_with(".lnk")
+    {
+        return None;
+    }
+    let leaf = tail.components().next_back()?.as_os_str().to_str()?;
+    if PER_USER_DENY_LEAVES
+        .iter()
+        .any(|d| d.eq_ignore_ascii_case(leaf))
+    {
+        return None;
+    }
+    if first.eq_ignore_ascii_case("AppData") && tail.components().count() < 3 {
+        return None;
+    }
+    Some(tail.to_path_buf())
+}
+
+/// 枚举本机已加载的用户配置目录（`ProfileList\<SID>\ProfileImagePath`）。
+///
+/// 卸载器通常以管理员身份运行，`%LOCALAPPDATA%` 指向执行卸载的账户；当初使用本
+/// 软件的可能是另一个账户。注册表清理已按 `HKEY_USERS` 补齐，文件这边靠这里补齐。
+fn loaded_profile_roots() -> Vec<PathBuf> {
+    const PROFILE_LIST: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList";
+    let Ok(list) = windows_registry::LOCAL_MACHINE
+        .options()
+        .read()
+        .open(PROFILE_LIST)
+    else {
+        return Vec::new();
+    };
+    let Ok(sids) = list.keys() else {
+        return Vec::new();
+    };
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for sid in sids {
+        // `*_Classes` 只是视图键；`.DEFAULT` / LocalSystem 不是普通登录用户
+        if sid.ends_with("_Classes") || sid == ".DEFAULT" || sid == "S-1-5-18" {
+            continue;
+        }
+        let Ok(key) = list.open(&sid) else {
+            continue;
+        };
+        let Ok(raw) = key.get_string("ProfileImagePath") else {
+            continue;
+        };
+        let expanded = expand_env_vars(raw.trim());
+        if expanded.is_empty() {
+            continue;
+        }
+        let root = PathBuf::from(expanded);
+        if !root.is_absolute() {
+            continue;
+        }
+        if !roots.iter().any(|r| path_eq(r, &root)) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+/// 把「当前用户展开后的数据目录 / 快捷方式」映射到所有已加载用户配置目录下的同一
+/// 相对位置，得到还需要补删的候选。每个候选都要过 `is_safe_delete_root`，且必须真实
+/// 存在；文件只放行 `.lnk`，目录不限（数据目录里可能有 WebView2 缓存等任意内容）。
+fn collect_all_users_cleanup_targets(paths: &[String]) -> Vec<PathBuf> {
+    let mut tails: Vec<PathBuf> = Vec::new();
+    for pathstr in paths {
+        if let Some(tail) = profile_relative_tail(Path::new(pathstr)) {
+            if !tails.contains(&tail) {
+                tails.push(tail);
+            }
+        }
+    }
+    if tails.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    for root in loaded_profile_roots() {
+        for tail in &tails {
+            let candidate = root.join(tail);
+            if !is_safe_delete_root(&candidate) {
+                tracing::warn!("skip unsafe per-user path: {}", candidate.display());
+                continue;
+            }
+            let is_lnk = tail
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with(".lnk");
+            if !candidate.is_dir() && !(is_lnk && candidate.is_file()) {
+                continue;
+            }
+            if !out.iter().any(|o| path_eq(o, &candidate)) {
+                out.push(candidate);
+            }
+        }
+    }
+    out
+}
+
+/// 多用户残留清理：尽力而为，删不掉只记日志，绝不让卸载失败。
+async fn clean_per_user_leftovers(paths: &[String]) {
+    for target in collect_all_users_cleanup_targets(paths) {
+        let target_str = target.display().to_string();
+        let res = if target.is_dir() {
+            tokio::fs::remove_dir_all(&target).await
+        } else {
+            tokio::fs::remove_file(&target).await
+        };
+        match res {
+            Ok(()) => tracing::info!("removed per-user leftover {target_str}"),
+            Err(err) => tracing::warn!("per-user cleanup failed (ignored) {target_str}: {err}"),
+        }
+    }
+}
+
+/// `%TEMP%` 里属于本安装器的文件名白名单。只认固定形状，绝不按「含 kachina 就删」
+/// 这种模糊规则来：
+/// - `KachinaInstaller.log`：安装 / 卸载日志，一直在追加，从来没人删
+/// - `kachina.MicrosoftEdgeWebview2Setup.exe`：WebView2 引导安装器
+/// - `kachina-agreement.txt`：原生简化 UI 查看协议全文时写的临时文件
+///
+/// 运行时安装包与卸载器副本不在这里：新架构把它们放在 staging 根目录下，随
+/// staging 一起回收（见 `fs/staging.rs` 的 `dl\` / `old\`）。
+fn is_installer_temp_artifact(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == "kachinainstaller.log"
+        || lower == "kachina.microsoftedgewebview2setup.exe"
+        || lower == "kachina-agreement.txt"
+}
+
+/// 清理 `%TEMP%` 里本安装器留下的东西。只删文件不删目录、不递归，失败只记日志
+/// （正在被使用的文件本来也删不掉）。
+async fn clean_installer_temp_files() {
+    let temp = std::env::temp_dir();
+    let mut entries = match tokio::fs::read_dir(&temp).await {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::warn!("read temp dir failed (ignored) {}: {err}", temp.display());
+            return;
+        }
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !is_installer_temp_artifact(name) {
+            continue;
+        }
+        // 只删文件：同名目录不是本安装器造的
+        match entry.file_type().await {
+            Ok(ft) if ft.is_file() => {}
+            _ => continue,
+        }
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => tracing::info!("removed temp artifact {}", path.display()),
+            Err(err) => tracing::warn!("remove temp artifact failed (ignored) {}: {err}", path.display()),
+        }
+    }
+}
+
 pub async fn run_uninstall(
     source: String,
     files: Vec<String>,
@@ -430,8 +729,10 @@ pub async fn run_uninstall(
             ok
         })
         .collect();
+    // `%VAR%` 必须在「真正要删的那一刻、那个进程里」展开：提权后 `%LOCALAPPDATA%`
+    // 指向的是执行卸载的账户，而不是发起卸载的那个。
     let keep_roots = |paths: Vec<String>, label: &str| -> Vec<String> {
-        paths
+        expand_path_list(&paths)
             .into_iter()
             .filter(|p| {
                 let ok = is_safe_delete_root(Path::new(p));
@@ -444,7 +745,7 @@ pub async fn run_uninstall(
     };
     let user_data_path = keep_roots(user_data_path, "userDataPath");
     let extra_uninstall_path = keep_roots(extra_uninstall_path, "extraUninstallPath");
-    let extra_uninstall_shortcuts: Vec<String> = extra_uninstall_shortcuts
+    let extra_uninstall_shortcuts: Vec<String> = expand_path_list(&extra_uninstall_shortcuts)
         .into_iter()
         .filter(|p| {
             let ok = is_safe_shortcut_path(Path::new(p));
@@ -453,6 +754,13 @@ pub async fn run_uninstall(
             }
             ok
         })
+        .collect();
+    // 跨用户重放吃的是同一份「展开后的数据目录 + 额外路径」：勾了「同时删除用户数据」
+    // 才会带上 userDataPath，没勾就是空表，所以勾选语义自动跟随。
+    let per_user_paths: Vec<String> = user_data_path
+        .iter()
+        .chain(extra_uninstall_path.iter())
+        .cloned()
         .collect();
 
     let mut delete_list = files
@@ -466,12 +774,15 @@ pub async fn run_uninstall(
     }
     let mut errors = rm_list(delete_list).await;
     errors.extend(remove_paths(&[&user_data_path[..], &extra_uninstall_path[..]].concat()).await);
+    // 其它登录账户下的同一份残留（数据目录、桌面死图标、开始菜单文件夹）。
+    clean_per_user_leftovers(&per_user_paths).await;
     // 下面三项是宿主自己的登记残留：清不掉只记日志，不把卸载判为失败。
     for err in remove_paths(&extra_uninstall_shortcuts).await {
         tracing::warn!("{err}");
     }
     clean_extra_registry(&extra_uninstall_registry);
     clean_extra_scheduled_tasks(&reg_name, &extra_uninstall_scheduled_tasks).await;
+    clean_installer_temp_files().await;
     if let Err(e) = clear_empty_dirs(source).await {
         errors.push(format!("{e:#}"));
     }
@@ -486,6 +797,74 @@ pub async fn run_uninstall(
 mod tests {
     use super::*;
     use std::os::windows::fs::OpenOptionsExt;
+
+    #[test]
+    fn env_expansion_keeps_unknown_vars_and_percent_literals() {
+        std::env::set_var("KACHINA_TEST_VAR", r"C:\kachina");
+        assert_eq!(expand_env_vars(r"%KACHINA_TEST_VAR%\x"), r"C:\kachina\x");
+        // Windows 的环境变量名大小写不敏感
+        assert_eq!(expand_env_vars(r"%kachina_test_var%\x"), r"C:\kachina\x");
+        // 未知变量原样保留：宁可少删，也不拼出半个路径去删
+        assert_eq!(expand_env_vars("%NOPE_SURELY%\\x"), "%NOPE_SURELY%\\x");
+        assert_eq!(expand_env_vars("100% done"), "100% done");
+        assert_eq!(expand_env_vars("a%%b"), "a%b");
+        // 展开后去空白、空项、大小写不敏感去重
+        assert_eq!(
+            expand_path_list(&[r"  C:\a\b  ".into(), r"c:\A\B".into(), "  ".into()]),
+            vec![r"C:\a\b".to_string()]
+        );
+    }
+
+    #[test]
+    fn per_user_tail_only_accepts_product_shaped_paths() {
+        let profile = std::env::temp_dir().join("kachina-profile");
+        std::env::set_var("USERPROFILE", &profile);
+        let joined = |rel: &str| {
+            let mut path = profile.clone();
+            for part in rel.split(['/', '\\']) {
+                path.push(part);
+            }
+            path
+        };
+        let tail = |rel: &str| {
+            profile_relative_tail(&joined(rel))
+                .map(|t| t.to_string_lossy().replace('\\', "/"))
+        };
+        assert_eq!(tail("AppData/Local/App").as_deref(), Some("AppData/Local/App"));
+        assert_eq!(
+            tail("AppData/Roaming/App").as_deref(),
+            Some("AppData/Roaming/App")
+        );
+        assert_eq!(
+            tail("Documents/App").as_deref(),
+            Some("Documents/App")
+        );
+        assert_eq!(
+            tail("Desktop/App.lnk").as_deref(),
+            Some("Desktop/App.lnk")
+        );
+        // 容器本身、别人的容器、桌面上的普通文件、非每用户目录一律拒绝
+        assert!(tail("AppData/Local").is_none());
+        assert!(tail("AppData/Roaming/Microsoft").is_none());
+        assert!(tail("AppData/Roaming/Microsoft/Windows/Start Menu/Programs").is_none());
+        assert!(tail("Desktop/notes.txt").is_none());
+        assert!(tail("Desktop").is_none());
+        assert!(tail("Downloads/App").is_none());
+        assert!(tail("AppData/Local/App/../Other").is_none());
+    }
+
+    #[test]
+    fn temp_artifact_whitelist_is_shape_based() {
+        assert!(is_installer_temp_artifact("KachinaInstaller.log"));
+        assert!(is_installer_temp_artifact(
+            "kachina.MicrosoftEdgeWebview2Setup.exe"
+        ));
+        assert!(is_installer_temp_artifact("kachina-agreement.txt"));
+        // 目录名、别人的文件、形状不符的都不动
+        assert!(!is_installer_temp_artifact("kachina-staged"));
+        assert!(!is_installer_temp_artifact("kachina-backup.exe"));
+        assert!(!is_installer_temp_artifact("other.txt"));
+    }
 
     #[tokio::test]
     async fn park_self_moves_running_image_into_staging_old() {

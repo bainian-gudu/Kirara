@@ -39,7 +39,7 @@
 | 3 删除范围与提权面安全阀 | 部分 | 卸载侧四类判定 + 清单路径越界拦截已落地；下载验签、提权管道 ACL 待办 |
 | 4 vendored rcedit 兼容 | 待办 | 上游仍用 `Devolutions/rcedit-rs` git 依赖；核对 MSVC 14.51 是否需要 vendoring |
 | 5 弹窗 footer | 完成 | `.dialog` 改纵向 flex、footer 回文档流；见下 |
-| 6 多用户与临时残留清理 | 部分 | 扩展注册表/计划任务清理已落地；`%VAR%` 展开、跨用户重放、`%TEMP%` 白名单、卸载前结束进程待办 |
+| 6 多用户与临时残留清理 | 完成 | `%VAR%` 展开、跨用户重放、`%TEMP%` 白名单、卸载前结束进程，见下 |
 | 7 物理移除遥测 | 完成 | 见下「P4 已落地改动与证据」 |
 | 8 卸载收尾、路径比较、提权状态、ARP 静默入口 | 部分 | ARP 加引号 + 静默入口已落地；提权状态由上游等价实现覆盖 |
 | 9 安全临时文件、下载验签、提权管道 | 部分 | 清单越界已挡（见下）；下载后执行的验签、管道 ACL、日志重解析点检查待办 |
@@ -119,6 +119,10 @@
 | 清单越界拦截 | `native/session/plan.rs`、`native/fs/commit.rs` | 网络元数据里的文件名 / 残留清单先过 `is_safe_member`（非空 + `is_safe_rel`）；提交单元再做一次，越界的 `rel` 会让 `join_rel` 退化成安装目录本身，所以直接以 `FILE_IO_FAILED` 拒绝 |
 | ARP 卸载入口 | `native/installer/registry.rs` | `UninstallString` 整体加引号；新增 `QuietUninstallString`（`-U -S -I` 短选项，长名会被 clap 拒绝）；`tests/utils.mjs` / `tests/registry.mjs` 同步断言 |
 | 提权管道存活 | `native/ipc/manager.rs` | 不适用：上游已用 `fail_all_pending` 让在途请求立刻报错，`run()` 在发送失败时也提前返回 `IPC_ERR`；且 `ManagedElevate` 按会话创建，重试即新起 helper，不存在「永远转圈」 |
+| 环境变量展开（第 6 项） | `native/installer/uninstall.rs` 的 `expand_env_vars` / `expand_path_list` | 在**卸载器进程内**展开 `%VAR%`（提权后 `%LOCALAPPDATA%` 是执行账户的），未知变量原样保留、`%%` 是字面 `%`；展开发生在安全阀之前 |
+| 跨用户清理（第 6 项） | `native/installer/uninstall.rs` 的 `profile_relative_tail` / `loaded_profile_roots` / `collect_all_users_cleanup_targets` / `clean_per_user_leftovers` | 从 `ProfileList\<SID>\ProfileImagePath` 枚举已加载用户，把「相对用户目录的尾巴」重放到每个用户；只放行 `AppData` / `Documents` / `Desktop` 下的产品目录，`Desktop` 只认 `.lnk`，叶子命中 Shell 容器黑名单即拒绝；勾选语义自动跟随（没勾就没有 `userDataPath`） |
+| `%TEMP%` 白名单（第 6 项） | `native/installer/uninstall.rs` 的 `is_installer_temp_artifact` / `clean_installer_temp_files` | 只认固定形状：日志、WebView2 引导器、协议查看临时文件；只删文件不递归。运行时安装包与卸载器副本已由 staging 目录回收，不再单列 |
+| 卸载前结束进程（第 6 项） | `native/session/run.rs` 的 `prepare_process` / `run_uninstall_inner` | 卸载前按当前名与历史名找安装目录内的实例，询问后结束（静默卸载直接结束）；结束后等 1s 让 WebView2 缓存释放；用户拒绝则回到卸载页（`SessionResult::uninstall_cancelled`） |
 
 验证证据（本机 WSL，非 Windows 运行验证）：
 
