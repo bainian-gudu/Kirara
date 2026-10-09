@@ -38,6 +38,15 @@ const APP = 'HoYoEnhance';
 const REG_NAME = 'HoYoEnhance';
 const TASK_NAME = 'HoYoEnhance.AutoStart';
 const MARKER = 'p6-marker.txt';
+const RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
+const APP_FILES = [
+  `${APP}.exe`,
+  `${APP}.uninst.exe`,
+  `${APP}.update.exe`,
+  'FpsUnlockerStub.dll',
+  'StarRailStub.dll',
+  'ui/index.html',
+];
 
 const failures = [];
 
@@ -63,6 +72,7 @@ async function download(url, dest) {
   await fs.writeFile(dest, Buffer.from(await res.arrayBuffer()));
 }
 
+/** 安装器按当前进程的 hive 写记录；提权与不提权会落在不同 hive，两边都查。 */
 async function findUninstallRecord() {
   for (const hive of ['HKCU', 'HKLM']) {
     const record = await readUninstallRecord(hive, REG_NAME);
@@ -73,32 +83,64 @@ async function findUninstallRecord() {
   return null;
 }
 
-async function runTask(args) {
-  const result = await $({ reject: false })`schtasks ${args}`.quiet();
+/** 用户数据目录：宿主按可写性回退链依次尝试这三个位置。 */
+function dataDirs() {
+  return [
+    path.join(process.env.LOCALAPPDATA ?? '', APP),
+    path.join(process.env.APPDATA ?? '', APP),
+    path.join(process.env.USERPROFILE ?? '', 'Documents', APP),
+  ];
+}
+
+/** 快捷方式可能落在当前用户或公共目录，四个根都找一遍。 */
+async function findShortcuts() {
+  const roots = (
+    await $`@('Desktop', 'CommonDesktopDirectory', 'Programs', 'CommonPrograms') | ForEach-Object { [Environment]::GetFolderPath($_) }`.quiet()
+  ).stdout
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const found = new Set();
+  for (const root of roots) {
+    if (!(await fs.pathExists(root))) {
+      continue;
+    }
+    const hits =
+      await $`Get-ChildItem -LiteralPath ${root} -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '${APP}*' } | Select-Object -ExpandProperty FullName`.quiet();
+    for (const line of hits.stdout.split('\n')) {
+      const hit = line.trim();
+      if (hit) {
+        found.add(hit);
+      }
+    }
+  }
+  return [...found];
+}
+
+async function writeRunValue(exe) {
+  const result =
+    await $`reg add ${RUN_KEY} /v ${REG_NAME} /t REG_SZ /d ${exe} /f`.nothrow();
   return result.exitCode === 0;
 }
 
-async function taskExists() {
-  return runTask(['/Query', '/TN', TASK_NAME]);
+async function readRunValue() {
+  const result = await $`reg query ${RUN_KEY} /v ${REG_NAME}`.nothrow();
+  return result.exitCode === 0 ? result.stdout.trim() : '';
 }
 
-async function runValue() {
-  const out =
-    await $`(Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name ${REG_NAME} -ErrorAction SilentlyContinue).${REG_NAME}`.quiet();
-  return out.stdout.trim();
-}
-
-async function userShortcutPaths() {
-  const desktop = (
-    await $`[Environment]::GetFolderPath('Desktop')`.quiet()
-  ).stdout.trim();
-  const programs = (
-    await $`[Environment]::GetFolderPath('Programs')`.quiet()
-  ).stdout.trim();
+async function createTask(exe) {
+  const result =
+    await $`Register-ScheduledTask -TaskName ${TASK_NAME} -Action (New-ScheduledTaskAction -Execute ${exe}) -Trigger (New-ScheduledTaskTrigger -AtLogOn) -Force`.nothrow();
   return {
-    desktop: path.join(desktop, `${APP}.lnk`),
-    programs: path.join(programs, APP),
+    ok: result.exitCode === 0,
+    output: `${result.stdout}${result.stderr}`.trim(),
   };
+}
+
+async function taskExists() {
+  const result =
+    await $`Get-ScheduledTask -TaskName ${TASK_NAME} -ErrorAction SilentlyContinue`.nothrow();
+  return result.exitCode === 0 && result.stdout.includes(TASK_NAME);
 }
 
 async function unpack(args, cwd) {
@@ -110,6 +152,13 @@ async function unpack(args, cwd) {
     );
   }
   return result.stdout;
+}
+
+async function markersPresent() {
+  const found = await Promise.all(
+    dataDirs().map((dir) => fs.pathExists(path.join(dir, MARKER))),
+  );
+  return found.every(Boolean);
 }
 
 async function main() {
@@ -147,7 +196,6 @@ async function main() {
   await download(OLD_URL, oldPackage);
   const oldHash = await getFileHash(oldPackage);
   check(oldHash === OLD_SHA, '旧安装包 SHA256 与冻结值一致', oldHash);
-  console.log(`  旧包     ${OLD_URL}`);
 
   for (const rel of ['packaging/packaging.config.json', 'USER_AGREEMENT.txt']) {
     const dest = path.join(downstreamDir, rel);
@@ -163,7 +211,9 @@ async function main() {
   step('隔离打包：extract → pack → gen → pack');
   const listed = await unpack(['extract', '--list', '-i', oldPackage]);
   check(
-    listed.includes('CONFIG') && listed.includes('INDEX') && listed.includes(`${APP}.exe`),
+    listed.includes('CONFIG') &&
+      listed.includes('INDEX') &&
+      listed.includes(`${APP}.exe`),
     '旧包可以列出载荷清单',
   );
   await unpack(['extract', '--all', payloadDir, '-i', oldPackage]);
@@ -171,7 +221,7 @@ async function main() {
   const appDir = payloadDir;
   check(await fs.pathExists(path.join(appDir, `${APP}.exe`)), '载荷按真实路径落盘');
 
-  // 与下游 pack.ps1 的暂存口径一致：图片不进包，协议正文随包内联。
+  // 与下游 pack.ps1 的暂存口径一致：协议正文随包内联。
   for (const rel of ['USER_AGREEMENT.txt', 'LICENSE', 'config.example.json']) {
     const src = path.join(downstreamDir, rel);
     if (await fs.pathExists(src)) {
@@ -230,28 +280,24 @@ async function main() {
     await runInstaller(oldPackage, [FLAGS, '-D', installDir], '旧包安装', '10m'),
     '旧包安装',
   );
-  for (const name of [`${APP}.exe`, `${APP}.uninst.exe`, `${APP}.update.exe`]) {
+  for (const name of APP_FILES) {
     check(await fs.pathExists(path.join(installDir, name)), `旧包装出 ${name}`);
   }
-  const installed = await findUninstallRecord();
-  check(installed !== null, '旧包写下 ARP 卸载记录');
-  const shortcuts = await userShortcutPaths();
-  check(
-    await fs.pathExists(shortcuts.desktop),
-    '旧包装出桌面快捷方式',
-    shortcuts.desktop,
+  check((await findUninstallRecord()) !== null, '旧包写下 ARP 卸载记录');
+  const shortcutsBefore = await findShortcuts();
+  console.log(
+    chalk.gray(`  旧包装出快捷方式：${shortcutsBefore.join(', ') || '无'}`),
   );
 
   // 旧版应用运行期才会写的东西：卸载器必须能按新配置回收。
-  const dataDir = path.join(
-    process.env.LOCALAPPDATA ?? '',
-    APP,
-  );
-  await fs.ensureDir(dataDir);
-  await fs.writeFile(path.join(dataDir, MARKER), 'p6\n');
-  await $`New-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name ${REG_NAME} -Value ${path.join(installDir, `${APP}.exe`)} -PropertyType String -Force | Out-Null`.quiet();
-  await runTask(['/Create', '/TN', TASK_NAME, '/TR', path.join(installDir, `${APP}.exe`), '/SC', 'ONLOGON', '/F']);
-  check((await runValue()) !== '', '自启项与计划任务已布置', TASK_NAME);
+  for (const dir of dataDirs()) {
+    await fs.ensureDir(dir);
+    await fs.writeFile(path.join(dir, MARKER), 'p6\n');
+  }
+  const runWritten = await writeRunValue(path.join(installDir, `${APP}.exe`));
+  check(runWritten && (await readRunValue()) !== '', '自启项已布置');
+  const task = await createTask(path.join(installDir, `${APP}.exe`));
+  check(task.ok, '计划任务已布置', task.output);
 
   step('升级到新包');
   assertExitOk(
@@ -268,10 +314,7 @@ async function main() {
     (await getFileHash(path.join(installDir, `${APP}.update.exe`))) === updaterHash,
     '安装目录里的更新器换成了新 builder 的产物',
   );
-  check(
-    await fs.pathExists(path.join(dataDir, MARKER)),
-    '升级不动用户数据',
-  );
+  check(await markersPresent(), '升级不动用户数据');
 
   step('卸载');
   assertExitOk(
@@ -285,16 +328,15 @@ async function main() {
   );
   check(!(await fs.pathExists(installDir)), '安装目录被删除');
   check((await findUninstallRecord()) === null, 'ARP 记录被删除');
+  const shortcutsAfter = await findShortcuts();
   check(
-    !(await fs.pathExists(shortcuts.desktop)),
-    '桌面快捷方式被删除',
+    shortcutsAfter.length === 0,
+    '安装期快捷方式被删除',
+    shortcutsAfter.join(', '),
   );
-  check((await runValue()) === '', '自启项被回收');
+  check((await readRunValue()) === '', '自启项被回收');
   check(!(await taskExists()), '计划任务被回收');
-  check(
-    await fs.pathExists(path.join(dataDir, MARKER)),
-    '未勾选时用户数据保留',
-  );
+  check(await markersPresent(), '未勾选时用户数据保留');
   try {
     await assertStagingRemoved(installDir);
     check(true, '暂存目录已回收');
@@ -302,41 +344,46 @@ async function main() {
     check(false, '暂存目录已回收', error.message);
   }
 
-  const temp = os.tmpdir();
-  const leftovers = (await fs.readdir(temp)).filter(
+  const leftovers = (await fs.readdir(os.tmpdir())).filter(
     (name) =>
       name.startsWith('kachina.uninst.') ||
       name.startsWith('Kachina.RuntimePackage.'),
   );
-  check(leftovers.length === 0, '%TEMP% 里安装期临时文件已回收', leftovers.join(', '));
-  await fs.remove(dataDir);
+  check(
+    leftovers.length === 0,
+    '%TEMP% 里安装期临时文件已回收',
+    leftovers.join(', '),
+  );
+  for (const dir of dataDirs()) {
+    await fs.remove(path.join(dir, MARKER));
+  }
 
   if (failures.length > 0) {
     console.error(chalk.red(`\n${failures.length} 项断言失败：`));
     for (const failure of failures) {
       console.error(chalk.red(`  - ${failure}`));
     }
-    if (await fs.pathExists(getLogFilePath())) {
-      console.error(chalk.yellow('\n=== 安装器日志尾部 ==='));
-      const log = await fs.readFile(getLogFilePath(), 'utf-8');
-      console.error(log.split('\n').slice(-60).join('\n'));
-    }
-    process.exitCode = 1;
   } else {
     console.log(chalk.green('\n✓ P6 端到端全部通过'));
   }
 
-  await fs.writeJSON(path.join(work, 'p6-summary.json'), {
-    builder: { path: BUILDER, sha256: builderHash },
-    oldPackage: { url: OLD_URL, sha256: oldHash },
-    newPackage: { path: newPackage, version: NEW_VERSION },
-    downstream: { repo: DOWNSTREAM_REPO, ref: DOWNSTREAM_REF },
-    failures,
-  });
   if (await fs.pathExists(getLogFilePath())) {
     await fs.copy(getLogFilePath(), path.join(work, 'KachinaInstaller.log'));
   }
+  await fs.writeJSON(path.join(work, 'p6-summary.json'), {
+    builder: { path: BUILDER, sha256: builderHash },
+    oldPackage: { url: OLD_URL, sha256: oldHash },
+    newPackage: {
+      path: newPackage,
+      version: NEW_VERSION,
+      sha256: await getFileHash(newPackage),
+    },
+    downstream: { repo: DOWNSTREAM_REPO, ref: DOWNSTREAM_REF },
+    shortcutsBefore,
+    failures,
+  });
   console.log(chalk.gray(`\n现场保留在 ${work}`));
+  process.exitCode = failures.length > 0 ? 1 : 0;
 }
 
 main().catch(async (error) => {
