@@ -47,6 +47,9 @@ pub async fn pack_cli(args: PackArgs) {
         return;
     }
     let mut config = config.unwrap();
+    for key in unknown_config_keys(&config) {
+        eprintln!("Warning: unrecognized config key \"{key}\" (ignored)");
+    }
     resolve_agreement(&mut config, &args.config);
     let metadata = if let Some(metadata) = args.metadata {
         let metadataf = tokio::fs::read(&metadata).await;
@@ -191,6 +194,29 @@ pub async fn pack_cli(args: PackArgs) {
         config.files.len()
     );
     pack(reader, output, config).await;
+}
+
+/// 打包配置里 builder 自己消费、不写进包内配置的键。
+const PACK_ONLY_KEYS: &[&str] = &["agreementFile", "agreementFormat", "agreementTitle"];
+
+/// 配置里既不是安装器字段、也不是 builder 字段的顶层键，按名字排序。
+///
+/// 键名拼错时 serde 静默忽略，配置看起来生效其实没有，所以在打包期点名。只警告不
+/// 中断：下游配置可能带着别的工具留下的键，包本身仍然能打。
+fn unknown_config_keys(config: &serde_json::Value) -> Vec<String> {
+    let Some(obj) = config.as_object() else {
+        return Vec::new();
+    };
+    let mut unknown: Vec<String> = obj
+        .keys()
+        .filter(|key| {
+            !crate::utils::config_keys::PROJECT_CONFIG_KEYS.contains(&key.as_str())
+                && !PACK_ONLY_KEYS.contains(&key.as_str())
+        })
+        .cloned()
+        .collect();
+    unknown.sort();
+    unknown
 }
 
 /// 把协议源字段内联成 `agreement: { title, format, content }`，并删掉三个源字段。
@@ -609,7 +635,9 @@ fn get_file_pack_priority(
 
 #[cfg(test)]
 mod tests {
-    use super::{embed_metadata_bytes, index_to_bin, resolve_agreement, write_header};
+    use super::{
+        embed_metadata_bytes, index_to_bin, resolve_agreement, unknown_config_keys, write_header,
+    };
     use crate::local::{get_embedded, INDEX_NAME_MAX};
     use crate::utils::metadata::{FileMeta, InstallerInfo, PatchInfo, PatchSide, RepoMetadata};
     use serde::Serialize;
@@ -621,6 +649,40 @@ mod tests {
         assert!(index_to_bin(&ok).is_ok());
         let over = vec![("n".repeat(INDEX_NAME_MAX + 1), 1u32, 0u32)];
         assert!(index_to_bin(&over).is_err());
+    }
+
+    #[test]
+    fn unrecognized_config_keys_are_reported() {
+        // 安装器字段 + builder 自己的三个协议字段都算认识
+        let known = serde_json::json!({
+            "source": "https://example.com/App.Install.exe",
+            "appName": "App",
+            "agreementFile": "USER_AGREEMENT.txt",
+            "agreementFormat": "md",
+            "agreementTitle": "用户协议",
+            "legacyExeNames": ["Old.exe"],
+            "legacyUninstallNames": ["Old.uninst.exe"],
+            "legacyProgramFilesPaths": ["OldApp"],
+            "extraUninstallLnkNames": ["App.lnk"],
+            "extraUninstallPath": [],
+            "userDataPath": [],
+            "ignoreFolderPath": [],
+        });
+        assert!(unknown_config_keys(&known).is_empty());
+
+        // 拼错的键名与上游已移除的键都要点名，按名字排序
+        let typo = serde_json::json!({
+            "appName": "App",
+            "legacyExeName": "Old.exe",
+            "shortcutName": "App",
+        });
+        assert_eq!(
+            unknown_config_keys(&typo),
+            vec!["legacyExeName", "shortcutName"]
+        );
+
+        // 不是对象的配置不误报
+        assert!(unknown_config_keys(&serde_json::json!("App")).is_empty());
     }
 
     #[test]

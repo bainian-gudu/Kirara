@@ -436,4 +436,38 @@ mod tests {
         let cfg = super::ProjectConfig::from_value(&v).unwrap();
         assert!(cfg.need_web_view2);
     }
+
+    /// 配置键清单（builder 用它点名拼错的键）必须与结构体的 serde 字段一致：
+    /// 结构体加了字段而没加进 `PROJECT_CONFIG_KEYS`，这里就会失败。
+    #[test]
+    fn config_keys_match_the_struct() {
+        let v = serde_json::json!({
+            "source": "https://example.com/app.exe",
+            "appName": "A",
+            "publisher": "P",
+            "regName": "A",
+            "exeName": "a.exe",
+            "uninstallName": "uninst.exe",
+            "updaterName": "update.exe",
+            "programFilesPath": "A",
+            "title": "T",
+            "description": "D",
+            "windowTitle": "W"
+        });
+        let cfg = super::ProjectConfig::from_value(&v).unwrap();
+        let mut from_struct: Vec<String> = serde_json::to_value(&cfg)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        let mut listed: Vec<String> = crate::utils::config_keys::PROJECT_CONFIG_KEYS
+            .iter()
+            .map(|key| (*key).to_string())
+            .collect();
+        from_struct.sort();
+        listed.sort();
+        assert_eq!(from_struct, listed);
+    }
 }

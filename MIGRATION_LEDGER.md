@@ -24,7 +24,7 @@
 | --- | --- | --- |
 | P0 冻结基线与建立隔离分支 | 完成 | 分支起自 `05a1410`，完成后改名 `main` 并设为默认分支 |
 | P1 标准目标 + 构建入口 + 产物接口 | 完成 | 目标、构建入口与产物接口已改；CI `Build` 在迁移后的 `main` 上真编并跑 13 组行为测试与单测（run `37923294286`，15 个 job 全绿），本机 WSL 只到类型检查 |
-| P2 配置、打包与升级兼容 | 部分 | 协议内联（第 2 项）、改名兼容（第 12 项）、打包器修复（第 17 项，上游等价）已落地；**未识别字段检测未做** |
+| P2 配置、打包与升级兼容 | 完成 | 协议内联（第 2 项）、改名兼容（第 12 项）、打包器修复（第 17 项，上游等价）、未识别字段检测均已落地 |
 | P3 卸载、提权与事务性安全 | 完成 | 卸载侧安全阀与扩展清理（第 1/1b/1c/8 项）、提权管道 ACL、重解析点拦截、下载后执行验签（第 3/9 项）均已落地 |
 | P4 前端体验与隐私 | 完成 | 遥测移除（第 7 项）、协议内联 / 安全渲染 / 接受门槛（第 2 项）、弹窗 footer 布局（第 5 项）均已落地 |
 | P5 依赖、文档与 CI 门禁 | 部分 | 依赖替换与许可证（第 4/14/15/16 项）、CI 关闭 release PDB、README / 来源说明 / 台账均已收尾；**快速检查门禁（旧分支 `tools/devcheck` 与 `.github/workflows/devcheck.yml`）未移植** |
@@ -244,6 +244,25 @@ exe，下载源被劫持时也照样执行。这里统一收口到 `native/utils
   在正式安装流程里默认不会被走到。
 - 快捷方式的**行为**只能实机验证：装一次看桌面 / 开始菜单的快捷方式能启动、工作目录正确，
   再卸载确认被清干净。
+
+## P2 已落地改动与证据（未识别字段检测）
+
+旧/新字段对照：旧分支 `refactor/v0.5.2` 的键名原样保留，`agreement*`、
+`extraUninstall*`、`legacy*`、`userDataPath`、`ignoreFolderPath` 五组键在新架构里同名
+同义（落点见上表）。唯一对不上的是上游 `05a1410` 移除了旧 Vue 的 `shortcutName`
+（旧 `src/App.vue:1740` 用 `shortcutName || appName` 命名快捷方式，新架构一律用
+`appName`）；下游 `packaging/packaging.config.json` 里该键与 `appName` 同值，行为不变。
+
+| 改动 | 文件 | 说明 |
+| --- | --- | --- |
+| 配置键清单 | `native/utils/config_keys.rs` | `PROJECT_CONFIG_KEYS` 列出 `ProjectConfig` 的 25 个 serde 字段；builder 经 `native/builder/utils/mod.rs` 的 `#[path]` 共用同一份 |
+| 打包期点名 | `native/builder/pack.rs` 的 `unknown_config_keys` | 既不是安装器字段、也不是 builder 自己的 `agreementFile` / `agreementFormat` / `agreementTitle` 的顶层键，按名字排序逐个 `Warning: unrecognized config key "x" (ignored)`。只警告不中断：下游配置可能带着别的工具留下的键，包本身仍然能打 |
+| 清单不漂移 | `native/session/types.rs` 的 `config_keys_match_the_struct` | 把 `ProjectConfig` 序列化后的键集合与清单逐字比对，结构体加了字段而清单没跟就失败 |
+| 检测会触发 | `native/builder/pack.rs` 的 `unrecognized_config_keys_are_reported` | 认识的键（含 `legacy*` 与 `extraUninstall*` 各键、三个 `agreement*` 键）不报；拼错的 `legacyExeName` 与上游已移除的 `shortcutName` 都报；非对象配置不误报 |
+
+本机证据：`cargo check --target x86_64-pc-windows-msvc --all-targets` 0 warning；两个
+单测由 CI 的 `unit-test` job 执行。下游真实配置的静态比对：`shortcutName` 不在清单里，
+打包时会打印一条警告。
 
 ## P2 已落地改动与证据（第 17 项：打包器修复逐条核对）
 
