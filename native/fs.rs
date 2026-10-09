@@ -1021,9 +1021,17 @@ pub async fn create_local_stream(
 /// Create a file under the staging directory (parents included). This is the
 /// only producer of files in the install pipeline; nothing writes into the
 /// install directory directly.
+///
+/// Refuses to write through a symlink / junction: the staging root can live in a
+/// user-writable place (`%TEMP%`), and the elevated helper is the one writing
+/// there, so a pre-placed link would redirect the write to a protected file.
 pub async fn create_staged_file(
     path: &Path,
 ) -> Result<tokio::io::BufWriter<tokio::fs::File>, anyhow::Error> {
+    if crate::fs::staging::has_reparse_point(path) {
+        return Err(anyhow::anyhow!("refusing to write through a reparse point")
+            .attach_with(crate::utils::code::FILE_IO_FAILED, path.to_string_lossy()));
+    }
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await

@@ -25,7 +25,7 @@
 | P0 冻结基线与建立隔离分支 | 完成 | 分支 `codex/migrate-upstream-main` 起自 `05a1410` |
 | P1 标准目标 + 构建入口 + 产物接口 | 部分 | 目标与产物接口已改；**Windows 构建未执行**（本环境无 MSVC/WebView2） |
 | P2 配置、打包与升级兼容 | 部分 | 协议内联（第 2 项）与改名兼容（第 12 项）已落地；未识别字段检测、打包器修复（第 17 项）待办 |
-| P3 卸载、提权与事务性安全 | 部分 | 卸载侧安全阀与扩展清理已落地（第 1/1b/1c/3/8 项）；提权管道已有上游等价实现 |
+| P3 卸载、提权与事务性安全 | 部分 | 卸载侧安全阀与扩展清理已落地（第 1/1b/1c/8 项）；提权管道 ACL 收紧、日志/暂存重解析点拦截已落地（第 3/9 项）；下载后执行验签待办 |
 | P4 前端体验与隐私 | 部分 | 遥测移除（第 7 项）、协议弹窗与 footer 布局（第 2/5 项）已完成；历史版本提示待核 |
 | P5 依赖、文档与 CI 门禁 | 部分 | CI 已关闭 release PDB；依赖替换（第 4/14/15/16 项）待办 |
 | P6 端到端兼容、发布与回退 | 待办 | |
@@ -36,13 +36,13 @@
 | --- | --- | --- |
 | 1 / 1b / 1c 卸载注册表、快捷方式、计划任务扩展 | 完成 | 见下「P3 已落地改动与证据」 |
 | 2 协议文件、格式、标题、弹窗 | 完成 | 见下「P2 / P4 已落地改动与证据」 |
-| 3 删除范围与提权面安全阀 | 部分 | 卸载侧四类判定 + 清单路径越界拦截已落地；下载验签、提权管道 ACL 待办 |
+| 3 删除范围与提权面安全阀 | 部分 | 卸载侧四类判定 + 清单路径越界拦截 + 提权管道 ACL 已落地；下载后执行验签待办 |
 | 4 vendored rcedit 兼容 | 待办 | 上游仍用 `Devolutions/rcedit-rs` git 依赖；核对 MSVC 14.51 是否需要 vendoring |
 | 5 弹窗 footer | 完成 | `.dialog` 改纵向 flex、footer 回文档流；见下 |
 | 6 多用户与临时残留清理 | 完成 | `%VAR%` 展开、跨用户重放、`%TEMP%` 白名单、卸载前结束进程，见下 |
 | 7 物理移除遥测 | 完成 | 见下「P4 已落地改动与证据」 |
 | 8 卸载收尾、路径比较、提权状态、ARP 静默入口 | 部分 | ARP 加引号 + 静默入口已落地；提权状态由上游等价实现覆盖 |
-| 9 安全临时文件、下载验签、提权管道 | 部分 | 清单越界已挡（见下）；下载后执行的验签、管道 ACL、日志重解析点检查待办 |
+| 9 安全临时文件、下载验签、提权管道 | 部分 | 清单越界、提权管道 ACL、日志/暂存重解析点已落地（见下）；下载后执行的验签待办 |
 | 10 DFS 拆分/注释 | 待办 | 旧 `src/dfs.ts` 与新 `native/session/`（含 `download_plan.rs`、`rate.rs`）职责映射 |
 | 11 编译告警治理 | 部分 | 上游 `05a1410` 已清理一批；剩余待构建后确认 |
 | 12 改名后的升级兼容 | 完成 | `legacyExeNames` / `legacyProgramFilesPaths` / `legacyUninstallNames`，见下 |
@@ -160,6 +160,26 @@
   净化负例、注释剥离）、`render.test.tsx` 的接受门槛用例（默认禁用 → 打开弹窗 → 接受后可用）。
 - `pnpm exec rsbuild build` 通过，PurgeCSS 未误删 `.agreement-body` / `.dialog-footer .btn-install`。
 - 真机观感（窄窗、高 DPI、暗亮主题、原生弹窗两遍流程）需 Windows 上确认。
+
+## P3 已落地改动与证据（第 9 项：提权管道 ACL 与重解析点拦截）
+
+提权 helper 是通过命名管道 `\\.\pipe\Kachina-Elevate-<uuid>` 驱动的，管道服务端由
+中等完整性的 UI 进程创建，提权子进程作为客户端连上来。UAC 弹窗期间（可能几十秒）管道
+空着等人，这段窗口就是攻击面。同一类问题也出现在「以管理员身份写固定路径文件」上：
+普通权限进程预置符号链接 / junction，就能把提权进程的写入重定向到受保护文件。
+
+| 改动 | 落点 | 说明 |
+| --- | --- | --- |
+| 管道 ACL 收紧 | `native/utils/acl.rs` 的 `create_security_attributes` | SDDL 由 `D:(A;;GA;;;AC)(A;;GA;;;RC)(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;BU)S:(ML;;NW;;;LW)` 改为 `D:(A;;GA;;;CO)(A;;GA;;;SY)(A;;GA;;;BA)S:(ML;;NW;;;ME)`：去掉 `BU`（所有本地用户）/ `AC`（AppContainer）/ `RC`（远程会话），改为只放行创建者（`CO`，解析成创建者 SID，UI 与提权子进程同一用户）与 `SY` / `BA`；完整性级别由 Low 提到 Medium，低完整性进程无法写入（no-write-up）。`reject_remote_clients` / `first_pipe_instance` 上游已开 |
+| 重解析点判定复用 | `native/fs/staging.rs` 的 `has_reparse_point` | 从 `uninstall.rs` 提升为公共函数，供日志 / 暂存 / 卸载三处共用；沿父级逐层检查符号链接与 junction，`NotFound` 跳过继续看父级（首次写日志时文件本就不存在），其它读取错误按「是」处理 |
+| 暂存文件拒写 | `native/fs.rs` 的 `create_staged_file` | 写入前先判定重解析点，命中即以 `FILE_IO_FAILED` 拒绝并附路径。staging 根可能在用户可写的 `%TEMP%`，且由提权 helper 写入，预置链接即可重定向 |
+| 日志文件拒写 | `native/utils/log.rs` 的 `init` | 日志文件名固定，命中重解析点时只写控制台（stderr 提示），不打开文件 |
+
+验证证据（本机 WSL，非 Windows 运行验证）：
+
+- `cargo check --target x86_64-pc-windows-msvc --all-targets` 通过，**0 warning / 0 error**。
+- SDDL 合法性由 `ConvertStringSecurityDescriptorToSecurityDescriptorW` 在真机运行时校验，
+  `CO` / `ML;;NW;;;ME` 是标准 SDDL 记号；真机提权安装 / 卸载流程需 Windows 上确认。
 
 ## 未验证项（阻塞）
 

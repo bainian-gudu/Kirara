@@ -27,11 +27,18 @@ pub fn path() -> std::path::PathBuf {
 /// 安装为全局 Subscriber。日志文件打不开时静默降级为仅控制台。
 pub fn init(log_file: &std::path::Path) {
     let _ = LOG_PATH.set(log_file.to_path_buf());
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_file)
-        .ok();
+    // 日志文件名固定，提权子进程也走同一段初始化：普通权限程序预先放一个符号链接 /
+    // junction，就能让管理员权限的进程往任意文件里追加内容。命中重解析点只写控制台。
+    let file = if crate::fs::staging::has_reparse_point(log_file) {
+        eprintln!("log path is a reparse point, logging to console only");
+        None
+    } else {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_file)
+            .ok()
+    };
     let _ = tracing::subscriber::set_global_default(LogSubscriber {
         file: file.map(Mutex::new),
         next_span_id: AtomicU64::new(1),

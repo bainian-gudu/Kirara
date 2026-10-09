@@ -394,6 +394,25 @@ fn claim_lock(path: &Path, install_dir: &str) -> anyhow::Result<()> {
     }
 }
 
+/// 路径本身或任一父级是符号链接 / junction。属性读不到时按「是」处理：判不出来
+/// 就别动它。还不存在的层级跳过（第一次写日志文件时文件本来就不存在），继续看父级。
+pub fn has_reparse_point(path: &Path) -> bool {
+    let mut current = Some(path);
+    while let Some(p) = current {
+        match std::fs::symlink_metadata(p) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || crate::fs::commit::is_reparse(&meta) {
+                    return true;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return true,
+        }
+        current = p.parent();
+    }
+    false
+}
+
 /// Relative path that cannot escape `base` when joined: no absolute form,
 /// drive prefix, `.`, or `..` components. Empty is the directory itself.
 pub fn is_safe_rel(rel: &str) -> bool {

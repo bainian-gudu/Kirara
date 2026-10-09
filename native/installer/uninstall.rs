@@ -3,7 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-use crate::fs::staging::{staging_root, Staging};
+use crate::fs::staging::{has_reparse_point, staging_root, Staging};
 use crate::utils::code::{Coded, FILE_IO_FAILED};
 use crate::utils::error::TAResult;
 use crate::utils::process;
@@ -188,25 +188,6 @@ pub async fn remove_paths(paths: &[String]) -> Vec<String> {
 fn path_eq(a: &Path, b: &Path) -> bool {
     crate::session::plan::normalize_full(&a.to_string_lossy())
         == crate::session::plan::normalize_full(&b.to_string_lossy())
-}
-
-/// 路径本身或任一父级是符号链接 / junction。属性读不到时按「是」处理：
-/// 判不出来就别动它。
-fn has_reparse_point(path: &Path) -> bool {
-    let mut current = Some(path);
-    while let Some(p) = current {
-        match std::fs::symlink_metadata(p) {
-            Ok(meta) => {
-                if meta.file_type().is_symlink() || crate::fs::commit::is_reparse(&meta) {
-                    return true;
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
-            Err(_) => return true,
-        }
-        current = p.parent();
-    }
-    false
 }
 
 fn is_under_system_root(path: &Path) -> bool {
