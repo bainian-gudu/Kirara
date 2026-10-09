@@ -27,7 +27,7 @@
 | P2 配置、打包与升级兼容 | 部分 | 协议内联（第 2 项）与改名兼容（第 12 项）已落地；未识别字段检测、打包器修复（第 17 项）待办 |
 | P3 卸载、提权与事务性安全 | 完成 | 卸载侧安全阀与扩展清理（第 1/1b/1c/8 项）、提权管道 ACL、重解析点拦截、下载后执行验签（第 3/9 项）均已落地 |
 | P4 前端体验与隐私 | 部分 | 遥测移除（第 7 项）、协议弹窗与 footer 布局（第 2/5 项）已完成；历史版本提示待核 |
-| P5 依赖、文档与 CI 门禁 | 部分 | CI 已关闭 release PDB；依赖替换（第 4/14/15/16 项）待办 |
+| P5 依赖、文档与 CI 门禁 | 部分 | CI 已关闭 release PDB；rcedit / `mslnk` / `nt_version` 与 `libs/` 许可证已落地（第 4/16 项）；zip 与 H3（第 14/15 项）待办 |
 | P6 端到端兼容、发布与回退 | 待办 | |
 
 ## 逐项处置
@@ -37,7 +37,7 @@
 | 1 / 1b / 1c 卸载注册表、快捷方式、计划任务扩展 | 完成 | 见下「P3 已落地改动与证据」 |
 | 2 协议文件、格式、标题、弹窗 | 完成 | 见下「P2 / P4 已落地改动与证据」 |
 | 3 删除范围与提权面安全阀 | 完成 | 卸载侧四类判定、清单路径越界拦截、提权管道 ACL、下载后执行验签均已落地；宿主侧 `UninstallLauncher` / `ResolveDotNetCli` 不在本仓库（见下） |
-| 4 vendored rcedit 兼容 | 待办 | 上游仍用 `Devolutions/rcedit-rs` git 依赖；核对 MSVC 14.51 是否需要 vendoring |
+| 4 vendored rcedit 兼容 | 完成 | `vendor/rcedit-rs/` 副本 + `rescle.cc` 的 `std::locale::classic()`；根 `Cargo.toml` 改 path 依赖（见下） |
 | 5 弹窗 footer | 完成 | `.dialog` 改纵向 flex、footer 回文档流；见下 |
 | 6 多用户与临时残留清理 | 完成 | `%VAR%` 展开、跨用户重放、`%TEMP%` 白名单、卸载前结束进程，见下 |
 | 7 物理移除遥测 | 完成 | 见下「P4 已落地改动与证据」 |
@@ -49,7 +49,7 @@
 | 13 Windows 10/11 标准目标 | 部分 | 目标、`-Z build-std`、`rust-src`、`ctor` patch、`STATIC_VCRUNTIME` 已处理（见下）；CI 的 `CARGO_PROFILE_RELEASE_DEBUG` 等细节待补 |
 | 14 zip 去 fork 与中文名解码 | 待办 | 上游仍用 `xytoki/zip2`；`native/thirdparty/mirrorc.rs` |
 | 15 H3 改 `quinn`/`rustls` | 待办 | 上游仍用 `msquic-async` 系列 fork |
-| 16 旧依赖替换与许可证 | 待办 | 上游仍用 `mslnk` / `nt_version` |
+| 16 旧依赖替换与许可证 | 完成 | `mslnk` → Shell Link API、`nt_version` → ntdll、`libs/` 许可证补齐（见下） |
 | 17 打包器修复 | 待办 | PE 识别、嵌入名、extract 路径约束、`replace-bin`；可能已有上游等价实现，测试通过才标记已覆盖 |
 | 18 安装行为测试与单测 | 部分 | 上游行为矩阵保留；旧分支特有的 `userdata-ignore` / `builder-extract-replace` 断言待补 |
 
@@ -210,6 +210,29 @@ exe，下载源被劫持时也照样执行。这里统一收口到 `native/utils
   非 Valid 状态）、`dir` 的 `private_folder_matching_ignores_case_and_separators`。
 - 真机需确认两点：`Get-AuthenticodeSignature` 的证书 Subject 布局（不匹配时 fail-closed，
   错误信息带实际 status 与 subject）、`%SystemRoot%\Temp` 在标准用户下的可写性。
+
+## P5 已落地改动与证据（第 4 / 16 项：依赖替换与许可证）
+
+共同点：**只换实现，不换行为**；锁文件重新解析后没有顺带升级任何版本。
+
+| 改动 | 落点 | 说明 |
+| --- | --- | --- |
+| rcedit 改为仓库内副本（第 4 项） | `vendor/rcedit-rs/`（12 个文件）、根 `Cargo.toml` | 上游 `Devolutions/rcedit-rs@1bfa3ee6` 的 `rescle.cc` 用了 MSVC 非标准扩展 `std::locale::empty()`，MSVC 14.51 起从 `<xlocale>` 移除（microsoft/STL#5834），`windows-latest` 已是 VS 2026 / MSVC 14.51，CI 必然失败。副本改 `std::locale::classic()`（基准 locale 不影响 `codecvt_utf8` 的转换结果，且不受 `locale::global()` 影响），并删掉上游 `[dev-dependencies] tempfile`（`tests/` 未纳入副本）。两份 LICENSE 原样保留，差异与升级步骤见 `vendor/rcedit-rs/LOCAL_PATCHES.md` |
+| `.lnk` 改系统 API（第 16a 项） | `native/installer/lnk.rs` | `mslnk 0.1`（2022 年停更，自带约 1300 行手写 .lnk 序列化）换成 `IShellLinkW` + `IPersistFile::Save`；COM 初始化整段放进 `spawn_blocking`，`RPC_E_CHANGED_MODE` 视为可用但不配对 `CoUninitialize`；工作目录填目标文件所在目录。同时补回旧分支的路径校验（绝对路径、无 `..`、必须以 `.lnk` 结尾、目标过 `is_safe_delete_root`、`lnk` 非重解析点） |
+| 版本号改 ntdll（第 16b 项） | `native/utils/os_version.rs`、`native/host/window.rs`、`native/capabilities/mod.rs` | `nt_version 0.1` 换成自己声明 `#[link(name = "ntdll")] RtlGetNtVersionNumbers`；`build` 的高 16 位标志位统一在 `get()` 里裁掉，两处调用点不再各自 `& 0xffff`。H3 的 Win11 门槛（`10.0` 且 build ≥ 22000）未放宽 |
+| `libs/` 许可证（第 16c 项） | `libs/hdiff-sys/LICENSE`、`libs/hpatch-sys/LICENSE`、`libs/THIRDPARTY.md` | 补齐 HDiffPatch（MIT，Copyright (c) 2012-2023 housisong）与 libdivsufsort（MIT，Copyright (c) 2003-2008 Yuta Mori）的许可文本，并记录上游地址、快照版本 `v4.8.0`、本地四类差异（include 路径、`extern "C"` 出口、hpatch 具体错误码、注释中文化）与升级步骤 |
+| 依赖删除 | 根 `Cargo.toml`、`Cargo.lock` | 去掉 `nt_version`、`mslnk`；`rcedit` / `rcedit-sys` 去掉 `source = "git+…"`。锁文件净减 27 行，只少了 `mslnk`、`nt_version` 与仅供 `mslnk` 使用的 `bitflags 1.3.2`，无版本变动 |
+
+验证证据（本机 WSL，非 Windows 运行验证）：
+
+- `cargo metadata` 重新解析锁文件成功；`cargo check --target x86_64-pc-windows-msvc --all-targets`
+  通过，**0 warning / 0 error**，日志里能看到 `Compiling rcedit-sys v0.1.0 (…/vendor/rcedit-rs/rcedit-sys)`
+  —— 副本的 `build.rs` 与 `rescle.cc` 真被编了一遍（本机用 `/tmp` 的一次性假 `cl.exe`，
+  只验证构建脚本与源码能被接受，不产出可链接产物）。
+- `rg -n "nt_version|mslnk" native/ Cargo.toml` 无残留；`vendor/rcedit-rs/rcedit-sys/src/rescle.cc`
+  里没有 `locale::empty(`。
+- 快捷方式的**行为**只能实机验证：装一次看桌面 / 开始菜单的快捷方式能启动、工作目录正确，
+  再卸载确认被清干净。
 
 ## CI 回归：卸载时删日志文件
 

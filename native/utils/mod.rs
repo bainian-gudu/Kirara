@@ -10,6 +10,7 @@ pub mod i18n;
 pub mod icon;
 pub mod log;
 pub mod metadata;
+pub mod os_version;
 pub mod process;
 pub mod progressed_read;
 pub mod secure_temp;

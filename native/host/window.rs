@@ -57,15 +57,15 @@ pub const WM_THEME_BACKGROUND: u32 = WM_APP + 1;
 pub const WM_RESIZE_WEBVIEW: u32 = WM_APP + 2;
 
 pub fn is_win11() -> bool {
-    let (major, minor, build) = nt_version::get();
-    let build = (build & 0xffff) as u16;
+    let (major, minor, build) = crate::utils::os_version::get();
+    let build = build as u16;
     major == 10 && minor == 0 && build >= 22000
 }
 
 /// `WS_EX_NOREDIRECTIONBITMAP` is `WINVER >= 0x0602` (Windows 8). Windows 7
 /// (`6.1`) rejects it in `CreateWindowExW` with `ERROR_INVALID_PARAMETER`.
 fn no_redirection_bitmap() -> WINDOW_EX_STYLE {
-    let (major, minor, _) = nt_version::get();
+    let (major, minor, _) = crate::utils::os_version::get();
     if major > 6 || (major == 6 && minor >= 2) {
         WS_EX_NOREDIRECTIONBITMAP
     } else {

@@ -50,8 +50,7 @@ pub fn init() -> bool {
 
 fn probe_h3_support() -> bool {
     // 1. Win11+ check (MsQuic QUIC with Schannel requires build >= 22000)
-    let (major, minor, build) = nt_version::get();
-    let build_num = build & 0xffff;
+    let (major, minor, build_num) = crate::utils::os_version::get();
     if !(major == 10 && minor == 0 && build_num >= 22000) {
         tracing::info!(
             "[H3] Not Win11 (build={}, need 22000+), disabled",
@@ -127,7 +126,7 @@ impl Middleware for DynamicUaMiddleware {
 
 /// Generates the User-Agent string with optional h3/enabled suffix.
 pub fn ua_string() -> String {
-    let (major, minor, build) = nt_version::get();
+    let (major, minor, build) = crate::utils::os_version::get();
     let cpu_cores = num_cpus::get();
     let wv2ver = crate::host::webview_version().unwrap_or_else(|_| "Unknown".to_string());
 

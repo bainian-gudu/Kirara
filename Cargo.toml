@@ -64,9 +64,7 @@ windows = { version = "0.62", features = [
     "Win32_Storage_FileSystem"
 ] }
 
-nt_version = "0.1"
 lazy_static = "1.5"
-mslnk = "=0.1"
 twox-hash = "2.1.0"
 pin-project = "1.1.7"
 fmmap = { version = "0.4", features = ["tokio"] }
@@ -79,7 +77,9 @@ ignore = "0.4.23"
 num_cpus = "1.16.0"
 indicatif = { version = "0.17.9", features = ["tokio"] }
 console = "0.15.10"
-rcedit = { version = "0.1.0", git = "https://github.com/Devolutions/rcedit-rs.git" }
+# 仓库内副本：上游 `Devolutions/rcedit-rs` 的 `rescle.cc` 用了 MSVC 已移除的
+# `std::locale::empty()`，MSVC 14.51 起编不过。差异与升级方式见 vendor/rcedit-rs/LOCAL_PATCHES.md。
+rcedit = { path = "vendor/rcedit-rs" }
 windows-registry = "0.5"
 zip = { git = "https://github.com/xytoki/zip2.git", default-features = false, features = [
     "deflate",
