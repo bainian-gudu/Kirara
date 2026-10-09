@@ -248,8 +248,3 @@ Tips：Mirror酱使用独立的文件级增量更新机制，因此当选择Mirr
 安装程序和dfs服务器不是强绑定关系，任何可以通过HTTP提供离线包下载的服务器都可以作为更新服务器。dfs在本项目中仅作为一个获取下载地址的API使用。
 
 上游的技术细节可以看看 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/YuehaiTeam/kachina-installer) 。
-
-## 贡献者
-
-- 当前仓库所有者：`bainian-gudu`。
-- 上游作者与历史提交的作者保留在 git 提交历史里，不做改写；本仓库不在此列其他贡献者。
