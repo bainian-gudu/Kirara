@@ -65,15 +65,15 @@ fn probe_h3_support() -> bool {
         return false;
     }
 
-    // 3. MsQuic availability probe — create Registration to verify DLL + Schannel
-    use h3_msquic_async::msquic_async::msquic;
-    match msquic::Registration::new(&msquic::RegistrationConfig::default()) {
-        Ok(_reg) => {
+    // 3. QUIC 客户端配置探测：验证加密提供者 + 系统证书验证器能就绪。
+    //    只建配置、不开 socket。
+    match h3::probe() {
+        Ok(()) => {
             tracing::info!("[H3] Probe succeeded, enabled");
             true
         }
         Err(e) => {
-            tracing::info!("[H3] Probe failed: {:?}, disabled", e);
+            tracing::info!("[H3] Probe failed: {e:#}, disabled");
             false
         }
     }

@@ -130,12 +130,6 @@ try {
     & pnpm install --frozen-lockfile
     if ($LASTEXITCODE -ne 0) { throw "pnpm install 失败" }
 
-    # 依赖里仍有 crate 用 cmake 编 C 源码（msquic 等），按本机核数给 cmake 一个
-    # 明确的并行度，省得在 Windows 上退回串行编译。
-    if (-not $env:CMAKE_BUILD_PARALLEL_LEVEL) {
-        $env:CMAKE_BUILD_PARALLEL_LEVEL = [string][Environment]::ProcessorCount
-    }
-
     Step "pnpm build（原生宿主 + $TargetTriple，LTO；首次冷构建较慢）"
     & pnpm build
     if ($LASTEXITCODE -ne 0) { throw "pnpm build 失败" }

@@ -27,7 +27,7 @@
 | P2 配置、打包与升级兼容 | 部分 | 协议内联（第 2 项）与改名兼容（第 12 项）已落地；未识别字段检测、打包器修复（第 17 项）待办 |
 | P3 卸载、提权与事务性安全 | 完成 | 卸载侧安全阀与扩展清理（第 1/1b/1c/8 项）、提权管道 ACL、重解析点拦截、下载后执行验签（第 3/9 项）均已落地 |
 | P4 前端体验与隐私 | 部分 | 遥测移除（第 7 项）、协议弹窗与 footer 布局（第 2/5 项）已完成；历史版本提示待核 |
-| P5 依赖、文档与 CI 门禁 | 部分 | CI 已关闭 release PDB；rcedit / `mslnk` / `nt_version` 与 `libs/` 许可证已落地（第 4/16 项）；zip 与 H3（第 14/15 项）待办 |
+| P5 依赖、文档与 CI 门禁 | 部分 | CI 已关闭 release PDB；依赖替换与许可证全部落地（第 4/14/15/16 项）；README / 来源说明与快速检查门禁待收尾 |
 | P6 端到端兼容、发布与回退 | 待办 | |
 
 ## 逐项处置
@@ -48,7 +48,7 @@
 | 12 改名后的升级兼容 | 完成 | `legacyExeNames` / `legacyProgramFilesPaths` / `legacyUninstallNames`，见下 |
 | 13 Windows 10/11 标准目标 | 部分 | 目标、`-Z build-std`、`rust-src`、`ctor` patch、`STATIC_VCRUNTIME` 已处理（见下）；CI 的 `CARGO_PROFILE_RELEASE_DEBUG` 等细节待补 |
 | 14 zip 去 fork 与中文名解码 | 完成 | 改用 crates.io `zip 8.6`；`native/thirdparty/mirrorc.rs` 按 `name_raw()` 自己解条目名（见下） |
-| 15 H3 改 `quinn`/`rustls` | 待办 | 上游仍用 `msquic-async` 系列 fork |
+| 15 H3 改 `quinn`/`rustls` | 完成 | `native/capabilities/h3.rs` 整份换成 quinn + rustls + h3-quinn；`[patch.crates-io]` 的 msquic fork 删除（见下） |
 | 16 旧依赖替换与许可证 | 完成 | `mslnk` → Shell Link API、`nt_version` → ntdll、`libs/` 许可证补齐（见下） |
 | 17 打包器修复 | 待办 | PE 识别、嵌入名、extract 路径约束、`replace-bin`；可能已有上游等价实现，测试通过才标记已覆盖 |
 | 18 安装行为测试与单测 | 部分 | 上游行为矩阵保留；旧分支特有的 `userdata-ignore` / `builder-extract-replace` 断言待补 |
@@ -223,6 +223,9 @@ exe，下载源被劫持时也照样执行。这里统一收口到 `native/utils
 | `libs/` 许可证（第 16c 项） | `libs/hdiff-sys/LICENSE`、`libs/hpatch-sys/LICENSE`、`libs/THIRDPARTY.md` | 补齐 HDiffPatch（MIT，Copyright (c) 2012-2023 housisong）与 libdivsufsort（MIT，Copyright (c) 2003-2008 Yuta Mori）的许可文本，并记录上游地址、快照版本 `v4.8.0`、本地四类差异（include 路径、`extern "C"` 出口、hpatch 具体错误码、注释中文化）与升级步骤 |
 | 依赖删除 | 根 `Cargo.toml`、`Cargo.lock` | 去掉 `nt_version`、`mslnk`；`rcedit` / `rcedit-sys` 去掉 `source = "git+…"`。锁文件净减 27 行，只少了 `mslnk`、`nt_version` 与仅供 `mslnk` 使用的 `bitflags 1.3.2`，无版本变动 |
 | zip 去 fork（第 14 项） | 根 `Cargo.toml`、`native/thirdparty/mirrorc.rs` | 上游的 `xytoki/zip2` fork 相对上游只把 `read.rs` 的 UTF-8 判定写死成 `true`（部分打包工具写中文名时不置该标志位，按标志位解码会退回 CP437 得到乱码，MirrorChyan 下发的包正属于这类）。改用 crates.io `zip 8.6` 后复刻同一语义：新增 `decode_entry_name`（`String::from_utf8_lossy`，与 fork 分支逐字一致），条目清单由 `file_names()`（按标志位解码）改为逐个 `by_index(i)` 取 `name_raw()` 再解码，前缀计算与路径安全判定都建立在这份名字上。`by_name()` 保留：zip 8.x 的名字索引按原始字节建表（`index_for_name` 用 `name.as_bytes()`），UTF-8 名字查得到。feature 保持与原 fork 相同的解压能力（`deflate-flate2-zlib-rs` / `deflate64` / `zstd`），flate2 走纯 Rust 的 zlib-rs 后端，不引入新的 C 依赖 |
+| H3 换传输层（第 15 项） | `native/capabilities/h3.rs`（整份替换）、`native/capabilities/mod.rs`、根 `Cargo.toml` | 上游走 `h3-msquic-async` + `xytoki/msquic-async-rs` fork + 静态 `seera-msquic`（还要在 `[patch.crates-io]` 里重定向两个 git 源，构建时编上千个 C 文件）。换成 `quinn 0.11` + `rustls 0.23`（显式 ring 提供者）+ `h3-quinn 0.0.10` + `rustls-platform-verifier 0.7`，`[patch.crates-io]` 与 `h3-msquic-async` 依赖一并删除。对外行为逐条保持：连接池按 `(host, port, pin)` 复用、上限 32、空闲与死亡连接清扫；`PinningMode::Force` / `Add` 的判定顺序不变（`Add` 下系统信任即放行）；`PinTarget::Spki` 改为在证书 DER 上直接定位 SubjectPublicKeyInfo，字节与上游 `CryptEncodeObjectEx(X509_PUBLIC_KEY_INFO)` 一致，`openssl x509 -pubkey … | sha256sum` 的结果仍可直接当固定值；`http3://` 拦截、失败即 `disable_h3()`、UA 的 `h3/enabled`、`discover()` 接受任意证书并回传哈希都照旧；Win11+ 启用门槛保留（那是上游为 msquic + Schannel 定的，H3 的启用范围属于对外行为，不跟着依赖替换变） |
+| 启动探测改为 QUIC 配置 | `native/capabilities/mod.rs` 的 `probe_h3_support` | 第三步由「建 msquic Registration 验证 DLL + Schannel」改为 `h3::probe()`：只建一次完整 QUIC 客户端配置，验证加密提供者、系统证书验证器与 QUIC 参数就绪，不开 socket |
+| 删除 cmake 环境变量 | `build.ps1` | msquic 是唯一用 cmake 编 C 源码的依赖，替换后依赖图里已没有 `cmake` crate，`CMAKE_BUILD_PARALLEL_LEVEL` 的设置成为死代码 |
 
 验证证据（本机 WSL，非 Windows 运行验证）：
 
@@ -232,6 +235,13 @@ exe，下载源被劫持时也照样执行。这里统一收口到 `native/utils
   只验证构建脚本与源码能被接受，不产出可链接产物）。
 - `rg -n "nt_version|mslnk" native/ Cargo.toml` 无残留；`vendor/rcedit-rs/rcedit-sys/src/rescle.cc`
   里没有 `locale::empty(`。
+- H3 替换后：`Cargo.lock` 里 `msquic` 出现 0 次，`quinn` / `quinn-proto` / `quinn-udp` /
+  `rustls` / `rustls-platform-verifier` / `h3-quinn` 均已入图；`cargo metadata` 的包集合里
+  不再有 `cmake`、`c-types`、`rangemap`、`ctor` / `dtor`（都只被 msquic 依赖链引入）。
+  依赖侧有一条 future-incompat 提示（`quinn-udp v0.5.16`），不是本仓库代码的告警。
+- 行为验证的两点缺口（真机才能确认）：H3 真实连接只能在 Windows 上跑，靠 CI 的 Build
+  与安装 / 更新测试兜底；`packaging.config.json` 目前只有 `https://` 地址，`http3://`
+  在正式安装流程里默认不会被走到。
 - 快捷方式的**行为**只能实机验证：装一次看桌面 / 开始菜单的快捷方式能启动、工作目录正确，
   再卸载确认被清干净。
 
