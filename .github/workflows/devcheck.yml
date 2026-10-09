@@ -1,0 +1,82 @@
+name: Devcheck
+
+# 自动执行：push 到 main、任何 PR、以及手动触发。
+# 这套检查（tools/devcheck）是「不跑完整构建的快速体检」：完整构建要 nightly +
+# pnpm 全家桶与 LTO，几分钟起步，日常改一行 Rust / TS 靠它兜底。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: devcheck-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22"
+  CARGO_TERM_COLOR: always
+  # 压掉第三方 action 自己的弃用告警
+  NODE_NO_WARNINGS: "1"
+
+jobs:
+  devcheck:
+    name: devcheck (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu 验证脚本的跨平台分支；windows 验证用户实际会跑的那条路径
+        # （rust 层需要 MSVC 的 cl.exe 编 native 依赖的 C++，ubuntu 上自动 SKIP）
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      # 压掉 actions/checkout 里 git init 的 8 行 master hint
+      - name: Silence git default-branch hint
+        if: runner.os == 'Linux'
+        run: git config --global init.defaultBranch main
+
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v4.0.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      # front 层跑仓库自己的 tsc --noEmit 与 vitest，需要根 node_modules
+      - name: Install NPM Dependencies
+        run: pnpm i --frozen-lockfile
+
+      - name: Cache cargo (devcheck logic crate)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            tools/devcheck/rust/logic
+          cache-targets: true
+          key: devcheck
+
+      # vendor 层断言：源码快照完整、不是 submodule、工作流与脚本里没有任何从上游
+      # 拉源码 / 下二进制的动作（详见 tools/devcheck/README.md）。
+      # 单独跑一次，让这条约束在日志里有独立、显眼的结论。
+      # 注意：本文件的注释里不要写出被 vendor 层禁止的那些字符串，否则扫到自己。
+      - name: Vendored source guard
+        shell: pwsh
+        run: pwsh -NoProfile -File ./tools/devcheck/devcheck.ps1 -Layer vendor
+
+      - name: devcheck (all layers)
+        shell: pwsh
+        run: pwsh -NoProfile -File ./tools/devcheck/devcheck.ps1
+
+      # 自检：注入错误，确认每一层真的会报错（防止「检查跑通了但其实什么都没查」）。
+      # 自检会临时改写仓库文件，因此自带仓库改动锁。
+      - name: devcheck -SelfTest
+        shell: pwsh
+        run: pwsh -NoProfile -File ./tools/devcheck/devcheck.ps1 -SelfTest

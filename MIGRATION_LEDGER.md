@@ -27,7 +27,7 @@
 | P2 配置、打包与升级兼容 | 完成 | 协议内联（第 2 项）、改名兼容（第 12 项）、打包器修复（第 17 项，上游等价）、未识别字段检测均已落地 |
 | P3 卸载、提权与事务性安全 | 完成 | 卸载侧安全阀与扩展清理（第 1/1b/1c/8 项）、提权管道 ACL、重解析点拦截、下载后执行验签（第 3/9 项）均已落地 |
 | P4 前端体验与隐私 | 完成 | 遥测移除（第 7 项）、协议内联 / 安全渲染 / 接受门槛（第 2 项）、弹窗 footer 布局（第 5 项）均已落地 |
-| P5 依赖、文档与 CI 门禁 | 部分 | 依赖替换与许可证（第 4/14/15/16 项）、CI 关闭 release PDB、README / 来源说明 / 台账均已收尾；**快速检查门禁（旧分支 `tools/devcheck` 与 `.github/workflows/devcheck.yml`）未移植** |
+| P5 依赖、文档与 CI 门禁 | 完成 | 依赖替换与许可证（第 4/14/15/16 项）、CI 关闭 release PDB、README / 来源说明 / 台账均已收尾；快速检查门禁已按新根 Cargo 与 Preact 路径重做（`tools/devcheck` + `.github/workflows/devcheck.yml`，含 17 个注入用例的自检） |
 | P6 端到端兼容、发布与回退 | 部分 | 隔离打包与旧包新装 / 升级 / 卸载重演已跑通（run `37920859476`，26 项断言全绿）；**桌面交互路径（WebView2 界面、UAC 弹窗、OneDrive 重定向目录、真实游戏进程占用）未在真机手跑；tag 与 Release 未做（需明确批准）** |
 
 ## 逐项处置
@@ -244,6 +244,44 @@ exe，下载源被劫持时也照样执行。这里统一收口到 `native/utils
   在正式安装流程里默认不会被走到。
 - 快捷方式的**行为**只能实机验证：装一次看桌面 / 开始菜单的快捷方式能启动、工作目录正确，
   再卸载确认被清干净。
+
+## P5 已落地改动与证据（快速检查门禁：`tools/devcheck`）
+
+旧分支 `refactor/v0.5.2` 的 `tools/devcheck` 是按 Tauri + Vue 架构写的：`rust` 层把
+`src-tauri/src/` 的几个文件塞进一个最小 crate 做 msvc 类型检查，`front` 层自带一份最小
+TS 工程（`@vue/compiler-sfc` + `front/node_modules`），`native` 层单独用 MSVC 编
+vendored `rcedit-sys` 的 C++，`ci` 层验证 `tools/ci/Import-DevCmd.ps1` 的 MSVC 注入链路。
+迁移后仓库根就是 Rust crate、前端就是一份 Preact + TS 源码、也没有那个注入脚本，所以
+四层都按新路径重做（保留原语义与故障注入自检），而不是照搬。
+
+| 层 | 新落点 | 与旧分支的差异 |
+| --- | --- | --- |
+| `vendor` | `lib/Layers.ps1` 的 `Test-VendoredSource` | 十项断言照旧，路径改为根 `Cargo.toml` / `Cargo.lock` / `native/**`；git 依赖改指 `russh`；ARP 选项改从 `native/cli/mod.rs` 的 `OPTS` 表解析；`whoami` 不再算遥测依赖（现在是 `session::state` 的 icacls 测试用的 dev-dependency），只盯 `sentry` 系；新增「放行规则匹配不上就报错」的兜底 |
+| `ps1` | 同上 `Test-Ps1Syntax` | 不变（`build.ps1` + devcheck 自身共 8 个文件） |
+| `gen` | `lib/Generate.ps1` 的 `New-LogicGen` | 只生成 logic 层的抽取物（不再有 typecheck 层的整文件拼接）；抽取清单按 `native/` 的真实路径重写，11 个源文件 |
+| `rust` | `Test-RustTypecheck` | 由「最小 crate 的整文件类型检查」改为**根 crate 的** `cargo check --target x86_64-pc-windows-msvc --all-targets`。native 依赖（`libs/hdiff-sys`、`libs/hpatch-sys`、`vendor/rcedit-rs`）带 C++，只能靠 MSVC 的 `cl.exe` 编，因此这一层只在 Windows 上跑，其它平台 SKIP |
+| `logic` | `rust/logic/`（`src/main.rs` + 生成的 `src/gen/extracted.rs`） | 断言对象换成新架构的安全阀与纯逻辑：路径越界、删目录 / 删快捷方式 / 删计划任务 / 环境变量展开 / 跨用户重放 / `%TEMP%` 白名单、安装计划归一化与模板展开、未识别配置键点名与协议内联、包体 PE 识别、嵌入名规则、解包路径越界、zip 条目名解码、微软签名判定、H3 证书固定（SPKI 的 DER 与哈希用 openssl 交叉验证），共 160 条 |
+| `front` | `Test-Frontend` | 不再自带最小 TS 工程：直接跑仓库自己的 `pnpm exec tsc --noEmit`（`web/` 全量 strict）、`pnpm test`（vitest）与协议渲染文件的 prettier。根 `tsconfig.json` 才是构建真正用的那份，第二份最小工程只会与它漂移 |
+| `native` | — | 删除：`cargo check --all-targets` 已经会跑 `rcedit-sys` 的 `build.rs` 并用 `cl.exe` 编 `rescle.cc`，单独一层是重复 |
+| `ci` | `lib/CiScripts.ps1` 的 `Test-CiScripts` | 不再验证 `Import-DevCmd.ps1`（迁移后不存在）；改为断言工作流 action 版本不低于登记下限、`all` 集合的每一层都在 `devcheck.yml` 上真跑过、`build.ps1` / `build.yml` / `p6-e2e.yml` 三处的「拼接体 > 裸 builder → 以 `kirara-builder.exe` 交付」一致、`package.json` 的 `build` 脚本三步齐全 |
+
+其它随迁移落地的东西：`.github/workflows/devcheck.yml`（ubuntu + windows 双 runner，
+依次跑 `-Layer vendor` → `all` → `-SelfTest`）、`.gitattributes`（`* text=auto eol=lf`，
+自检按内容做字符串替换，CRLF 会变成假失败）、`.gitignore` 补生成物与自检的锁 / 备份目录、
+`tools/devcheck/README.md` 按新仓库重写。
+
+本机证据（WSL，Linux）：
+
+- `pwsh tools/devcheck/devcheck.ps1` → `vendor` / `ps1` / `gen` / `logic` / `front` / `ci`
+  全通过，`rust` SKIP（缺 MSVC），整套 ~9 秒；`logic` 160 条断言 0 失败。
+- `pwsh tools/devcheck/devcheck.ps1 -SelfTest` → 17 个注入用例里 16 个被抓到，1 个
+  （`rust` 层）因缺 MSVC 跳过；自检结束后 `git status` 与 8 个被注入文件的 md5 与自检前
+  逐字节一致，`.repo-lock` 与 `.selftest-backup` 都已清掉。
+- `rust` 层的命令形状在 Linux 上用一次性假 `cl.exe` 验证过（`cargo check --target
+  x86_64-pc-windows-msvc --all-targets --message-format short` 退出码 0）。
+
+缺口：`rust` 层与它的自检用例只有在 Windows（有 `cl.exe`）上才会真跑，本机只能验证
+命令形状；CI 的 windows runner 是这条路径的实际证据。
 
 ## P2 已落地改动与证据（未识别字段检测）
 

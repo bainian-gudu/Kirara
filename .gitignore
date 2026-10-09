@@ -39,3 +39,10 @@ fixtures/
 # 构建产物：kirara-builder.exe 由 build.ps1 生成，CI 里用 artifact / cache 传递
 tools/*.exe
 tools/*.pdb
+
+# devcheck：按名字从 native/ 抽出来的生成物、cargo 产物、自检的锁与备份，都不入库
+tools/devcheck/rust/logic/src/gen/
+tools/devcheck/rust/logic/target/
+tools/devcheck/.repo-lock
+tools/devcheck/.selftest-backup/
+tools/devcheck/_selftest/

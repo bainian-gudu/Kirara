@@ -1,0 +1,6 @@
+# 统一按 LF 存盘。
+#
+# 两个原因：CI 在 ubuntu 与 windows 两个 runner 上跑同一批脚本；tools/devcheck 的
+# 自检会按内容做字符串替换来注入错误，CRLF 会让「注入点没匹配上」变成假失败。
+# 二进制文件由 git 自己识别（text=auto），不受影响。
+* text=auto eol=lf
