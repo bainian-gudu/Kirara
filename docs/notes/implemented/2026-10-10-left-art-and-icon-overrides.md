@@ -32,9 +32,9 @@ Status: implemented
 | 判据 | 结果 |
 | --- | --- |
 | 无内联图片时左栏显示内置图，有内联图片时显示 `/theme.webp` | PASS：`render.test.tsx` 断言 `img` 的 `src` |
-| 图片内联进单文件产物，产物只有一个文件 | PASS：rsbuild 1.5.10 production 构建的 `dist/index.html` 90,051 字节，`dist/` 只有它，含一处 `data:image/webp;base64` |
+| 图片内联进单文件产物，产物只有一个文件 | PASS：rsbuild 1.5.10 production 构建的 `dist/index.html` 90,051 字节，`dist/` 只有它；产物里那处 `data:image/webp;base64` 解出的 21,750 字节与 `web/left.webp` 逐字节一致（同为 SHA256 `c4da8566…`） |
 | 配置键取出后不写进包内配置，相对与绝对路径都能解析，缺省回退内置资源 | PASS：devcheck logic 层 172 → 181 条断言全绿 |
-| `pack` 在 Windows 上真编并通过行为测试 | PASS：CI `build` job |
+| `pack` 在 Windows 上真编并通过行为测试 | PASS：CI `build` job run `38034103145`，15 个 job 全绿（含 13 组 release 行为测试与单测） |
 
 ## Consequences
 

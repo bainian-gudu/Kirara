@@ -520,8 +520,9 @@ base64 data URI 内联进 `dist/index.html`——宿主 `assets.rs` 只服务 `i
 以及 `unknown_config_keys` 认得这两个键），172 → 181 条全绿；front 层 tsc + vitest
 通过（渲染用例改断言 `img` 的 `src`：无内联图片时等于打包进来的内置图，有内联图片时
 是 `/theme.webp`）；`pnpm rsbuild build` 产出的 `dist/index.html` 只有一份
-`data:image/webp;base64` 内联，没有独立资源文件。本机没有 Windows 工具链，`pack` 的
-真机路径由 CI 的 `build` job 覆盖。
+`data:image/webp;base64` 内联，解出的 21,750 字节与 `web/left.webp` 逐字节一致，
+`dist/` 没有独立资源文件。本机没有 Windows 工具链，`pack` 的真机路径由 CI 覆盖：
+run `38034103145` 15 个 job 全绿。
 
 两项改动都在 `v1.0.0` 之后，不在已发布的 `kirara-builder.exe` 里。
 
