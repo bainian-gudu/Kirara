@@ -273,17 +273,27 @@ pub fn is_safe_delete_root(path: &Path) -> bool {
     depth >= 2 && !is_protected_root(path)
 }
 
-/// 「尽力删除」通道的安全阀：只放行 `.lnk`，且不含 `..`、不是符号链接。
+/// 「尽力删除」通道的安全阀：只放行 `.lnk`，其余与 [`is_safe_delete_root`] 同一条
+/// （绝对路径、无 `..`、不是符号链接、不在 `%SystemRoot%` 内、至少两级、非受保护位置本身）。
 pub fn is_safe_shortcut_path(path: &Path) -> bool {
-    path.is_absolute()
-        && !path
-            .to_string_lossy()
-            .split(['/', '\\'])
-            .any(|seg| seg == "..")
-        && path
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("lnk"))
-        && !has_reparse_point(path)
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("lnk"))
+        && is_safe_delete_root(path)
+}
+
+/// 注册表键路径里是否含产品的注册名整段（键名不区分大小写，按 `\` 分段比较）。
+/// `Software\App` 与 `Software\<publisher>\App\Sub` 都算产品自己的键，
+/// `Software`、`Software\Microsoft` 不算。
+fn key_belongs_to_product(key: &str, product: &str) -> bool {
+    !product.is_empty()
+        && key
+            .split(['\\', '/'])
+            .any(|seg| seg.eq_ignore_ascii_case(product))
+}
+
+/// 值名是否属于本产品：必须以注册名开头（与 [`is_safe_task_name`] 同一判据）。
+fn value_belongs_to_product(value: &str, product: &str) -> bool {
+    !product.is_empty() && value.starts_with(product)
 }
 
 /// 配置里的 hive 名（`HKCU` / `HKLM` / `HKCR` / `HKU` 及其全称）。
@@ -314,16 +324,33 @@ fn apply_registry_cleanup(root: &windows_registry::Key, key: &str, value: Option
 /// 清理宿主自己写过的注册表项。`HKCU` 还要遍历已加载的用户配置单元：卸载器
 /// 通常以管理员身份运行，此时 `HKCU` 指向管理员账户，而登记来自登录用户。
 /// 键不存在、无权限都只记日志，卸载不因此失败。
-pub fn clean_extra_registry(items: &[RegistryCleanupItem]) {
+///
+/// 卸载器以管理员身份运行，配置写错的代价是整棵键树：不带 `value` 的 `remove_tree`
+/// 只放行产品自己的键（键路径里有 `product` 整段）；共享容器（`...\Run` 这类）只能
+/// 删值，且值名必须以 `product` 开头。`HKEY_USERS` 的重放吃同一份判定。
+pub fn clean_extra_registry(items: &[RegistryCleanupItem], product: &str) {
     for item in items {
         if item.key.is_empty() {
+            continue;
+        }
+        let value = item.value.as_deref().filter(|v| !v.is_empty());
+        let owned_key = key_belongs_to_product(&item.key, product);
+        let allowed = match value {
+            None => owned_key,
+            Some(name) => owned_key || value_belongs_to_product(name, product),
+        };
+        if !allowed {
+            tracing::warn!(
+                "skip registry cleanup outside this product: {}\\{}",
+                item.hive,
+                item.key
+            );
             continue;
         }
         let Some(root) = cleanup_root(&item.hive) else {
             tracing::warn!("unknown hive in extraUninstallRegistry: {}", item.hive);
             continue;
         };
-        let value = item.value.as_deref().filter(|v| !v.is_empty());
         apply_registry_cleanup(root, &item.key, value);
         if !matches!(
             item.hive.to_ascii_uppercase().as_str(),
@@ -762,7 +789,7 @@ pub async fn run_uninstall(
     for err in remove_paths(&extra_uninstall_shortcuts).await {
         tracing::warn!("{err}");
     }
-    clean_extra_registry(&extra_uninstall_registry);
+    clean_extra_registry(&extra_uninstall_registry, &reg_name);
     clean_extra_scheduled_tasks(&reg_name, &extra_uninstall_scheduled_tasks).await;
     clean_installer_temp_files().await;
     if let Err(e) = clear_empty_dirs(source).await {
@@ -970,6 +997,49 @@ mod tests {
         assert!(!is_safe_task_name("App", &"A".repeat(101)));
         assert!(!is_safe_task_name("App", "App & calc.exe"));
         assert!(!is_safe_task_name("App", "App\"; del /f /q C:\\"));
+    }
+
+    #[test]
+    fn registry_cleanup_stays_inside_the_product() {
+        // 产品自己的键：整棵删放行（发布者那一层不算数，产品名整段命中即可）
+        assert!(key_belongs_to_product(r"Software\App", "App"));
+        assert!(key_belongs_to_product(r"Software\pub\App\Sub", "App"));
+        assert!(key_belongs_to_product(r"software\app", "App"));
+        // 共享容器不是产品自己的键，整棵删不放行
+        assert!(!key_belongs_to_product(r"Software", "App"));
+        assert!(!key_belongs_to_product(
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            "App"
+        ));
+        // 段内包含不算整段命中；空产品名一律拒绝
+        assert!(!key_belongs_to_product(r"Software\AppBackup", "App"));
+        assert!(!key_belongs_to_product(r"Software\App", ""));
+
+        // 共享容器里只允许删本产品的值
+        assert!(value_belongs_to_product("App", "App"));
+        assert!(value_belongs_to_product("App AutoStart", "App"));
+        assert!(!value_belongs_to_product("OtherApp", "App"));
+        assert!(!value_belongs_to_product("App", ""));
+    }
+
+    #[test]
+    fn shortcut_paths_use_the_delete_root_guard() {
+        // 正常位置放行：开始菜单与桌面
+        assert!(is_safe_shortcut_path(Path::new(
+            r"C:\Users\Alice\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\App\App.lnk"
+        )));
+        assert!(is_safe_shortcut_path(Path::new(
+            r"C:\Users\Alice\Desktop\App.lnk"
+        )));
+        // 系统目录、非 `.lnk`、相对路径、`..` 一律拒绝
+        assert!(!is_safe_shortcut_path(Path::new(r"C:\Windows\x.lnk")));
+        assert!(!is_safe_shortcut_path(Path::new(
+            r"C:\Users\Alice\Desktop\App.exe"
+        )));
+        assert!(!is_safe_shortcut_path(Path::new("App.lnk")));
+        assert!(!is_safe_shortcut_path(Path::new(
+            r"C:\Users\Alice\..\App.lnk"
+        )));
     }
 
     #[test]

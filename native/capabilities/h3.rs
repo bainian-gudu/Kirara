@@ -8,7 +8,6 @@
 //! - 连接按 `(host, port, 固定配置)` 复用，空闲 / 已死连接会被清扫，池子上限 32
 //! - 证书固定语义不变，见 [`PinningMode`] / [`PinTarget`]
 //! - URL 片段里没有固定值时只做系统证书验证
-//! - [`H3Middleware::discover`] 接受任意证书并回传算出来的哈希
 
 use async_trait::async_trait;
 use bytes::{Buf, Bytes};
@@ -154,23 +153,14 @@ fn compute_cert_hash(cert_der: &[u8]) -> [u8; 32] {
 // 证书验证器：系统验证（+ 可选的固定值校验）
 // ============================================================
 
-/// 从服务器证书中发现的哈希值。
-#[derive(Debug, Clone, Default)]
-pub struct DiscoveredHashes {
-    pub spki: Option<[u8; 32]>,
-    pub cert: Option<[u8; 32]>,
-}
-
-/// 证书验证的四种形态。
+/// 证书验证的三种形态。
 enum VerifyMode {
     /// 只用系统证书验证器（URL 片段里没给固定值）。
     SystemOnly,
     /// 系统验证 + 固定值校验，关系由 [`PinningMode`] 决定。
     Pin(PinConfig),
-    /// 发现模式：接受任何证书，把算出来的哈希写进这里（`discover()` 用）。
-    Discovery(Arc<Mutex<DiscoveredHashes>>),
     /// 构造基础配置时的占位：什么证书都不接受。
-    /// 真实连接都会把验证器换成上面三种之一，这个形态不会走到握手。
+    /// 真实连接都会把验证器换成上面两种之一，这个形态不会走到握手。
     RejectAll,
 }
 
@@ -198,7 +188,6 @@ impl PinVerifier {
         match self.mode {
             VerifyMode::SystemOnly => "system",
             VerifyMode::Pin(_) => "pin",
-            VerifyMode::Discovery(_) => "discovery",
             VerifyMode::RejectAll => "reject-all",
         }
     }
@@ -286,31 +275,6 @@ impl ServerCertVerifier for PinVerifier {
                 ocsp_response,
                 now,
             ),
-            VerifyMode::Discovery(results) => {
-                let cert_der = end_entity.as_ref();
-                let spki = compute_spki_hash(cert_der);
-                let cert = compute_cert_hash(cert_der);
-                let system_trusts =
-                    self.system_trusts(end_entity, intermediates, server_name, ocsp_response, now);
-
-                match spki {
-                    Some(hash) => tracing::info!("[Discovery] SPKI SHA-256: {}", hex::encode(hash)),
-                    None => warn!("[Discovery] Failed to parse SubjectPublicKeyInfo"),
-                }
-                tracing::info!(
-                    "[Discovery] system_trusts={}, Cert SHA-256: {}",
-                    system_trusts,
-                    hex::encode(cert)
-                );
-
-                if let Ok(mut guard) = results.lock() {
-                    guard.spki = spki;
-                    guard.cert = Some(cert);
-                }
-
-                // 发现模式的目的就是拿到哈希：无论系统是否信任都接受。
-                Ok(ServerCertVerified::assertion())
-            }
             VerifyMode::Pin(config) => {
                 let cert_der = end_entity.as_ref();
                 let system_trusts =
@@ -944,38 +908,6 @@ impl H3Middleware {
             handle.abort();
         }
         debug!("[H3] Shut down complete.");
-    }
-
-    /// 发现远程服务器证书的 SPKI 和完整证书 SHA-256 哈希。
-    /// 建立一次性 QUIC 连接，通过发现模式的验证器提取哈希后关闭连接。
-    pub async fn discover(
-        &self,
-        host: &str,
-        port: u16,
-    ) -> Result<DiscoveredHashes, reqwest_middleware::Error> {
-        let results = Arc::new(Mutex::new(DiscoveredHashes::default()));
-        let norm_host = normalize_host(host);
-
-        let conn = self
-            .connect(
-                &norm_host,
-                port,
-                VerifyMode::Discovery(Arc::clone(&results)),
-            )
-            .await?;
-
-        // 执行最小 H3 握手，确保触发证书验证
-        let h3_conn = h3_quinn::Connection::new(conn);
-        let (_driver, _send_request) = h3::client::new(h3_conn).await.map_err(|e| {
-            reqwest_middleware::Error::Middleware(anyhow::anyhow!("h3 discover: {}", e))
-        })?;
-
-        let result = results
-            .lock()
-            .map_err(|_| reqwest_middleware::Error::Middleware(anyhow::anyhow!("mutex poisoned")))?
-            .clone();
-
-        Ok(result)
     }
 }
 

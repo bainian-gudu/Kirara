@@ -113,9 +113,9 @@
 | 旧文件清理 | `native/session/run.rs` 的 `legacy_delete_names` | 更新时把旧 exe / 旧卸载器名并入 `deletes`（只接受纯文件名，含分隔符的一律丢弃） |
 | 快捷方式 | `native/session/run.rs` 的 `create_shortcuts` | 开始菜单项在更新时也重建；桌面图标更新时只重建**已存在**的（含历史命名），不给没勾选的用户补建 |
 | 扩展清理参数 | `native/installer/uninstall.rs` 的 `RunUninstallArgs` | 新增 `extra_uninstall_shortcuts` / `extra_uninstall_registry` / `extra_uninstall_scheduled_tasks` / `reg_name`，全部 `#[serde(default)]` |
-| 注册表清理 | `native/installer/uninstall.rs` | `clean_extra_registry`：`HKCU` 时额外遍历 `HKEY_USERS` 下已加载的用户配置单元（跳过 `*_Classes` / `.DEFAULT` / `S-1-5-18`），错误只记日志 |
+| 注册表清理 | `native/installer/uninstall.rs` | `clean_extra_registry`：`HKCU` 时额外遍历 `HKEY_USERS` 下已加载的用户配置单元（跳过 `*_Classes` / `.DEFAULT` / `S-1-5-18`），错误只记日志。整棵删（不带 `value`）只放行键路径里含 `regName` 整段的产品键，共享容器只能删值且值名须以 `regName` 开头 —— 卸载器以管理员身份运行，配置写错一个键名就是整棵键树 |
 | 计划任务清理 | `native/installer/uninstall.rs` | `is_safe_task_name`（必须以 `regName` 开头、字符白名单、≤100）+ `clean_extra_scheduled_tasks`（`schtasks.exe` 参数数组、无 shell） |
-| 删除范围安全阀 | `native/installer/uninstall.rs` | 文件清单过 `is_safe_rel`；`userDataPath` / `extraUninstallPath` 过 `is_safe_delete_root`（绝对、无 `..`、非重解析点、不在 `%SystemRoot%`、至少两级、非受保护位置本身）；快捷方式过 `is_safe_shortcut_path`（只放行 `.lnk`） |
+| 删除范围安全阀 | `native/installer/uninstall.rs` | 文件清单过 `is_safe_rel`；`userDataPath` / `extraUninstallPath` 过 `is_safe_delete_root`（绝对、无 `..`、非重解析点、不在 `%SystemRoot%`、至少两级、非受保护位置本身）；快捷方式过 `is_safe_shortcut_path`（`.lnk` 且与 `is_safe_delete_root` 同一条） |
 | 清单越界拦截 | `native/session/plan.rs`、`native/fs/commit.rs` | 网络元数据里的文件名 / 残留清单先过 `is_safe_member`（非空 + `is_safe_rel`）；提交单元再做一次，越界的 `rel` 会让 `join_rel` 退化成安装目录本身，所以直接以 `FILE_IO_FAILED` 拒绝 |
 | ARP 卸载入口 | `native/installer/registry.rs` | `UninstallString` 整体加引号；新增 `QuietUninstallString`（`-U -S -I` 短选项，长名会被 clap 拒绝）；`tests/utils.mjs` / `tests/registry.mjs` 同步断言 |
 | 提权管道存活 | `native/ipc/manager.rs` | 不适用：上游已用 `fail_all_pending` 让在途请求立刻报错，`run()` 在发送失败时也提前返回 `IPC_ERR`；且 `ManagedElevate` 按会话创建，重试即新起 helper，不存在「永远转圈」 |

@@ -5,7 +5,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_NIGHTLY_VERSION: nightly
-  # PDB 既不进 Release 也不上传 artifact，关掉省编译时间（本地构建不受影响）
+  # 关掉 release 调试信息（本地构建不受影响）。MSVC 链接器仍会写出 PDB，
+  # 下游 test / release job 都按 *.pdb 取用，artifact 的这条通配因此保留。
   CARGO_PROFILE_RELEASE_DEBUG: "false"
 jobs:
   build:

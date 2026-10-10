@@ -10,6 +10,10 @@
 //! 3. 或让下载源被劫持（镜像 / DNS / 中间人），拿到的就不是微软的东西。
 //!
 //! 这里三条一起堵：受限目录 + 随机文件名 + 独占创建 + 执行前验微软签名。
+//!
+//! 验签与 `spawn` 之间仍留着一个窗口：落地文件对创建者本人可写，同权限的进程能在
+//! 这中间把它换掉。能这么做的只有用户自己（安装器不以更高权限运行这段），所以不为此
+//! 改走句柄传递。
 
 use std::path::{Path, PathBuf};
 
@@ -35,8 +39,15 @@ pub fn package_path(prefix: &str) -> PathBuf {
 
 /// 独占创建目标文件：`create_new` 而不是 `File::create` / `tokio::fs::write`
 /// （后两者是 CREATE_ALWAYS，路径已存在就**跟着符号链接覆盖**）。
-/// 已存在＝有人在抢这个路径，直接失败。
+/// 已存在＝有人在抢这个路径，直接失败。路径或任一父级是符号链接 / junction 也不写：
+/// 与安装流水线其它落盘点同一条。
 pub async fn create_exclusive_file(path: &Path) -> Result<tokio::io::BufWriter<tokio::fs::File>> {
+    if crate::fs::staging::has_reparse_point(path) {
+        return Err(anyhow::anyhow!(
+            "CREATE_TARGET_FILE_ERR: reparse point in {}",
+            path.display()
+        ));
+    }
     let file = tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)

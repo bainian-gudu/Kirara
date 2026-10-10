@@ -233,6 +233,10 @@ fn main() {
         !is_safe_shortcut_path(&abs("/home/devcheck/Desktop/../App.lnk")),
         "含 `..` 拒绝",
     );
+    check(
+        !is_safe_shortcut_path(&abs("/sysroot/Desktop/App.lnk")),
+        "系统根内拒绝",
+    );
 
     group("计划任务名安全阀 is_safe_task_name");
     check(is_safe_task_name("App", "App.AutoStart"), "产品名开头放行");
@@ -253,6 +257,34 @@ fn main() {
     );
     check(!is_safe_task_name("App", "App$(x)"), "命令行注入字符拒绝");
     check(!is_safe_task_name("App", "App中"), "非 ASCII 拒绝");
+
+    group("注册表清理安全阀 key_belongs_to_product / value_belongs_to_product");
+    check(key_belongs_to_product(r"Software\App", "App"), "产品键放行");
+    check(
+        key_belongs_to_product(r"Software\pub\App\Sub", "App"),
+        "发布者下的产品键放行",
+    );
+    check(key_belongs_to_product(r"software\app", "App"), "键名大小写不敏感");
+    check(
+        !key_belongs_to_product(r"Software\Microsoft\Windows\CurrentVersion\Run", "App"),
+        "共享容器拒绝整棵删",
+    );
+    check(!key_belongs_to_product(r"Software", "App"), "hive 根拒绝");
+    check(
+        !key_belongs_to_product(r"Software\AppBackup", "App"),
+        "段内包含不算整段命中",
+    );
+    check(!key_belongs_to_product(r"Software\App", ""), "空产品名拒绝键判定");
+    check(value_belongs_to_product("App", "App"), "值名等于产品名放行");
+    check(
+        value_belongs_to_product("App AutoStart", "App"),
+        "值名带产品名前缀放行",
+    );
+    check(
+        !value_belongs_to_product("OtherApp", "App"),
+        "别的产品的值拒绝",
+    );
+    check(!value_belongs_to_product("App", ""), "空产品名拒绝值判定");
 
     group("环境变量展开 expand_env_vars / expand_path_list");
     std::env::set_var("KCHECK_MYVAR", "/val");

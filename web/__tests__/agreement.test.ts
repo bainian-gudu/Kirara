@@ -65,4 +65,50 @@ describe('agreement rendering', () => {
   it('removes comments', () => {
     expect(sanitizeAgreementHtml('a<!-- hidden -->b')).toBe('ab');
   });
+
+  it('removes comments at every depth', () => {
+    expect(sanitizeAgreementHtml('<p>a<!-- in --></p><!-- out -->b')).toBe(
+      '<p>a</p>b',
+    );
+  });
+
+  it('keeps the text of unknown tags but drops dangerous ones with their content', () => {
+    const html = sanitizeAgreementHtml(
+      '<section><p>a</p></section>' +
+        '<script>alert(1)</script>' +
+        '<style>p{}</style>',
+    );
+    // 未知容器拆掉标签，正文留下
+    expect(html).not.toContain('<section');
+    expect(html).toContain('<p>a</p>');
+    // 危险标签连内容一起消失，脚本正文不会变成可见文本
+    expect(html).not.toContain('alert(1)');
+    expect(html).not.toContain('p{}');
+  });
+
+  it('drops attributes outside the allowlist', () => {
+    const html = sanitizeAgreementHtml(
+      '<p formaction="https://evil" autofocus data-x="1" onmouseover="x()">a</p>' +
+        '<img src="https://ok/i.png" srcset="https://ok/2.png 2x" width="8">',
+    );
+    expect(html).not.toContain('formaction');
+    expect(html).not.toContain('autofocus');
+    expect(html).not.toContain('data-x');
+    expect(html).not.toContain('onmouseover');
+    expect(html).not.toContain('srcset');
+    expect(html).toContain('src="https://ok/i.png"');
+    expect(html).toContain('width="8"');
+  });
+
+  it('restricts ids and forces links to open outside the window', () => {
+    const html = sanitizeAgreementHtml(
+      '<p id="sec-1">b</p><p id="1 bad">c</p>' +
+        '<a href="https://example.com" target="_self">d</a>',
+    );
+    expect(html).toContain('id="sec-1"');
+    expect(html).not.toContain('1 bad');
+    expect(html).toContain('target="_blank"');
+    expect(html).not.toContain('_self');
+    expect(html).toContain('rel="noreferrer noopener"');
+  });
 });

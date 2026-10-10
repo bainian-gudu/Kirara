@@ -5,8 +5,63 @@
  */
 import type { AgreementConfig } from './state';
 
-/** 整体删除（含内容）的标签：可执行、可提交、可嵌入外部内容、非排版。 */
-const FORBID_TAGS = new Set([
+/**
+ * 允许保留的标签。表外的标签分两种处理：危险清单整体删除，其余拆掉标签只留内容
+ * （排版容器换个名字不该让正文消失）。
+ */
+const ALLOWED_TAGS = new Set([
+  'a',
+  'abbr',
+  'b',
+  'blockquote',
+  'br',
+  'caption',
+  'code',
+  'col',
+  'colgroup',
+  'dd',
+  'del',
+  'div',
+  'dl',
+  'dt',
+  'em',
+  'figcaption',
+  'figure',
+  'h1',
+  'h2',
+  'h3',
+  'h4',
+  'h5',
+  'h6',
+  'hr',
+  'i',
+  'img',
+  'ins',
+  'li',
+  'mark',
+  'ol',
+  'p',
+  'pre',
+  'q',
+  's',
+  'small',
+  'span',
+  'strong',
+  'sub',
+  'sup',
+  'table',
+  'tbody',
+  'td',
+  'tfoot',
+  'th',
+  'thead',
+  'tr',
+  'u',
+  'ul',
+]);
+
+/** 危险标签：连同内容整体删除 —— 拆掉标签会把脚本正文当文本留在界面上。 */
+const DANGEROUS_TAGS = new Set([
   'script',
   'style',
   'link',
@@ -39,59 +94,84 @@ const FORBID_TAGS = new Set([
   'marquee',
 ]);
 
-/** 一律剥掉的属性；`on*` 前缀的事件处理器另判。 */
-const FORBID_ATTR = new Set([
-  'style',
-  'srcdoc',
-  'formaction',
-  'data',
-  'background',
-  'srcset',
-  'ping',
-  'action',
-  'method',
-  'http-equiv',
+/** 所有允许标签都接受的属性。 */
+const GLOBAL_ATTRS = new Set([
+  'align',
+  'class',
+  'colspan',
+  'dir',
+  'id',
+  'lang',
+  'rowspan',
+  'start',
+  'title',
 ]);
+
+/** 只在指定标签上允许的属性。 */
+const TAG_ATTRS: Record<string, Set<string>> = {
+  a: new Set(['href', 'target']),
+  img: new Set(['alt', 'height', 'src', 'width']),
+  li: new Set(['type', 'value']),
+  ol: new Set(['reversed', 'type']),
+  td: new Set(['headers']),
+  th: new Set(['headers', 'scope']),
+};
 
 /** 只允许 http(s) / mailto / 页内锚点，杜绝 `javascript:` / `data:` / `file:`。 */
 const ALLOWED_URI = /^(?:https?:|mailto:|#)/i;
 
-/** 取值受 `ALLOWED_URI` 约束的属性。 */
-const URI_ATTRS = new Set([
-  'href',
-  'src',
-  'cite',
-  'poster',
-  'longdesc',
-  'usemap',
-  'xlink:href',
-]);
+/** `id` 只用于页内锚点：限制成普通标识符，怪字符不参与选择器与片段匹配。 */
+const SAFE_ID = /^[A-Za-z][\w:.-]*$/;
 
-/** 白名单净化：排版标签保留，可执行 / 可提交 / 外链内容剥掉。 */
+/**
+ * 白名单净化：不在允许表里的标签与属性一律剥掉 —— 危险标签连同内容删除，其余拆标签
+ * 留内容；`on*` 事件处理器、可提交控件与内嵌外部内容因此都进不了界面。
+ * 注释在任意层级都清掉：条件注释与 mXSS 都靠它。
+ */
 export function sanitizeAgreementHtml(html: string): string {
   const doc = new DOMParser().parseFromString(html, 'text/html');
   const body = doc.body;
   for (const el of Array.from(body.querySelectorAll('*'))) {
     const tag = el.tagName.toLowerCase();
-    if (FORBID_TAGS.has(tag)) {
+    if (DANGEROUS_TAGS.has(tag)) {
       el.remove();
       continue;
     }
+    if (!ALLOWED_TAGS.has(tag)) {
+      el.replaceWith(...Array.from(el.childNodes));
+      continue;
+    }
+    const scoped = TAG_ATTRS[tag];
     for (const attr of Array.from(el.attributes)) {
       const name = attr.name.toLowerCase();
-      if (FORBID_ATTR.has(name) || name.startsWith('on')) {
+      const value = attr.value.trim();
+      const keep =
+        name === 'href'
+          ? tag === 'a' && ALLOWED_URI.test(value)
+          : name === 'src'
+            ? tag === 'img' && ALLOWED_URI.test(value)
+            : name === 'id'
+              ? SAFE_ID.test(attr.value)
+              : GLOBAL_ATTRS.has(name) || (scoped ? scoped.has(name) : false);
+      if (!keep) {
         el.removeAttribute(attr.name);
-        continue;
       }
-      if (URI_ATTRS.has(name) && !ALLOWED_URI.test(attr.value.trim())) {
-        el.removeAttribute(attr.name);
+    }
+    if (tag === 'a') {
+      // 链接一律交给系统浏览器打开，窗口内不导航。
+      el.setAttribute('rel', 'noreferrer noopener');
+      if (el.getAttribute('target') !== '_blank') {
+        el.setAttribute('target', '_blank');
       }
     }
   }
-  for (const node of Array.from(body.childNodes)) {
-    if (node.nodeType === Node.COMMENT_NODE) {
-      node.remove();
-    }
+  const comments: Node[] = [];
+  const walker = doc.createTreeWalker(body, NodeFilter.SHOW_COMMENT);
+  while (walker.nextNode()) {
+    comments.push(walker.currentNode);
+  }
+  for (const node of comments) {
+    node.parentNode?.removeChild(node);
   }
   return body.innerHTML;
 }

@@ -25,6 +25,8 @@ $script:LogicUninstallItems = @(
     @{ Kind = 'fn'; Name = 'is_safe_delete_root' }
     @{ Kind = 'fn'; Name = 'is_safe_shortcut_path' }
     @{ Kind = 'fn'; Name = 'is_safe_task_name' }
+    @{ Kind = 'fn'; Name = 'key_belongs_to_product' }
+    @{ Kind = 'fn'; Name = 'value_belongs_to_product' }
     @{ Kind = 'const'; Name = 'PER_USER_CLEANUP_ROOTS' }
     @{ Kind = 'const'; Name = 'PER_USER_DENY_LEAVES' }
     @{ Kind = 'fn'; Name = 'expand_env_vars' }

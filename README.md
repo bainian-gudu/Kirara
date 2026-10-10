@@ -52,7 +52,7 @@ pwsh build.ps1 -Force   # 已有产物也重新构建
 | --- | --- |
 | `legacyExeNames` / `legacyUninstallNames` / `legacyProgramFilesPaths` | 品牌改名后的兼容：识别旧主程序名、旧卸载器名，以及注册表没有记录时按序兜底探测的旧默认安装目录（相对 `%ProgramFiles%`） |
 | `extraUninstallLnkNames` | 卸载时清理的快捷方式文件名；用户/公共桌面与用户/公共开始菜单四处都会试 |
-| `extraUninstallRegistry` | 卸载时清理宿主自己写过的注册表项（`hive` / `key` / `value`）；`hive: HKCU` 会同时遍历已加载的其他用户配置单元 |
+| `extraUninstallRegistry` | 卸载时清理宿主自己写过的注册表项（`hive` / `key` / `value`）；不带 `value` 时只能指向键路径里含 `regName` 整段的产品键，带 `value` 时共享容器也只删该值且值名须以 `regName` 开头；`hive: HKCU` 会同时遍历已加载的其他用户配置单元 |
 | `extraUninstallScheduledTasks` | 卸载时清理的登录计划任务名；必须带 `regName` 前缀，通配符一律拒绝 |
 | `agreementFile` / `agreementFormat` / `agreementTitle` | 打包期内联用户协议正文；三个字段见「用户协议（打包期内联）」一节 |
 | `userDataPath` | 卸载勾选后清理的用户数据目录；`%VAR%` 会展开，并按已加载的用户配置单元重放，所以卸载器提权运行时也能清掉当初普通用户那份数据 |

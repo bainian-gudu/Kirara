@@ -166,7 +166,7 @@ impl H3FallbackMiddleware {
         Ok(Self { h3 })
     }
 
-    /// Get a reference to the inner H3Middleware (for shutdown, discover, etc.)
+    /// Get a reference to the inner H3Middleware (for shutdown, etc.)
     pub fn inner(&self) -> &H3Middleware {
         &self.h3
     }
