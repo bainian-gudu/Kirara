@@ -152,7 +152,7 @@ bridge 暴露两层：`error_dialog({ code, detail, subject, sid, event_id })` �
 
 ### 主题槽位
 
-打包格式不变，`\0IMAGE` 槽位继续一槽多用，识别在 `session/commands.rs::apply_theme`：`RIFF….WEBP` 魔数为图片；`28 B5 2F FD` 为 zstd 帧，解开后首个非空白字符为 `<` 是 HTML、否则是 CSS；其余按前 16 字节可打印 ASCII 视为明文 CSS，否则视为图片。识别结果进 `UiState.theme`；字节本体走资产端点：图片 `theme.webp`、CSS `theme.css`；HTML 直接替换 `index.html` 条目。`InstallerConfig.embedded_image` 不以 base64 进入任何命令返回值。空包不携带默认图片，`theme == None` 时渲染器不显示图片区域。
+打包格式不变，`\0IMAGE` 槽位继续一槽多用，识别在 `session/commands.rs::apply_theme`：`RIFF….WEBP` 魔数为图片；`28 B5 2F FD` 为 zstd 帧，解开后首个非空白字符为 `<` 是 HTML、否则是 CSS；其余按前 16 字节可打印 ASCII 视为明文 CSS，否则视为图片。识别结果进 `UiState.theme`；字节本体走资产端点：图片 `theme.webp`、CSS `theme.css`；HTML 直接替换 `index.html` 条目。`InstallerConfig.embedded_image` 不以 base64 进入任何命令返回值。空包不携带内联图片，`theme == None` 时渲染器用内置默认图，见 [左栏默认图与图片 / 图标自定义](./2026-10-10-left-art-and-icon-overrides.md)。
 
 ### 插件宿主
 

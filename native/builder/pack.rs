@@ -51,6 +51,18 @@ pub async fn pack_cli(args: PackArgs) {
         eprintln!("Warning: unrecognized config key \"{key}\" (ignored)");
     }
     resolve_agreement(&mut config, &args.config);
+    // 命令行优先；配置里的 imageFile / iconFile 次之；都没有就回退内置图与内置图标。
+    let image_file = take_pack_file(&mut config, "imageFile", &args.config);
+    let icon_file = take_pack_file(&mut config, "iconFile", &args.config);
+    let image_path = args.image.or(image_file);
+    let icon_path = args.icon.or(icon_file);
+    // 点名了图标却找不到文件时直接失败：静默保留内置图标会让人以为配置已经生效。
+    if let Some(icon) = &icon_path {
+        if !icon.is_file() {
+            eprintln!("Icon file not found: {}", icon.display());
+            return;
+        }
+    }
     let metadata = if let Some(metadata) = args.metadata {
         let metadataf = tokio::fs::read(&metadata).await;
         if metadataf.is_err() {
@@ -71,10 +83,14 @@ pub async fn pack_cli(args: PackArgs) {
     } else {
         None
     };
-    let image = if let Some(image) = args.image {
+    let image = if let Some(image) = image_path {
         let image_size = tokio::fs::metadata(&image).await;
         if image_size.is_err() {
-            eprintln!("Failed to get image size: {:?}", image_size.err());
+            eprintln!(
+                "Failed to read image {}: {:?}",
+                image.display(),
+                image_size.err()
+            );
             return;
         }
         let image_size = image_size.unwrap().len() as u32;
@@ -180,7 +196,7 @@ pub async fn pack_cli(args: PackArgs) {
         metadata,
         image,
         files,
-        icon_path: args.icon,
+        icon_path,
     };
     if let Err(err) = validate_pack_names(&config) {
         eprintln!("{err}");
@@ -197,7 +213,13 @@ pub async fn pack_cli(args: PackArgs) {
 }
 
 /// 打包配置里 builder 自己消费、不写进包内配置的键。
-const PACK_ONLY_KEYS: &[&str] = &["agreementFile", "agreementFormat", "agreementTitle"];
+const PACK_ONLY_KEYS: &[&str] = &[
+    "agreementFile",
+    "agreementFormat",
+    "agreementTitle",
+    "iconFile",
+    "imageFile",
+];
 
 /// 配置里既不是安装器字段、也不是 builder 字段的顶层键，按名字排序。
 ///
@@ -219,34 +241,48 @@ fn unknown_config_keys(config: &serde_json::Value) -> Vec<String> {
     unknown
 }
 
+/// 配置里的相对路径按配置文件所在目录解析；绝对路径原样使用。
+fn config_relative_path(value: &str, config_path: &std::path::Path) -> std::path::PathBuf {
+    let path = std::path::Path::new(value);
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(path)
+}
+
+/// 取出一个指向文件的打包期字段，并从配置里删掉它：包内配置由 `ProjectConfig`
+/// 反序列化，这些键没有消费方。空串与缺失都返回 `None`，由调用方回退默认值。
+fn take_pack_file(
+    config: &mut serde_json::Value,
+    key: &str,
+    config_path: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let obj = config.as_object_mut()?;
+    let value = obj.remove(key).and_then(|v| v.as_str().map(String::from));
+    let value = value.filter(|v| !v.is_empty())?;
+    Some(config_relative_path(&value, config_path))
+}
+
 /// 把协议源字段内联成 `agreement: { title, format, content }`，并删掉三个源字段。
 /// 安装器 / 卸载器 / 更新器都是单文件 exe，运行期没有仓库上下文，正文必须在打包期
 /// 写进配置。`agreementFile` 相对配置文件所在目录解析；读不到只警告，不中断打包
 /// （此时链接退化为纯文字）。
 fn resolve_agreement(config: &mut serde_json::Value, config_path: &std::path::Path) {
+    let path = take_pack_file(config, "agreementFile", config_path);
     let Some(obj) = config.as_object_mut() else {
         return;
     };
-    let file = obj
-        .remove("agreementFile")
-        .and_then(|v| v.as_str().map(String::from));
     let format = obj
         .remove("agreementFormat")
         .and_then(|v| v.as_str().map(String::from));
     let title = obj
         .remove("agreementTitle")
         .and_then(|v| v.as_str().map(String::from));
-    let Some(file) = file.filter(|f| !f.is_empty()) else {
+    let Some(path) = path else {
         return;
-    };
-    let path = std::path::Path::new(&file);
-    let path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        config_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join(path)
     };
     let content = match std::fs::read(&path) {
         Ok(bytes) => {

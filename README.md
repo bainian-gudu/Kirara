@@ -59,6 +59,7 @@ pwsh build.ps1 -Force   # 已有产物也重新构建
 | `extraUninstallRegistry` | 卸载时清理宿主自己写过的注册表项（`hive` / `key` / `value`）；不带 `value` 时只能指向键路径里含 `regName` 整段的产品键，带 `value` 时共享容器也只删该值且值名须以 `regName` 开头；`hive: HKCU` 会同时遍历已加载的其他用户配置单元 |
 | `extraUninstallScheduledTasks` | 卸载时清理的登录计划任务名；必须带 `regName` 前缀，通配符一律拒绝 |
 | `agreementFile` / `agreementFormat` / `agreementTitle` | 打包期内联用户协议正文；三个字段见「用户协议（打包期内联）」一节 |
+| `imageFile` / `iconFile` | 打包期内联左栏图片与程序图标；两个字段见「左栏图片与程序图标」一节 |
 | `userDataPath` | 卸载勾选后清理的用户数据目录；`%VAR%` 会展开，并按已加载的用户配置单元重放，所以卸载器提权运行时也能清掉当初普通用户那份数据 |
 
 ```jsonc
@@ -108,7 +109,29 @@ pwsh build.ps1 -Force   # 已有产物也重新构建
 }
 ```
 
-### 3. 用户协议（打包期内联）
+### 3. 左栏图片与程序图标
+
+安装界面左栏的图片与输出 exe 的图标都由配置指定，两个字段都不写进包内配置：
+
+| 字段 | 作用 |
+| --- | --- |
+| `imageFile` | 左栏图片，相对配置文件所在目录解析；内容识别为 WebP 时作图片，纯文本按 CSS 主题注入 |
+| `iconFile` | 输出 exe 的图标（`.ico`），相对配置文件所在目录解析 |
+
+```jsonc
+{
+  "imageFile": "left.webp",
+  "iconFile": "app.ico"
+}
+```
+
+两个字段都不配置时，左栏用内置图、exe 用内置图标；配置了却读不到文件时打包报错。
+`pack` 的 `--image`（`-t`）与 `--icon` 优先于配置，指向的文件不存在同样让打包失败。
+图标对三个 exe 都生效：安装器与更新器各自 `pack` 时写进映像，卸载器在安装期由安装器
+（更新时由更新器）的映像复制而来。三步 `pack` 共用同一份配置，界面与图标因此一致；
+改用命令行参数时三步要传同一份参数，否则安装器自更新会把界面换回不带自定义资源的那份。
+
+### 4. 用户协议（打包期内联）
 
 安装包是单文件 exe，运行期没有仓库上下文，协议正文在打包期读入并写进包内配置。这三个字段
 上游没有：
@@ -132,7 +155,7 @@ pwsh build.ps1 -Force   # 已有产物也重新构建
 协议正文，界面上的协议入口退化为不可点击的文字。内联了正文的安装包，安装时必须先勾选同意
 才能继续。
 
-### 4. 打包三步
+### 5. 打包三步
 
 1. 构建更新器，用于打包在便携版内等。更新器不需要被打包到离线包内。
 
@@ -140,11 +163,13 @@ pwsh build.ps1 -Force   # 已有产物也重新构建
 kirara-builder.exe pack -c kirara.config.json -o Kirara.update.exe
 ```
 
-可选：为输出的 exe 设置图标和自定义css/左侧图片：
+可选：为输出的 exe 设置图标和自定义 css / 左侧图片：
 
 ```bat
-kirara-builder.exe pack -c kirara.config.json -o Kirara.update.exe --icon icon.ico -m [custom.css | custom.webp]
+kirara-builder.exe pack -c kirara.config.json -o Kirara.update.exe --icon icon.ico -t custom.webp
 ```
+
+这两项写进配置（见「左栏图片与程序图标」一节）时三步共用一份，不必逐条传参。
 
 2. 构建Metadata、压缩应用文件
 
@@ -158,12 +183,10 @@ kirara-builder.exe gen -j 8 -i {AppDir} -m metadata.json -o hashed -r {AppId} -t
 kirara-builder.exe pack -c kirara.config.json -m metadata.json -d hashed -o Kirara.Install.exe
 ```
 
-** 如果在线包使用了自定义UI/图标，请确保在第一步生成更新器时也使用了相同的UI/图标参数，否则会影响安装器自更新能力 **
-
 4. 部署离线包到服务器上，确保可以通过json里的url下载到。在目前版本里，你不需要部署压缩产生的`hashed`文件夹和metadata文件，这些文件是在构建过程中临时使用的。
 5. 此时第一步得到的更新器可以直接作为在线安装包使用。
 
-### 5. 静默安装、卸载与指定目录
+### 6. 静默安装、卸载与指定目录
 
 安装器接受下列开关，安装与卸载都适用：
 
@@ -174,7 +197,7 @@ Kirara.Install.exe -S -D D:\App    :: 指定安装目录
 Kirara.uninst.exe  -S              :: 静默卸载
 ```
 
-### 6. 查看/提取离线包内容（kirara-builder extract）
+### 7. 查看/提取离线包内容（kirara-builder extract）
 
 用于调试/排查打包结果：
 
@@ -198,7 +221,7 @@ kirara-builder.exe extract -i Kirara.Install.exe --meta-name "Main.exe"
 
 提示：`--name` / `--meta-name` / `--all` / `--list` 四种模式互斥，一次只能用一种。
 
-### 7. 多安装源
+### 8. 多安装源
 
 如果你希望用户可以自由选择安装源，你可以指定多个Source，此时用户主动打开安装器时将在路径选择上方看到安装源选择按钮。
 
@@ -221,7 +244,7 @@ kirara-builder.exe extract -i Kirara.Install.exe --meta-name "Main.exe"
 }
 ```
 
-### 8. Mirror酱平台支持
+### 9. Mirror酱平台支持
 
 [Mirror酱](https://mirrorchyan.com) 是独立的第三方软件下载平台，提供付费的软件下载加速服务。本安装器接入了Mirror酱的API，允许用户使用Mirror酱更新软件。例如，你可以结合上述的安装源选择功能，让用户选择使用自建服务器更新还是使用Mirror酱更新。
 

@@ -11,12 +11,14 @@ pub struct PackArgs {
     pub output: PathBuf,
     #[clap(long, short = 'c', default_value = ".config.json")]
     pub config: PathBuf,
+    /// 安装界面左栏图片；不给就用配置里的 `imageFile`，都没有则用内置图
     #[clap(long, short = 't')]
     pub image: Option<PathBuf>,
     #[clap(long, short = 'm')]
     pub metadata: Option<PathBuf>,
     #[clap(long, short = 'd')]
     pub data_dir: Option<PathBuf>,
+    /// 输出 exe 的图标（.ico）；不给就用配置里的 `iconFile`，都没有则用内置图标
     #[clap(long)]
     pub icon: Option<PathBuf>,
 }

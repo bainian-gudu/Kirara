@@ -26,7 +26,7 @@
 | P1 标准目标 + 构建入口 + 产物接口 | 完成 | 目标、构建入口与产物接口已改；CI `Build` 在迁移后的 `main` 上真编并跑 13 组行为测试与单测（run `37923294286`，15 个 job 全绿），本机 WSL 只到类型检查 |
 | P2 配置、打包与升级兼容 | 完成 | 协议内联（第 2 项）、改名兼容（第 12 项）、打包器修复（第 17 项，上游等价）、未识别字段检测均已落地 |
 | P3 卸载、提权与事务性安全 | 完成 | 卸载侧安全阀与扩展清理（第 1/1b/1c/8 项）、提权管道 ACL、重解析点拦截、下载后执行验签（第 3/9 项）均已落地 |
-| P4 前端体验与隐私 | 完成 | 遥测移除（第 7 项）、协议内联 / 安全渲染 / 接受门槛（第 2 项）、弹窗 footer 布局（第 5 项）均已落地 |
+| P4 前端体验与隐私 | 完成 | 遥测移除（第 7 项）、协议内联 / 安全渲染 / 接受门槛（第 2 项）、弹窗 footer 布局（第 5 项）均已落地；左栏默认图与图片 / 图标自定义见下「界面资源：默认左栏图与图片 / 图标自定义」 |
 | P5 依赖、文档与 CI 门禁 | 完成 | 依赖替换与许可证（第 4/14/15/16 项）、CI 关闭 release PDB、README / 来源说明 / 台账均已收尾；快速检查门禁已按新根 Cargo 与 Preact 路径重做（`tools/devcheck` + `.github/workflows/devcheck.yml`，含 17 个注入用例的自检） |
 | P6 端到端兼容、发布与回退 | 完成 | 隔离打包与旧包新装 / 升级 / 卸载重演已跑通（run `37920859476`，26 项断言全绿）；`v1.0.0` tag 与 Release 已发布（run `38031416210`，16 个 job 全绿，见下「发布 v1.0.0」）；**桌面交互路径（WebView2 界面、UAC 弹窗、OneDrive 重定向目录、真实游戏进程占用）仍需在目标机器手跑** |
 
@@ -493,6 +493,37 @@ job 全绿（`build`、`unit-test`、13 组 release 行为测试、`release`）�
 `release` job 必须显式声明 job 级 `permissions: contents: write`：仓库默认的
 workflow 权限是只读，缺这条会在建 Release 那一步 403。该权限与随包交付的
 `SHA256SUMS.txt` 由 `1ab5399` 加入。
+
+## 界面资源：默认左栏图与图片 / 图标自定义
+
+上游 0.5.1 的界面在包内没有内联图片时渲染仓库自带的 `src/left.webp`；上游改成 Preact
+后换成内联的 `WizardArt` 线稿。本仓库保留原来的图：`web/left.webp`（与旧分支同一
+blob，SHA256 `c4da85669a84ff34155c225ba0670c42aea64577fc791ba452da424a3c59cd60`，
+399×454 WebP），`web/App.tsx` 在内联图片缺失时渲染它，`WizardArt` 与 `.image-default`
+样式删除。`rsbuild.config.ts` 的 `dataUriLimit` 是 `Number.MAX_SAFE_INTEGER`，图片以
+base64 data URI 内联进 `dist/index.html`——宿主 `assets.rs` 只服务 `index.html` /
+`i18n.tsv` / `theme.webp` / `theme.css` 四个路径，独立资源文件送不出去。
+
+打包侧新增两个 pack-only 键（`native/builder/pack.rs` 的 `PACK_ONLY_KEYS`），取出后从
+包内配置里删掉，所以 `ProjectConfig` 不需要认识它们：
+
+| 键 | 作用 | 缺省 |
+| --- | --- | --- |
+| `imageFile` | 内联左栏图片（`\0IMAGE` 段） | 内置 `web/left.webp` |
+| `iconFile` | 输出 exe 的图标（rcedit 写入） | 内置 `resources/icons/icon.ico` |
+
+两个键都按 `config_relative_path` 相对配置文件所在目录解析，`pack` 的 `--image` /
+`--icon` 优先；点名了文件却读不到时打包失败，不再静默回退。卸载器不单独打包，安装期
+由安装器（更新时由更新器）的映像复制而来，因此三个 exe 的图标来自同一份配置。
+
+证据：`devcheck` 的 logic 层新增 9 条断言（`take_pack_file` / `config_relative_path`，
+以及 `unknown_config_keys` 认得这两个键），172 → 181 条全绿；front 层 tsc + vitest
+通过（渲染用例改断言 `img` 的 `src`：无内联图片时等于打包进来的内置图，有内联图片时
+是 `/theme.webp`）；`pnpm rsbuild build` 产出的 `dist/index.html` 只有一份
+`data:image/webp;base64` 内联，没有独立资源文件。本机没有 Windows 工具链，`pack` 的
+真机路径由 CI 的 `build` job 覆盖。
+
+两项改动都在 `v1.0.0` 之后，不在已发布的 `kirara-builder.exe` 里。
 
 ## 未验证项（阻塞）
 

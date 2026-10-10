@@ -47,11 +47,13 @@ $script:LogicPlanItems = @(
     @{ Kind = 'fn'; Name = 'strip_install_prefix' }
 )
 
-# 打包器：协议内联与未识别配置键点名（整个 pack.rs 依赖 builder 的一堆模块，
-# 只抽这两个纯函数）。
+# 打包器：协议内联、图片 / 图标取用与未识别配置键点名（整个 pack.rs 依赖 builder
+# 的一堆模块，只抽这几个纯函数）。
 $script:LogicPackItems = @(
     @{ Kind = 'const'; Name = 'PACK_ONLY_KEYS' }
     @{ Kind = 'fn'; Name = 'unknown_config_keys' }
+    @{ Kind = 'fn'; Name = 'config_relative_path' }
+    @{ Kind = 'fn'; Name = 'take_pack_file' }
     @{ Kind = 'fn'; Name = 'resolve_agreement' }
 )
 

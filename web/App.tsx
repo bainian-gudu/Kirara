@@ -11,6 +11,7 @@ import {
   type Coded,
   type UiState,
 } from './state';
+import leftArt from './left.webp';
 import { Ready } from './screens/Ready';
 import { Running } from './screens/Running';
 import { Done } from './screens/Done';
@@ -19,7 +20,7 @@ import { SourcePanel } from './panels/SourcePanel';
 import { CdkPanel } from './panels/CdkPanel';
 import { registerPluginBridge } from './plugin-host';
 import { Dialog } from './ui/Dialog';
-import { IconClose, IconMinimize, WizardArt } from './ui/icons';
+import { IconClose, IconMinimize } from './ui/icons';
 import { Spinner } from './ui/Spinner';
 
 type Panel = 'source' | 'cdk' | null;
@@ -143,13 +144,7 @@ export function App() {
           </div>
         ) : null}
         <div class="image">
-          {ui.theme === 'image' ? (
-            <img src="/theme.webp" alt={ui.project.title} />
-          ) : (
-            <div class="image-default">
-              <WizardArt />
-            </div>
-          )}
+          <img src={ui.theme === 'image' ? '/theme.webp' : leftArt} alt={ui.project.title} />
         </div>
         <div class="right">
           <div class="title">{ui.project.title}</div>

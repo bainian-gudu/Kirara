@@ -30,7 +30,7 @@ WebView 前端（`src/`，Vue 3 + rsbuild，产物为单个内联脚本与样式
 
 - Preact + TSX，`@preact/signals` 持有唯一的 `state = signal<UiState>()`。没有 SFC、路由、状态库。
 - rsbuild 用 `@rsbuild/plugin-preact`；`inlineScripts` / `inlineStyles` / `all-in-one` 分块 / purgecss / `dataUriLimit` 配置保持。
-- `package.json` 的 `dependencies` 只有 `preact` 与 `@preact/signals`；`@sentry/cli`、`@testing-library/preact`、`jsdom`、`vitest` 在 `devDependencies`。仓库与产物中没有 `vue`、`dompurify`、`left.webp`、`.vue` 文件。
+- `package.json` 的 `dependencies` 只有 `preact` 与 `@preact/signals`；`@sentry/cli`、`@testing-library/preact`、`jsdom`、`vitest` 在 `devDependencies`。仓库与产物中没有 `vue`、`dompurify`、`.vue` 文件；内置左栏图 `web/left.webp` 见 [左栏默认图与图片 / 图标自定义](./2026-10-10-left-art-and-icon-overrides.md)。
 
 ### 目录
 
@@ -59,7 +59,7 @@ web/
 - `state.pending` 非空时渲染确认模态：文案键 `prompt.<kind>.title` / `prompt.<kind>.message`，`items` 以列表展示，按钮发 `Intent::Answer`。
 - `Ready.tsx` 的每个控件对应一个 `Intent`：路径链接 → `invoke("pick_path")` 后发 `SetPath`；源列表 → `SetSource`；两个复选框 → `SetCreateLnk` / `SetDeleteUserData`；主按钮 → `Start`；`needs_elevate` 决定盾牌图标。EULA 勾选是视图状态，默认勾选。`CdkPanel` 的输入框失焦或确定时发 `SetCdk`，按 `state.cdk` 显示校验中 / 无效（无效时 `state.cdk` 里的 `Coded` 走 `error_dialog`）。
 - 源图标：`sources[i].icon` 为 SVG 文本时以 `dangerouslySetInnerHTML` 直接内联，不消毒；来源是打包方的嵌入配置，与替换整个 HTML 处于同一信任边界。
-- 主题：`state.theme` 为 `Image` 时 `<img src="/theme.webp">`，为 `Css` 时插入 `<link rel="stylesheet" href="/theme.css">`，为 `None` 时不渲染图片区域、右侧内容占满宽度。bundle 不携带任何默认图片。
+- 主题：`state.theme` 为 `Image` 时左栏是 `<img src="/theme.webp">`，其余取值左栏是内置默认图 `web/left.webp`；为 `Css` 时另插入 `<link rel="stylesheet" href="/theme.css">`。
 - 窗口控制（无边框时的最小化 / 关闭）用 `window_minimize` / `window_close` 命令。
 
 ### 文案
@@ -104,7 +104,7 @@ Vitest + jsdom + `@testing-library/preact`。`__tests__/fixtures.ts` 提供各�
 | 判据 | 结果 |
 |---|---|
 | `dist/index.html` zstd level 22 后 ≤ 30,000 字节 | PASS：17,269 字节（rsbuild 1.5.10 production 构建，`src-tauri/build.rs` 产出的 `index.html.zst`；同一测量方法下 Vue 版为 68,026） |
-| 产物中不含 `vue`、`dompurify` 的模块，`left.webp` 不存在于仓库与产物 | PASS：`rg -i "vue|dompurify|left\.webp" dist/index.html` 零命中；`git ls-files` 无 `left.webp` 与 `.vue` |
+| 产物中不含 `vue`、`dompurify` 的模块 | PASS：`rg -i "vue|dompurify" dist/index.html` 零命中；`git ls-files` 无 `.vue` |
 | 每个 `UiState.phase` 变体与每个 `Prompt.kind` 至少一个组件测试；每个有前端入口的 `Intent` 变体至少一个"点击后发出该意图"的断言 | PASS：`render.test.tsx` 覆盖 `ready`（安装 / 更新 / 卸载）、`running`、`done` 四种结局、`failed`（`error_dialog` 后发 `dismiss`）、三种 `Prompt.kind`，以及 `set_path`、`set_source`、`set_create_lnk`、`set_delete_user_data`、`set_cdk`、`start`、`answer`、`launch`、`close`、`dismiss`；`cancel`（进行中取消，接口预留）与 `advanced`（native 专用）无前端入口 |
 | 文案完整性测试通过 | PASS：`i18n-keys.test.ts` |
 | 以 `?pluginHost=1` 加载时不渲染界面元素、不请求 `/i18n.tsv`、调用一次 `plugin_host_ready`；e2e `plugin-stub` 保持通过 | PASS：`plugin-host.test.ts`；CI e2e `test:plugin-stub` 通过 |

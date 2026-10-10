@@ -413,6 +413,8 @@ fn main() {
         "agreementFile": "USER_AGREEMENT.txt",
         "agreementFormat": "md",
         "agreementTitle": "用户协议",
+        "imageFile": "left.webp",
+        "iconFile": "app.ico",
     });
     eq(unknown_config_keys(&known), Vec::<String>::new(), "认识的键不报");
     eq(
@@ -509,6 +511,56 @@ fn main() {
         untouched,
         serde_json::json!({ "appName": "App" }),
         "没配协议时配置一个字节不动",
+    );
+
+    group("图片 / 图标取用 take_pack_file");
+    let mut image = serde_json::json!({
+        "appName": "App",
+        "imageFile": "left.webp",
+        "iconFile": "app.ico",
+    });
+    eq(
+        take_pack_file(&mut image, "imageFile", &config_path),
+        Some(agreement_dir.join("left.webp")),
+        "相对路径按配置文件所在目录解析",
+    );
+    check(image.get("imageFile").is_none(), "取走后键不再写进包内配置");
+    eq(
+        take_pack_file(&mut image, "iconFile", &config_path),
+        Some(agreement_dir.join("app.ico")),
+        "图标走同一条通道",
+    );
+    eq(
+        take_pack_file(&mut image, "imageFile", &config_path),
+        None,
+        "已取走的键再取是 None",
+    );
+    let absolute_file = scratch.join("abs").join("left.webp");
+    let mut absolute = serde_json::json!({ "imageFile": absolute_file.to_string_lossy() });
+    eq(
+        take_pack_file(&mut absolute, "imageFile", &config_path),
+        Some(absolute_file),
+        "绝对路径原样使用",
+    );
+    let mut blank = serde_json::json!({ "imageFile": "", "iconFile": 3 });
+    eq(
+        take_pack_file(&mut blank, "imageFile", &config_path),
+        None,
+        "空串按未配置处理，回退内置图",
+    );
+    eq(
+        take_pack_file(&mut blank, "iconFile", &config_path),
+        None,
+        "非字符串按未配置处理，回退内置图标",
+    );
+    check(
+        blank.get("iconFile").is_none(),
+        "类型不对的键同样被删掉，不留进包内配置",
+    );
+    eq(
+        config_relative_path("a/b.webp", &config_path),
+        agreement_dir.join("a/b.webp"),
+        "多级相对路径照常拼接",
     );
 
     group("包体识别与嵌入名 builder/local.rs、embedded_name.rs");

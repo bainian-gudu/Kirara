@@ -1,6 +1,7 @@
 import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/preact';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { App } from '../App';
+import leftArt from '../left.webp';
 import { state } from '../state';
 import { posted, resetHost } from './setup';
 import {
@@ -163,13 +164,12 @@ describe('screens', () => {
     expect(screen.queryByText('取消')).toBeNull();
   });
 
-  it('always renders the side column; default art when the package has no image', async () => {
+  it('always renders the side column; bundled art unless the package ships an image', async () => {
+    const sideArt = () => document.querySelector('.image img')?.getAttribute('src');
     await mount(ready({ theme: 'none' }));
-    expect(document.querySelector('.image .image-default svg')).not.toBeNull();
-    expect(document.querySelector('.image img')).toBeNull();
+    expect(sideArt()).toBe(leftArt);
     await mount(ready({ theme: 'image' }));
-    expect(document.querySelector('.image img')).not.toBeNull();
-    expect(document.querySelector('.image-default')).toBeNull();
+    expect(sideArt()).toBe('/theme.webp');
   });
 
   it('renders English copy when project.lang is en-US', async () => {
