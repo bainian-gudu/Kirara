@@ -96,8 +96,6 @@ progress.uninstall_done	Uninstall complete
 progress.uninstall_scan	Preparing to uninstall…
 prompt.occupied_files.message	Some files are in use and the installation may not succeed. Continue anyway? {items}
 prompt.occupied_files.title	Notice
-prompt.process_running.message	{items} is running. Close it and continue the installation?
-prompt.process_running.title	Notice
 prompt.version_mismatch.message	This installer is not the latest version. Install the latest version instead?
 prompt.version_mismatch.title	Notice
 ready.advanced	Advanced install

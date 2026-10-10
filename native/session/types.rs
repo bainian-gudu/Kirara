@@ -288,13 +288,6 @@ impl SessionResult {
         }
     }
 
-    /// 卸载流程在「主程序正在运行」的询问处被用户取消：界面回到卸载页，不算失败。
-    pub fn uninstall_cancelled() -> Self {
-        Self {
-            cancelled: true,
-            ..Self::uninstall()
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

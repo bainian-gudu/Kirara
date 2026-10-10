@@ -63,8 +63,6 @@ progress_stages! {
 }
 
 pub const PROMPT_KEYS: &[&str] = &[
-    "prompt.process_running.title",
-    "prompt.process_running.message",
     "prompt.occupied_files.title",
     "prompt.occupied_files.message",
     "prompt.version_mismatch.title",

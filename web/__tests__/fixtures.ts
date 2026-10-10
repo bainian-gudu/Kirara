@@ -130,17 +130,6 @@ export function failed(code = 'PKG_BROKEN'): UiState {
   });
 }
 
-export function pendingProcess(): UiState {
-  return ready({
-    pending: {
-      id: 'p1',
-      kind: 'process_running',
-      items: ['Demo.exe'],
-      params: {},
-    },
-  });
-}
-
 export function pendingOccupied(): UiState {
   return ready({
     pending: {

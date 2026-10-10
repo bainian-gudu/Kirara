@@ -122,7 +122,7 @@
 | 环境变量展开（第 6 项） | `native/installer/uninstall.rs` 的 `expand_env_vars` / `expand_path_list` | 在**卸载器进程内**展开 `%VAR%`（提权后 `%LOCALAPPDATA%` 是执行账户的），未知变量原样保留、`%%` 是字面 `%`；展开发生在安全阀之前 |
 | 跨用户清理（第 6 项） | `native/installer/uninstall.rs` 的 `profile_relative_tail` / `loaded_profile_roots` / `collect_all_users_cleanup_targets` / `clean_per_user_leftovers` | 从 `ProfileList\<SID>\ProfileImagePath` 枚举已加载用户，把「相对用户目录的尾巴」重放到每个用户；只放行 `AppData` / `Documents` / `Desktop` 下的产品目录，`Desktop` 只认 `.lnk`，叶子命中 Shell 容器黑名单即拒绝；勾选语义自动跟随（没勾就没有 `userDataPath`） |
 | `%TEMP%` 白名单（第 6 项） | `native/installer/uninstall.rs` 的 `is_installer_temp_artifact` / `clean_installer_temp_files` | 只认固定形状：WebView2 引导器、协议查看临时文件；只删文件不递归。运行时安装包与卸载器副本已由 staging 目录回收，不再单列。`KachinaInstaller.log` **不删**：它是本次会话的诊断记录，行为测试也要在进程退出后读它（见下「CI 回归」） |
-| 卸载前结束进程（第 6 项） | `native/session/run.rs` 的 `prepare_process` / `run_uninstall_inner` | 卸载前按当前名与历史名找安装目录内的实例，询问后结束（静默卸载直接结束）；结束后等 1s 让 WebView2 缓存释放；用户拒绝则回到卸载页（`SessionResult::uninstall_cancelled`） |
+| 卸载前结束进程（第 6 项） | `native/session/run.rs` 的 `prepare_process` / `run_uninstall_inner` | 安装、更新与卸载都按当前名与历史名找安装目录内的实例并直接结束（先按配置的 `elevate`，失败再按提权重试），失败挂 `PROCESS_KILL_FAILED`；卸载结束后等 1s 让 WebView2 缓存释放。询问式提示与 `SessionResult::uninstall_cancelled` 已移除，见 `docs/notes/implemented/2026-10-10-silent-process-exit.md` |
 
 验证证据（本机 WSL，非 Windows 运行验证）：
 

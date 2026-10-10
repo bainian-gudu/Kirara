@@ -15,7 +15,6 @@ use crate::utils::code::{log_line, Coded};
 
 #[derive(Debug, Clone, Copy)]
 pub enum PromptKind {
-    ProcessRunning,
     OccupiedFiles,
     VersionMismatch,
 }
@@ -23,7 +22,6 @@ pub enum PromptKind {
 impl PromptKind {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::ProcessRunning => "process_running",
             Self::OccupiedFiles => "occupied_files",
             Self::VersionMismatch => "version_mismatch",
         }

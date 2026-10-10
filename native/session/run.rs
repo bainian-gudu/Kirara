@@ -1175,12 +1175,7 @@ async fn run_dfs_install(
     if settings.elevate {
         let _ = run_op(mgr, true, IpcOperation::Ping, progress_noop()).await;
     }
-    if prepare_process(settings, project, ui, mgr, &latest.tag_name).await?
-        == ProcessPrep::Cancelled
-    {
-        tracing::info!("install cancelled at process-running prompt");
-        return Ok(SessionResult::cancelled(settings.is_update));
-    }
+    prepare_process(settings, project, mgr).await?;
     ui.check_cancel()?;
 
     let hash_key = latest.hash_key()?;
@@ -1639,11 +1634,11 @@ async fn pick_metadata(
 async fn prepare_process(
     settings: &Settings,
     project: &ProjectConfig,
-    ui: &LiveUi<'_>,
     mgr: &ManagedElevate,
-    _version: &str,
 ) -> anyhow::Result<ProcessPrep> {
     // 品牌改名后旧主程序可能仍在运行；按当前名与历史名一起找，只结束安装目录里的实例。
+    // 检测到就结束，不询问：主程序常驻托盘时它的 exe、`logs\` 与 WebView2 的界面缓存
+    // 都被占用，不先结束进程就装不干净、也删不干净；静默 / 非交互运行下更没人应答。
     let names = std::iter::once(&project.exe_name)
         .chain(project.legacy_exe_names.iter())
         .cloned()
@@ -1673,17 +1668,8 @@ async fn prepare_process(
     if running.is_empty() {
         return Ok(ProcessPrep::Proceed);
     }
-    if !ui
-        .confirm(Prompt {
-            id: String::new(),
-            kind: "process_running",
-            items: vec![project.app_name.clone()],
-            params: std::collections::BTreeMap::new(),
-        })
-        .await
-    {
-        return Ok(ProcessPrep::Cancelled);
-    }
+    let pids: Vec<u32> = running.iter().map(|(pid, _)| *pid).collect();
+    tracing::info!("ending {} running process(es): {pids:?}", pids.len());
     for (pid, _) in &running {
         if run_op(
             mgr,
@@ -1702,12 +1688,11 @@ async fn prepare_process(
     Ok(ProcessPrep::Killed)
 }
 
-/// 结束占用文件的进程这一步的结果：没有进程在跑、结束过、或用户在询问处取消。
+/// 结束占用文件的进程这一步的结果：没有进程在跑，或结束过（调用方据此等句柄释放）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessPrep {
     Proceed,
     Killed,
-    Cancelled,
 }
 
 /// 品牌改名后旧主程序/旧卸载器不在新清单里，更新时按配置显式清理。
@@ -3231,11 +3216,9 @@ async fn run_mirrorc(
         .await;
         return Ok(SessionResult::install(true, settings.is_update));
     }
-    if prepare_process(settings, project, ui, mgr, &version_name).await?
-        == ProcessPrep::Cancelled
-    {
+    if let Err(err) = prepare_process(settings, project, mgr).await {
         finish_staging(&staged, recovered_self, mgr).await;
-        return Ok(SessionResult::cancelled(settings.is_update));
+        return Err(err);
     }
     if ui.check_cancel().is_err() {
         finish_staging(&staged, recovered_self, mgr).await;
@@ -3488,14 +3471,10 @@ async fn run_uninstall_inner(
     log_session_start("uninstall", settings, config, project);
     ensure_helper_sees_path(settings, mgr)?;
     // 主程序常驻托盘时它的 exe、logs\ 与 WebView2 的界面缓存都被占用，不先结束进程
-    // 就会删不干净。用户拒绝则回到卸载页，不执行卸载。
-    match prepare_process(settings, project, ui, mgr, "").await? {
-        ProcessPrep::Cancelled => return Ok(SessionResult::uninstall_cancelled()),
-        ProcessPrep::Killed => {
-            // 进程退出后界面缓存还会被短暂占用
-            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-        }
-        ProcessPrep::Proceed => {}
+    // 就会删不干净。
+    if prepare_process(settings, project, mgr).await? == ProcessPrep::Killed {
+        // 进程退出后界面缓存还会被短暂占用
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
     }
     progress(ui, 0, 10.0, ProgressStage::UninstallScan, None, None, None);
     let matched =

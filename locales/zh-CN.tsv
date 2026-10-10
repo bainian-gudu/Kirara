@@ -96,8 +96,6 @@ progress.uninstall_done	卸载完成
 progress.uninstall_scan	准备卸载……
 prompt.occupied_files.message	检测到部分文件被占用，继续安装可能无法成功，是否继续？ {items}
 prompt.occupied_files.title	提示
-prompt.process_running.message	检测到{items}正在运行，是否结束进程并继续安装？
-prompt.process_running.title	提示
 prompt.version_mismatch.message	当前安装包不是最新版本，是否直接安装最新版本？
 prompt.version_mismatch.title	提示
 ready.advanced	高级安装

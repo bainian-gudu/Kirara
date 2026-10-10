@@ -11,7 +11,6 @@ import {
   doneUpdate,
   failed,
   pendingOccupied,
-  pendingProcess,
   pendingVersion,
   ready,
   readyUninstall,
@@ -215,15 +214,6 @@ describe('screens', () => {
       expect(posted.some((m) => (m as { cmd?: string }).cmd === 'error_dialog')).toBe(true);
     });
     await waitFor(() => expect(lastIntent()).toEqual({ kind: 'dismiss' }));
-  });
-
-  it('renders process_running prompt', async () => {
-    await mount(pendingProcess());
-    expect(screen.getByText('确定')).toBeTruthy();
-    fireEvent.click(screen.getByText('确定'));
-    await waitFor(() => {
-      expect(lastIntent()).toEqual({ kind: 'answer', id: 'p1', ok: true });
-    });
   });
 
   it('renders occupied_files prompt cancel', async () => {
