@@ -538,13 +538,14 @@ run `38034103145` 15 个 job 全绿。
 
 构建版本 `1.0.1-r345.3dae0c4+2610101536`。下载资产后 `sha256sum -c SHA256SUMS.txt` 通过。
 
-两个 Release 的 builder 里都能按 zstd 魔数 `28 B5 2F FD` 找到内嵌界面的帧，解出来就是
-`index.html`：
+各 Release 的 builder 里都能按 zstd 魔数 `28 B5 2F FD` 找到内嵌界面的帧（帧头紧跟
+`index.html` / `i18n.tsv` 键），解出来就是 `index.html`：
 
 | 版本 | `index.html` | 内联左栏图 | `image-default` 线稿 |
 | --- | --- | --- | --- |
 | `v1.0.0` | 62374 | 无 | 有 |
 | `v1.0.1` | 90051 | 21750 字节，与 `web/left.webp` 逐字节一致 | 无 |
+| `v1.0.2` | 90717 | 21750 字节，与 `web/left.webp` 逐字节一致 | 无 |
 
 ## 界面回归：进度页不再撑高窗口
 
@@ -577,6 +578,28 @@ WebView2 宿主桥与 i18n 表以脚本注入，界面状态经 `ui-state` 事�
 
 细节、落选方案与真机待确认项见
 `docs/notes/implemented/2026-10-10-progress-page-fits-window.md`。
+
+这两项改动与静默结束进程随 `v1.0.2` 发布，见下「发布 v1.0.2」。
+
+## 发布 v1.0.2
+
+在 `main` 的 `40017cd` 上打注解 tag `v1.0.2` 触发流水线 run `38042284050`，16 个 job
+全绿（`build`、`unit-test`、13 组 release 行为测试、`release`）。Release 标为最新版本：
+
+| 资产 | 大小 | SHA256 |
+| --- | --- | --- |
+| `kirara-builder.exe` | 7043584 | `6a8806934bf26a02dbc3499308564f93a6a0ce82f29853140bd0218d1d594ef9` |
+| `SHA256SUMS.txt` | 85 | — |
+
+构建版本 `1.0.2-r349.40017cd+2610101742`。下载资产后 `sha256sum -c SHA256SUMS.txt` 通过。
+exe 与 `v1.0.1` 同为 7043584 字节（内嵌资产帧随 PE 节按 4096 对齐，几百字节的帧变化不改变
+节大小），SHA256 不同。
+
+内嵌 `index.html` 帧压缩 42489、解出 90717，与本机 rsbuild 1.5.10 production 构建的
+`dist/index.html` 逐字节一致（SHA256
+`4f60d04b61e616483600fadb691e964f09725ec4409ce0c35f0a0e212af15c6b`）；`i18n.tsv` 帧
+压缩 4870、解出 12822，已无 `prompt.process_running.*` 键。解帧用 `libzstd` 的流式接口：
+这两个帧都没写 content size，`ZSTD_decompress` 需要事先知道解出大小。
 
 ## 未验证项（阻塞）
 
