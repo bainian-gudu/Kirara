@@ -253,8 +253,11 @@ pub fn run(
 
     let text_scale = crate::windows_text_scale_factor();
     let scale = text_scale * window::dpi_scale();
+    // 安装器、更新器与卸载器共用这份宿主代码（卸载器是安装器映像的副本），
+    // 尺寸只在这里定义，三者必然一致。高度按进度页需要留：步骤表、总体统计
+    // 与活动文件列表都要落在窗口内，列表本身可滚动。
     let width = (520.0 * scale).round() as i32;
-    let height = (250.0 * scale).round() as i32;
+    let height = (280.0 * scale).round() as i32;
 
     let hwnd = window::create(width, height).context("create window")?;
 

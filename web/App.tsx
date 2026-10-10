@@ -116,10 +116,10 @@ export function App() {
   // 没有正文时保持上游的默认勾选。`null` 表示用户还没动过，勾选态跟着协议是否内联
   // 走 —— 协议晚于挂载到达时不会把默认值定死在挂载那一刻。
   const [agreeChoice, setAgreeChoice] = useState<boolean | null>(null);
-  const agreement = ui.project.agreement;
+  const agreement = ui?.project.agreement ?? null;
   // 弹窗与主界面同处一层：弹窗自身不铺底色（见 layout.css 的 .dialog），
   // 打开时主界面整块让位，否则会从弹窗下面透出来。
-  const overlay = panel !== null || showAgreement || ui.pending !== null;
+  const overlay = ui !== null && (panel !== null || showAgreement || ui.pending !== null);
 
   useEffect(() => {
     void i18nReady().then(() => setCopyReady(true));

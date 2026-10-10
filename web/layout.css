@@ -1,6 +1,10 @@
 
+/* 窗口是固定尺寸（native 侧 520x250），内容只能自己收敛：一旦让主容器按内容长高，
+   左栏插画会被拉长、右下角按钮会被推出可视区，看起来就像窗口被撑大了。 */
 .main {
-  min-height: 100vh;
+  height: 100vh;
+  max-height: 100vh;
+  overflow: hidden;
   app-region: drag;
 }
 .init-loading {
@@ -18,7 +22,8 @@
 }
 .content {
   display: flex;
-  min-height: 100vh;
+  height: 100vh;
+  min-height: 0;
   line-height: 1.1;
   text-align: center;
   justify-content: center;
@@ -83,6 +88,11 @@
   margin-right: 6px;
   margin-left: -6px;
   padding-top: 2px;
+}
+/* 进度页的取消按钮悬浮在活动文件列表右下角，收窄并抬高，让最后一行也能滚出来。 */
+.progress > .btn-install {
+  height: 32px;
+  bottom: 12px;
 }
 .actions {
   display: flex;
@@ -157,33 +167,55 @@
   transition-timing-function: cubic-bezier(0.33, 0, 0.67, 1);
   width: 30%;
 }
+/* 步骤表横向铺开：四行竖排要吃掉 116px，250px 高的窗口装不下后面的汇总与文件列表。 */
 .step-desc {
-  padding: 14px 10px;
-  font-size: 14px;
+  padding: 8px 10px;
+  font-size: 12.5px;
   display: flex;
-  flex-direction: column;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  flex: 0 0 auto;
 }
 .substep {
   display: flex;
-  gap: 6px;
+  gap: 4px;
+  white-space: nowrap;
 }
 .substep .fui-Spinner__spinner {
-  width: 16px;
-  height: 16px;
+  width: 14px;
+  height: 14px;
   display: block;
 }
 .substep-done {
-  width: 16px;
-  height: 16px;
+  width: 14px;
+  height: 14px;
   display: block;
 }
 .substep.done {
-  font-size: 13px;
+  font-size: 12.5px;
   opacity: 0.8;
+}
+.progress {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  /* 兜底：固定部分自己就装不下时才整块滚动，正常情况下只有文件列表在滚。 */
+  overflow-y: auto;
+  app-region: no-drag;
+}
+/* 内容超出时用滚轮查看，不显示滚动条。 */
+.progress,
+.active-files {
+  scrollbar-width: none;
+}
+.progress::-webkit-scrollbar,
+.active-files::-webkit-scrollbar {
+  display: none;
 }
 .current-status {
   position: relative;
+  flex: 0 0 auto;
   max-width: 100%;
   font-size: 12px;
   opacity: 0.7;
@@ -387,8 +419,11 @@
   height: 40px;
 }
 
-.progress-summary { display: flex; gap: 16px; padding: 8px 14px; font-size: 12px; white-space: nowrap; }
-.active-files { max-height: 128px; overflow-y: auto; padding: 0 14px; font-size: 12px; app-region: no-drag; }
+.progress-summary { display: flex; gap: 16px; padding: 8px 14px; font-size: 12px; white-space: nowrap; flex: 0 0 auto; }
+/* 汇总与状态固定不动，只有文件列表在剩余高度里滚动；列表上限不再写死 128px，
+   否则窗口变矮时它会先占满再溢出。列表下边距等于浮动取消按钮高出列表底边的部分
+   （按钮高 32 + 距底 12 − 列表距底 16），列表整体落在按钮上方，不会被遮挡。 */
+.active-files { flex: 1 1 auto; min-height: 0; max-height: none; overflow-y: auto; margin-bottom: 28px; padding: 0 14px; font-size: 12px; app-region: no-drag; }
 .active-file { display: flex; gap: 8px; align-items: baseline; padding: 4px 0; }
 .active-file-name { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .active-file-counter { white-space: nowrap; font-variant-numeric: tabular-nums; }
