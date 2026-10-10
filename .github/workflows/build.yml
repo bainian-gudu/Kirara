@@ -107,6 +107,9 @@ jobs:
     needs: [build, test, unit-test]
     runs-on: windows-2022
     if: startsWith(github.ref, 'refs/tags/')
+    # 仓库默认的 workflow 权限是只读，建 Release 与上传资产要显式申请写权限
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4.0.0
@@ -123,12 +126,21 @@ jobs:
       - name: Copy Binary
         # artifact 里的 kachina-builder.exe 已由 build job 用拼接体覆盖，这里只改名交付
         run: Copy-Item "artifacts/artifact/kachina-builder.exe" "kirara-builder.exe" -Force
+      - name: Checksums
+        # 行尾用 LF 写出，下游 sha256sum -c 才能直接校验
+        run: |
+          $hash = (Get-FileHash "kirara-builder.exe" -Algorithm SHA256).Hash.ToLower()
+          [System.IO.File]::WriteAllText("$PWD/SHA256SUMS.txt", "$hash  kirara-builder.exe`n")
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          files: kirara-builder.exe
+          files: |
+            kirara-builder.exe
+            SHA256SUMS.txt
           make_latest: true
-          body: "${{ needs.build.outputs.version }}"
+          body: |
+            构建版本：${{ needs.build.outputs.version }}
+            交付产物 `kirara-builder.exe` 的 SHA256 见资产 `SHA256SUMS.txt`。
 
   test:
     needs: build
