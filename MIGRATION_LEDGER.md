@@ -28,7 +28,7 @@
 | P3 卸载、提权与事务性安全 | 完成 | 卸载侧安全阀与扩展清理（第 1/1b/1c/8 项）、提权管道 ACL、重解析点拦截、下载后执行验签（第 3/9 项）均已落地 |
 | P4 前端体验与隐私 | 完成 | 遥测移除（第 7 项）、协议内联 / 安全渲染 / 接受门槛（第 2 项）、弹窗 footer 布局（第 5 项）均已落地 |
 | P5 依赖、文档与 CI 门禁 | 完成 | 依赖替换与许可证（第 4/14/15/16 项）、CI 关闭 release PDB、README / 来源说明 / 台账均已收尾；快速检查门禁已按新根 Cargo 与 Preact 路径重做（`tools/devcheck` + `.github/workflows/devcheck.yml`，含 17 个注入用例的自检） |
-| P6 端到端兼容、发布与回退 | 部分 | 隔离打包与旧包新装 / 升级 / 卸载重演已跑通（run `37920859476`，26 项断言全绿）；**桌面交互路径（WebView2 界面、UAC 弹窗、OneDrive 重定向目录、真实游戏进程占用）未在真机手跑；tag 与 Release 未做（需明确批准）** |
+| P6 端到端兼容、发布与回退 | 完成 | 隔离打包与旧包新装 / 升级 / 卸载重演已跑通（run `37920859476`，26 项断言全绿）；`v1.0.0` tag 与 Release 已发布（run `38031416210`，16 个 job 全绿，见下「发布 v1.0.0」）；**桌面交互路径（WebView2 界面、UAC 弹窗、OneDrive 重定向目录、真实游戏进程占用）仍需在目标机器手跑** |
 
 ## 逐项处置
 
@@ -474,6 +474,26 @@ WSL 内可做的校验已做完（不需要 Windows）：
 用户目录（卸载器的跨用户重放对重定向目录只命中当前进程用户那一份）、真实游戏进程占用下的
 卸载。这些要在目标桌面机器上按 runbook 的路线 B 手跑。
 
+## 发布 v1.0.0
+
+在 `main` 的 `1ab5399` 上打注解 tag `v1.0.0` 触发流水线 run `38031416210`，16 个
+job 全绿（`build`、`unit-test`、13 组 release 行为测试、`release`）。Release 已标为
+最新版本，交付两个资产：
+
+| 资产 | 大小 | SHA256 |
+| --- | --- | --- |
+| `kirara-builder.exe` | 7022080 | `4a4400c6421a2a60617c8972c80d174b0677b95881d9c52db798828085045746` |
+| `SHA256SUMS.txt` | 85 | — |
+
+资产下载回 WSL 后 `sha256sum -c SHA256SUMS.txt` 通过。Release 正文里的构建版本为
+`1.0.0-r342.1ab5399+2610101435`：`Update Meta` 用 `git describe --tags --abbrev=0`
+取 tag 并剥掉 `v` 前缀，再拼提交计数、短 SHA 与 CST 时间戳，所以 tag 名带不带 `v`
+都不影响版本串。
+
+`release` job 必须显式声明 job 级 `permissions: contents: write`：仓库默认的
+workflow 权限是只读，缺这条会在建 Release 那一步 403。该权限与随包交付的
+`SHA256SUMS.txt` 由 `1ab5399` 加入。
+
 ## 未验证项（阻塞）
 
 - **本机没有 Windows 运行环境**：开发机是 WSL，无 MSVC 工具链与 WebView2。本机证据
@@ -488,6 +508,6 @@ WSL 内可做的校验已做完（不需要 Windows）：
   `native/utils/acl.rs` 的 SDDL 改回上游那串即可回退）、`Get-AuthenticodeSignature`
   的证书 Subject 布局（不匹配时 fail-closed，错误信息带实际 status 与 subject）、
   `%SystemRoot%\Temp` 在标准用户下的可写性、旧版本安装包的原地升级、H3 真实连接。
-- **未做的事**：tag 与 Release 需明确批准后才做；桌面交互路径（WebView2 界面、UAC
-  弹窗、OneDrive 重定向目录）要在目标 Windows 机器上按 runbook 路线 B 手跑；
-  `docs/notes/` 里少数上游笔记仍把 `msquic` 列为 C 依赖示例，属于上游文档，未改动。
+- **未做的事**：桌面交互路径（WebView2 界面、UAC 弹窗、OneDrive 重定向目录）要在
+  目标 Windows 机器上按 runbook 路线 B 手跑；`docs/notes/` 里少数上游笔记仍把
+  `msquic` 列为 C 依赖示例，属于上游文档，未改动。

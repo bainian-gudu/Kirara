@@ -30,16 +30,20 @@
 
 ## 使用方式
 
-### 1. 构建 kirara-builder.exe
+### 1. 取得 kirara-builder.exe
 
-只在 Windows 上构建（需要 MSVC 与 WebView2 相关工具链）：
+下游项目打包安装包时只需要这一个文件，不再检出本仓库源码。
+
+- 直接取发布产物：从 [Releases](https://github.com/bainian-gudu/Kirara/releases)
+  下载 `kirara-builder.exe`，并用同页的 `SHA256SUMS.txt` 校验
+  （`sha256sum -c SHA256SUMS.txt`）。
+- 自行构建（只在 Windows 上，需要 MSVC 与 WebView2 相关工具链）：
 
 ```powershell
 pwsh build.ps1          # 产物 tools\kirara-builder.exe
 pwsh build.ps1 -Force   # 已有产物也重新构建
 ```
 
-下游项目打包安装包时只需要这一个文件，不再检出本仓库源码。
 完整子命令（`pack` / `gen` / `extract` / `replace-bin` / `append`）与参数以
 `kirara-builder.exe --help` 为准。
 
