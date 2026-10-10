@@ -7,7 +7,7 @@
 | 项目 | 值 |
 | --- | --- |
 | 迁移基线 | `upstream/main` `05a14107fc024645e1ad350fd3b4dffa62ae1368`（2026-09-25） |
-| 旧分支 | `refactor/v0.5.2` `18f95534fba82c1d0d3a41c028af9c23b1a25d1c`（远端分支已清理，内容由 tag `v0.5.2` 保留） |
+| 旧分支 | `refactor/v0.5.2` `18f95534fba82c1d0d3a41c028af9c23b1a25d1c`（远端分支与 tag 均已清理） |
 | 迁移分支 | `main`（迁移期间名 `codex/migrate-upstream-main`，完成后改名并设为默认分支） |
 | 共同祖先 | 无（按行为逐项移植，不做 merge / cherry-pick） |
 
@@ -410,8 +410,7 @@ Compare recorded dump with planner
 
 ## 分支收尾
 
-- 旧内容分支 `main`（`18f9553`）已从远端删除；同一提交由 tag `v0.5.2` 保留，需要时
-  推一个分支出来即可取回。
+- 旧内容分支 `main`（`18f9553`）与对应 tag 均已从远端删除，远端不再保留该历史。
 - 迁移分支改名 `main` 并设为默认分支，远端现在只剩这一个分支。
 - 两边没有共同祖先，GitHub 拒绝 `codex/migrate-upstream-main` → `main` 的 PR
   （`no history in common`），曾用一个树拷贝的桥接提交开 PR #2 供审查；改名后该 PR
