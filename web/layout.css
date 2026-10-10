@@ -26,6 +26,10 @@
   padding: 0 16px;
   gap: 8px;
 }
+/* 弹窗不铺底色，与窗口底同色；主界面不整块让位就会从弹窗下面透出来。 */
+.content[hidden] {
+  display: none;
+}
 .desc {
   font-size: 14px;
   opacity: 0.8;
@@ -236,7 +240,6 @@
   left: 16px;
   right: 16px;
   bottom: 0;
-  background: var(--colorNeutralBackground1, #111);
   z-index: 5;
   /* 弹窗是纵向 flex：正文吃剩余高度，footer 回到文档流，两者不可能重叠。 */
   display: flex;

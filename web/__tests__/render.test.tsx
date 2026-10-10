@@ -100,6 +100,22 @@ describe('screens', () => {
     expect((screen.getByText('安装') as HTMLButtonElement).disabled).toBe(false);
   });
 
+  it('yields the main content to an open dialog', async () => {
+    const ui = ready();
+    ui.project = {
+      ...ui.project,
+      agreement: { title: '用户协议', format: 'text', content: '第一条 正文' },
+    };
+    await mount(ui);
+    // 弹窗不铺底色，主界面不整块让位就会从弹窗下面透出来。
+    const content = document.querySelector('.content') as HTMLElement;
+    expect(content.hidden).toBe(false);
+    fireEvent.click(screen.getByText('用户协议'));
+    expect(content.hidden).toBe(true);
+    fireEvent.click(screen.getByText('关闭', { selector: 'button' }));
+    expect(content.hidden).toBe(false);
+  });
+
   it('renders running progress; cancel asks for confirmation first', async () => {
     await mount(running());
     expect(screen.getByText('app.exe')).toBeTruthy();

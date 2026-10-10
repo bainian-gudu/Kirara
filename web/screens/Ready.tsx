@@ -1,29 +1,28 @@
-import { useState } from 'preact/hooks';
 import { t } from '../i18n';
 import { intent, type UiState } from '../state';
 import { invoke } from '../host';
 import { hasAgreementContent } from '../agreement';
-import { AgreementPanel } from '../panels/AgreementPanel';
 import { Checkbox } from '../ui/Checkbox';
 import { IconEdit, IconShield } from '../ui/icons';
 
 export function Ready({
   ui,
   onOpenSource,
+  agreeChoice,
+  onAgreeChange,
+  onOpenAgreement,
 }: {
   ui: UiState;
   onOpenSource: () => void;
+  agreeChoice: boolean | null;
+  onAgreeChange: (value: boolean) => void;
+  onOpenAgreement: () => void;
 }) {
   const uninstall = ui.mode === 'uninstall';
   const update = ui.mode === 'update';
-  // Renderer-local view state (not in UiState). 内联了协议正文时必须手动勾选；
-  // 没有正文时保持上游的默认勾选。`null` 表示用户还没动过，勾选态跟着协议是否内联
-  // 走 —— 协议晚于挂载到达时不会把默认值定死在挂载那一刻。
   const agreement = ui.project.agreement;
   const hasAgreement = hasAgreementContent(agreement);
-  const [agreeChoice, setAgreeChoice] = useState<boolean | null>(null);
   const agree = agreeChoice ?? !hasAgreement;
-  const [showAgreement, setShowAgreement] = useState(false);
   const source = ui.sources.find((s) => s.uri === ui.options.source_uri);
   const mirrorc = ui.options.source_uri.startsWith('mirrorc://');
   const markedKey = ui.options.mirrorc_cdk
@@ -62,10 +61,10 @@ export function Ready({
       ) : null}
       {!update && !uninstall ? (
         <div class="read">
-          <Checkbox checked={agree} onChange={setAgreeChoice} />
+          <Checkbox checked={agree} onChange={onAgreeChange} />
           {t('ready.agree')}
           {hasAgreement ? (
-            <a class="agreement-link" onClick={() => setShowAgreement(true)}>
+            <a class="agreement-link" onClick={onOpenAgreement}>
               {agreement?.title || t('ready.eula')}
             </a>
           ) : (
@@ -117,16 +116,6 @@ export function Ready({
         ) : null}
         {verb}
       </button>
-      {showAgreement && agreement && hasAgreement ? (
-        <AgreementPanel
-          agreement={agreement}
-          onClose={() => setShowAgreement(false)}
-          onAccept={() => {
-            setAgreeChoice(true);
-            setShowAgreement(false);
-          }}
-        />
-      ) : null}
     </div>
   );
 }

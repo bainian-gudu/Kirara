@@ -18,6 +18,7 @@ import { Done } from './screens/Done';
 import { Failed } from './screens/Failed';
 import { SourcePanel } from './panels/SourcePanel';
 import { CdkPanel } from './panels/CdkPanel';
+import { AgreementPanel } from './panels/AgreementPanel';
 import { registerPluginBridge } from './plugin-host';
 import { Dialog } from './ui/Dialog';
 import { IconClose, IconMinimize } from './ui/icons';
@@ -69,14 +70,28 @@ function Screen({
   ui,
   onOpenSource,
   onOpenCdk,
+  agreeChoice,
+  onAgreeChange,
+  onOpenAgreement,
 }: {
   ui: UiState;
   onOpenSource: () => void;
   onOpenCdk: () => void;
+  agreeChoice: boolean | null;
+  onAgreeChange: (value: boolean) => void;
+  onOpenAgreement: () => void;
 }) {
   const { phase } = ui;
   if (phase.kind === 'ready') {
-    return <Ready ui={ui} onOpenSource={onOpenSource} />;
+    return (
+      <Ready
+        ui={ui}
+        onOpenSource={onOpenSource}
+        agreeChoice={agreeChoice}
+        onAgreeChange={onAgreeChange}
+        onOpenAgreement={onOpenAgreement}
+      />
+    );
   }
   if (isRunning(phase)) {
     return <Running ui={ui} progress={phase} />;
@@ -96,6 +111,15 @@ export function App() {
   // 点 Mirror 卡片时记下候选 URI；确定成功才提交，取消只关面板。
   const [cdkUri, setCdkUri] = useState<string | null>(null);
   const [copyReady, setCopyReady] = useState(false);
+  const [showAgreement, setShowAgreement] = useState(false);
+  // Renderer-local view state (not in UiState). 内联了协议正文时必须手动勾选；
+  // 没有正文时保持上游的默认勾选。`null` 表示用户还没动过，勾选态跟着协议是否内联
+  // 走 —— 协议晚于挂载到达时不会把默认值定死在挂载那一刻。
+  const [agreeChoice, setAgreeChoice] = useState<boolean | null>(null);
+  const agreement = ui.project.agreement;
+  // 弹窗与主界面同处一层：弹窗自身不铺底色（见 layout.css 的 .dialog），
+  // 打开时主界面整块让位，否则会从弹窗下面透出来。
+  const overlay = panel !== null || showAgreement || ui.pending !== null;
 
   useEffect(() => {
     void i18nReady().then(() => setCopyReady(true));
@@ -132,7 +156,7 @@ export function App() {
   return (
     <div class="main">
       {ui.theme === 'css' ? <link rel="stylesheet" href="/theme.css" /> : null}
-      <div class={`content ${ui.project.borderless ? 'borderless' : ''}`}>
+      <div class={`content ${ui.project.borderless ? 'borderless' : ''}`} hidden={overlay}>
         {ui.project.borderless ? (
           <div class="controls">
             <button class="cont-minimize" onClick={() => void invoke('window_minimize')}>
@@ -153,6 +177,9 @@ export function App() {
             ui={ui}
             onOpenSource={() => setPanel('source')}
             onOpenCdk={() => setPanel('cdk')}
+            agreeChoice={agreeChoice}
+            onAgreeChange={setAgreeChoice}
+            onOpenAgreement={() => setShowAgreement(true)}
           />
         </div>
       </div>
@@ -178,6 +205,16 @@ export function App() {
           onConfirmed={() => {
             setCdkUri(null);
             setPanel(null);
+          }}
+        />
+      ) : null}
+      {showAgreement && agreement ? (
+        <AgreementPanel
+          agreement={agreement}
+          onClose={() => setShowAgreement(false)}
+          onAccept={() => {
+            setAgreeChoice(true);
+            setShowAgreement(false);
           }}
         />
       ) : null}
