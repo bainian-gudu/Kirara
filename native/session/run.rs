@@ -38,7 +38,7 @@ use crate::session::source::{
     resolve_file_location, resolve_range_urls, FileLocation, ParsedSource, SourceCtx,
 };
 use crate::session::state::{
-    ByteProgress, CancelState, FileAction, FileProgress, Phase, Progress as UiProgress,
+    CancelState, FileAction, Phase, Progress as UiProgress,
     ProgressCounter, ProgressStage, ProgressUnit, Prompt, UiState,
 };
 use crate::session::types::{version_gt, ProjectConfig, SessionResult, Settings};
@@ -1793,7 +1793,6 @@ struct FileProg {
     running: bool,
     network_pending: bool,
     action: FileAction,
-    bytes: Option<ByteProgress>,
 }
 
 struct DownloadProg {
@@ -1822,7 +1821,6 @@ impl DownloadProg {
                     running: false,
                     network_pending: network,
                     action: FileAction::Download,
-                    bytes: None,
                 })
             };
             match task {
@@ -1872,18 +1870,6 @@ impl DownloadProg {
         } else {
             None
         };
-        progress.files = self
-            .files
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| f.running)
-            .map(|(id, f)| FileProgress {
-                id: id as u32,
-                name: f.name.clone(),
-                action: f.action,
-                bytes: f.bytes.clone(),
-            })
-            .collect();
         progress
     }
 }
@@ -1912,7 +1898,6 @@ impl ProgressHandle {
                 file.size = total;
                 file.downloaded = 0;
                 file.network_pending = !source.is_local();
-                file.bytes = None;
                 file.action = FileAction::Retry;
             }
         }
@@ -1958,14 +1943,29 @@ impl ProgressHandle {
                     g.processed += file.processed.saturating_sub(state.processed[index]);
                     state.processed[index] = file.processed;
                     let target = &mut g.files[id];
+                    let previous_action = target.action;
+                    let was_running = target.running;
                     target.running = !file.finished;
                     target.size = file.work_total;
                     target.downloaded = file.completed;
                     target.action = file.action;
-                    target.bytes = file.done.map(|done| ByteProgress {
-                        done,
-                        total: file.total,
-                    });
+                    // 逐文件明细不进界面，落日志：动作切换与完成各记一行。
+                    if previous_action != file.action {
+                        tracing::info!(
+                            "[{}] {}{}",
+                            target.name,
+                            file.action.as_str(),
+                            byte_suffix(file.done, file.total),
+                        );
+                    }
+                    if was_running && file.finished {
+                        tracing::info!(
+                            "[{}] {} done{}",
+                            target.name,
+                            file.action.as_str(),
+                            byte_suffix(file.done, file.total),
+                        );
+                    }
                     if file.finished
                         || matches!(file.action, FileAction::Verify | FileAction::Flush)
                     {
@@ -2037,6 +2037,15 @@ fn format_size(size: u64) -> String {
         format!("{:.0}KB", size as f64 / 1024.0)
     } else {
         format!("{size}B")
+    }
+}
+
+/// 日志里的字节后缀：` 12.0MB / 20.0MB`，两个数都未知时为空。
+fn byte_suffix(done: Option<u64>, total: Option<u64>) -> String {
+    match (done, total) {
+        (Some(done), Some(total)) => format!(" {} / {}", format_size(done), format_size(total)),
+        (Some(done), None) => format!(" {}", format_size(done)),
+        _ => String::new(),
     }
 }
 
@@ -4077,13 +4086,17 @@ mod tests {
             assert_eq!(prog.processed, 110);
             assert_eq!(prog.network_bytes, u32::MAX as u64 + 8);
             let view = prog.render();
-            assert_eq!(view.files[0].action, FileAction::Verify);
-            assert!(view.files[0].bytes.is_none());
             assert_eq!(view.summary.unwrap().done, 100);
+            // 动作只留在执行侧（界面不再有逐文件明细），日志按它决定行内容。
+            assert_eq!(prog.files[0].action, FileAction::Verify);
+            assert_eq!(byte_suffix(Some(20), Some(20)), " 20B / 20B");
+            assert_eq!(byte_suffix(None, None), "");
         }
         reporter.action(FileAction::Flush, None);
         reporter.finish();
-        assert!(prog.lock().unwrap().render().files.is_empty());
-        assert_eq!(prog.lock().unwrap().processed, 110);
+        let mut prog = prog.lock().unwrap();
+        assert!(prog.render().summary.is_some());
+        assert!(!prog.files[0].running);
+        assert_eq!(prog.processed, 110);
     }
 }

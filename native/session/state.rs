@@ -184,7 +184,6 @@ pub struct Progress {
     pub processing_bps: Option<u64>,
     pub network_bps: Option<u64>,
     pub network_pending: bool,
-    pub files: Vec<FileProgress>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,14 +209,6 @@ pub enum ProgressUnit {
     Operations,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct FileProgress {
-    pub id: u32,
-    pub name: String,
-    pub action: FileAction,
-    pub bytes: Option<ByteProgress>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileAction {
@@ -227,12 +218,6 @@ pub enum FileAction {
     Verify,
     Flush,
     Retry,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ByteProgress {
-    pub done: u64,
-    pub total: Option<u64>,
 }
 
 impl ProgressStage {
@@ -289,7 +274,6 @@ impl Progress {
             processing_bps: None,
             network_bps: None,
             network_pending: false,
-            files: Vec::new(),
         }
     }
 

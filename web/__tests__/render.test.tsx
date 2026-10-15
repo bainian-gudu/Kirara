@@ -117,7 +117,6 @@ describe('screens', () => {
 
   it('renders running progress; cancel asks for confirmation first', async () => {
     await mount(running());
-    expect(screen.getByText('app.exe')).toBeTruthy();
     expect(screen.getByText('正在处理文件……')).toBeTruthy();
     fireEvent.click(screen.getByText('取消'));
     expect(screen.getByText('确定要取消吗？')).toBeTruthy();
@@ -134,14 +133,15 @@ describe('screens', () => {
     expect((screen.getByText('取消') as HTMLButtonElement).disabled).toBe(true);
   });
 
-  it('shows active files, explicit units and zero network speed before offline processing speed', async () => {
+  it('shows the byte summary and speed, keeping per-file detail out of the page', async () => {
     const ui = running();
     if (ui.phase.kind !== 'running') throw new Error('fixture');
-    ui.phase.files.push({ id: 2, name: 'assets/app.exe', action: 'verify', bytes: null });
     await mount(ui);
     expect(screen.getByTitle('网络接收速度').textContent).toBe('0B/s');
-    expect(screen.getByTitle('assets/app.exe')).toBeTruthy();
-    expect(screen.getByText('校验')).toBeTruthy();
+    // 逐文件明细只在日志里，界面不渲染名称与动作。
+    expect(screen.queryByTitle('assets/app.exe')).toBeNull();
+    expect(screen.queryByText('校验')).toBeNull();
+    expect(screen.getByText('1KB / 2KB')).toBeTruthy();
     ui.phase.network_pending = false;
     ui.phase.summary = { unit: 'files', done: 0, total: 0 };
     ui.phase.percent = null;
@@ -150,9 +150,7 @@ describe('screens', () => {
     expect(screen.getByText('0 / 0')).toBeTruthy();
     expect(screen.getByRole('progressbar').getAttribute('aria-valuenow')).toBeNull();
     ui.phase.summary = { unit: 'bytes', done: 0, total: null };
-    ui.phase.files = [];
     await mount(ui);
-    expect(screen.queryByTitle('assets/app.exe')).toBeNull();
     expect(screen.getByText('0B')).toBeTruthy();
   });
 

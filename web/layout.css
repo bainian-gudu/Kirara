@@ -89,11 +89,6 @@
   margin-left: -6px;
   padding-top: 2px;
 }
-/* 进度页的取消按钮悬浮在活动文件列表右下角，收窄并抬高，让最后一行也能滚出来。 */
-.progress > .btn-install {
-  height: 32px;
-  bottom: 12px;
-}
 .actions {
   display: flex;
   flex-direction: column;
@@ -108,7 +103,6 @@
   padding-left: 12px;
   font-size: 13px;
   display: flex;
-  flex-wrap: wrap;
 }
 .read a,
 .lnk a {
@@ -138,16 +132,12 @@
   font-family: Consolas, "Courier New", Microsoft Yahei;
   opacity: 0.8;
   font-size: 12px;
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 .finish-text {
   text-align: center;
   opacity: 0.9;
   width: 100%;
-  padding: 32px 10px;
+  padding: 38px 10px;
   font-size: 18px;
   display: flex;
   justify-content: center;
@@ -167,32 +157,30 @@
   transition-timing-function: cubic-bezier(0.33, 0, 0.67, 1);
   width: 30%;
 }
-/* 步骤表横向铺开：四行竖排要吃掉 116px，250px 高的窗口装不下后面的汇总与文件列表。 */
 .step-desc {
-  padding: 8px 10px;
-  font-size: 12.5px;
+  padding: 14px 10px;
+  font-size: 14px;
   display: flex;
-  flex-wrap: wrap;
-  gap: 4px 12px;
+  flex-direction: column;
+  gap: 8px;
   flex: 0 0 auto;
 }
 .substep {
   display: flex;
-  gap: 4px;
-  white-space: nowrap;
+  gap: 6px;
 }
 .substep .fui-Spinner__spinner {
-  width: 14px;
-  height: 14px;
+  width: 16px;
+  height: 16px;
   display: block;
 }
 .substep-done {
-  width: 14px;
-  height: 14px;
+  width: 16px;
+  height: 16px;
   display: block;
 }
 .substep.done {
-  font-size: 12.5px;
+  font-size: 13px;
   opacity: 0.8;
 }
 .progress {
@@ -200,17 +188,17 @@
   min-height: 0;
   display: flex;
   flex-direction: column;
-  /* 兜底：固定部分自己就装不下时才整块滚动，正常情况下只有文件列表在滚。 */
+  /* 兜底：内容自己就装不下时才整块滚动。 */
   overflow-y: auto;
+  /* 右下角浮着取消按钮（高 40 + 距底 20 − 容器内边距 16），正文不让进这条带。 */
+  padding-bottom: 44px;
   app-region: no-drag;
 }
 /* 内容超出时用滚轮查看，不显示滚动条。 */
-.progress,
-.active-files {
+.progress {
   scrollbar-width: none;
 }
-.progress::-webkit-scrollbar,
-.active-files::-webkit-scrollbar {
+.progress::-webkit-scrollbar {
   display: none;
 }
 .current-status {
@@ -223,13 +211,14 @@
   margin-top: -6px;
   font-family: Consolas, "Courier New", Microsoft Yahei;
 }
-.current-status.ellipsis {
+.current-status-line {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.current-stat {
-  margin-left: 1em;
+.d-single-stat {
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 .controls {
@@ -277,8 +266,6 @@
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  padding: 4px 8px 0;
-  box-sizing: border-box;
 }
 .dialog-body {
   flex: 1 1 auto;
@@ -292,7 +279,7 @@
   justify-content: flex-end;
   align-items: center;
   gap: 8px;
-  padding: 6px 0 10px;
+  padding: 6px 8px 10px;
 }
 /* `.btn-install` 是给主界面右下角设计的绝对定位按钮，弹窗里要回到流内。 */
 .dialog-footer .btn-install {
@@ -307,10 +294,17 @@
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
-  padding: 2px 4px;
+  overflow-x: hidden;
+  padding: 10px 12px;
+  margin: 8px 0 4px;
   font-size: 12.5px;
-  line-height: 1.6;
+  line-height: 1.8;
+  text-align: left;
+  word-break: break-word;
   user-select: text;
+  border: 1px solid var(--colorNeutralStroke1, rgba(0, 0, 0, 0.12));
+  border-radius: 4px;
+  background: var(--colorNeutralBackground2, rgba(0, 0, 0, 0.04));
   app-region: no-drag;
 }
 .agreement-body h2,
@@ -318,51 +312,63 @@
 .agreement-body h4,
 .agreement-body h5,
 .agreement-body h6 {
-  font-size: 14px;
-  margin: 10px 0 4px;
+  margin: 12px 0 6px;
+  font-size: 13.5px;
+  font-weight: 600;
+  line-height: 1.5;
 }
 .agreement-body p {
-  margin: 6px 0;
+  margin: 0 0 8px;
 }
 .agreement-body ul,
 .agreement-body ol {
-  margin: 6px 0;
+  margin: 0 0 8px;
   padding-left: 20px;
 }
+.agreement-body li {
+  margin: 2px 0;
+}
 .agreement-body blockquote {
-  margin: 6px 0;
-  padding-left: 8px;
-  border-left: 2px solid currentColor;
-  opacity: 0.85;
+  margin: 8px 0;
+  padding: 4px 10px;
+  border-left: 3px solid var(--colorBrandStroke1, #0f6cbd);
 }
 .agreement-body pre {
-  margin: 6px 0;
-  padding: 6px 8px;
+  margin: 8px 0;
+  padding: 8px 10px;
   border-radius: 4px;
-  background: rgba(127, 127, 127, 0.18);
+  background: rgba(0, 0, 0, 0.06);
   overflow-x: auto;
 }
 .agreement-body code {
-  font-family: Consolas, monospace;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12px;
+}
+.agreement-body hr {
+  margin: 10px 0;
+  border: 0;
+  border-top: 1px solid var(--colorNeutralStroke1, rgba(0, 0, 0, 0.12));
 }
 .agreement-body a {
-  color: #6cb6ff;
-  text-decoration: underline;
+  color: var(--colorBrandForegroundLink, #0f6cbd);
   cursor: pointer;
 }
 .agreement-body img {
   max-width: 100%;
 }
-.agreement-plain {
+.agreement-body .agreement-plain {
+  margin: 0;
   white-space: pre-wrap;
+  font-family: inherit;
 }
 .agreement-link {
-  cursor: pointer;
   text-decoration: underline;
-  margin-left: 4px;
+  text-underline-offset: 2px;
+  cursor: pointer;
 }
 .agreement-link-off {
-  margin-left: 4px;
+  cursor: default;
+  text-decoration: none;
 }
 .prompt-items {
   font-size: 12px;
@@ -374,7 +380,8 @@
 }
 .cdk-input {
   app-region: no-drag;
-  margin: 20px 10px 12px;
+  margin: 30px 10px;
+  margin-bottom: 48px;
   width: 320px;
 }
 .cdk-input input {
@@ -419,13 +426,5 @@
   height: 40px;
 }
 
-.progress-summary { display: flex; gap: 16px; padding: 8px 14px; font-size: 12px; white-space: nowrap; flex: 0 0 auto; }
-/* 汇总与状态固定不动，只有文件列表在剩余高度里滚动；列表上限不再写死 128px，
-   否则窗口变矮时它会先占满再溢出。列表下边距等于浮动取消按钮高出列表底边的部分
-   （按钮高 32 + 距底 12 − 列表距底 16），列表整体落在按钮上方，不会被遮挡。 */
-.active-files { flex: 1 1 auto; min-height: 0; max-height: none; overflow-y: auto; margin-bottom: 28px; padding: 0 14px; font-size: 12px; app-region: no-drag; }
-.active-file { display: flex; gap: 8px; align-items: baseline; padding: 4px 0; }
-.active-file-name { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.active-file-counter { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .progress-bar.indeterminate { width: 30%; animation: progress-indeterminate 1.5s infinite linear; }
 @keyframes progress-indeterminate { from { left: -30%; } to { left: 100%; } }

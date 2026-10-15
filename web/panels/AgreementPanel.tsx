@@ -10,10 +10,12 @@ import { Dialog } from '../ui/Dialog';
  */
 export function AgreementPanel({
   agreement,
+  product,
   onClose,
   onAccept,
 }: {
   agreement: AgreementConfig;
+  product: string;
   onClose: () => void;
   onAccept: () => void;
 }) {
@@ -32,6 +34,9 @@ export function AgreementPanel({
   return (
     <Dialog
       title={<div class="title">{agreement.title || t('ready.eula')}</div>}
+      desc={
+        <div class="desc">{t('dialog.agreement_hint', { title: product })}</div>
+      }
       footer={
         <>
           <button class="btn btn-install btn-install-2rd neutral" onClick={onClose}>

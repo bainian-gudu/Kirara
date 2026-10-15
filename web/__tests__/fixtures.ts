@@ -64,7 +64,6 @@ export function running(): UiState {
       cancel: 'available',
       summary: { unit: 'bytes', done: 1024, total: 2048 },
       processing_bps: 1024, network_bps: 0, network_pending: true,
-      files: [{ id: 1, name: 'app.exe', action: 'download', bytes: { done: 1024, total: 2048 } }],
     },
   });
 }

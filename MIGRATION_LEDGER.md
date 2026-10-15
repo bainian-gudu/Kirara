@@ -550,31 +550,25 @@ run `38034103145` 15 个 job 全绿。
 ## 界面回归：进度页不再撑高窗口
 
 真机上看到的现象是安装过程中窗口像被撑大又恢复、检验信息把窗口向下顶开。原因在
-`web/layout.css`：`.main` / `.content` 用 `min-height: 100vh`，而进度页比旧分支多出
-步骤表、总体统计与活动文件列表，内容比 520×250 客户区高 70~130px 时整行被撑高，
-左栏插画跟着被拉伸，绝对定位在 `.right` 底部的取消按钮被推出窗口，进度条压住列表
-最后一行。
+`web/layout.css`：`.main` / `.content` 用 `min-height: 100vh`，而进度页的内容比
+520×250 客户区高 70~130px 时整行被撑高，左栏插画跟着被拉伸，绝对定位在 `.right`
+底部的取消按钮被推出窗口，进度条压住内容最后一行。
 
 | 改动 | 落点 | 说明 |
 | --- | --- | --- |
 | 窗口尺寸 | `native/host/mod.rs` | 客户区 520×250 → 520×280；尺寸只此一处，安装器 / 更新器 / 卸载器（安装器映像的副本）共用，三者必然一致 |
 | 主容器收敛 | `web/layout.css` | `.main` / `.content` 固定 `height: 100vh; max-height: 100vh; overflow: hidden`，窗口高度不随内容变化 |
-| 进度块 | `web/layout.css` 的 `.progress` | `flex: 1 1 auto; min-height: 0`；步骤表 / 状态 / 统计 `flex: 0 0 auto`，只有活动文件列表在剩余高度里滚动且不显示滚动条，列表下边距 28px 让它整体落在浮动取消按钮上方 |
-| 步骤表 | `web/layout.css` 的 `.step-desc` / `.substep` | 四步横排并允许换行（12.5px 字号、14px 图标），116px → 50px |
-| 取消按钮 | `web/layout.css` 的 `.progress > .btn-install` | 32px 高、距底 12px，不压住列表最后一行 |
+| 进度块 | `web/layout.css` 的 `.progress` | `flex: 1 1 auto; min-height: 0; overflow-y: auto`，不显示滚动条；下内边距 44px 等于浮动取消按钮占用的条带 |
 | 类型错误 | `web/App.tsx` | `overlay` 在 `ui` 空值判断之前取值，devcheck front 层 `tsc --noEmit` 报 TS18047；这是 CI run `38039212824` 里 `Devcheck` 失败的唯一原因 |
 
 证据（本机 WSL，非 Windows 运行验证）：`dist/index.html` 由 rsbuild 1.5.10 production
-构建产出，在 chrome-headless-shell 155.0.8059.39 中按 520×280 与 650×350 加载，
-WebView2 宿主桥与 i18n 表以脚本注入，界面状态经 `ui-state` 事件推送。全部夹具下
+构建产出，在 chrome-headless 155.0.8059.79 中加载，WebView2 宿主桥与 i18n 表以脚本
+注入，界面状态经 `ui-state` 事件推送。全部夹具下
 `document.documentElement.scrollHeight` 与 `.content` 高度都等于视口高度（未收敛前
-同一条件下量到 271 与 380.7）；插画容器恒为 168×226；取消按钮 236..268、进度条
-276..280 不随列表滚动移动；列表矩形 170.7..236 与按钮 236..268 相邻不相交；12 个活动
-文件时列表滚动 189px，`offsetWidth - clientWidth` 为 0（不占滚动条宽度）；step 2 +
-2 个文件与 step 3 + 3 个文件滚动量为 0。`pnpm test`
+同一条件下量到 271 与 380.7）；插画容器恒为 168×226；进度条恒在 276..280。`pnpm test`
 41 用例全绿，`tools/devcheck/devcheck.ps1` 七层通过（rust 层因缺 MSVC 跳过），
-`cargo check --target x86_64-pc-windows-msvc --all-targets` 0 warning / 0 error
-（假工具链仅存在于 `/tmp`）。
+`cargo check --target x86_64-pc-windows-msvc --all-targets` 退出码 0（假工具链仅存在于
+`/tmp`）。
 
 细节、落选方案与真机待确认项见
 `docs/notes/implemented/2026-10-10-progress-page-fits-window.md`。
@@ -600,6 +594,37 @@ exe 与 `v1.0.1` 同为 7043584 字节（内嵌资产帧随 PE 节按 4096 对�
 `4f60d04b61e616483600fadb691e964f09725ec4409ce0c35f0a0e212af15c6b`）；`i18n.tsv` 帧
 压缩 4870、解出 12822，已无 `prompt.process_running.*` 键。解帧用 `libzstd` 的流式接口：
 这两个帧都没写 content size，`ZSTD_decompress` 需要事先知道解出大小。
+
+## 界面回退到 refactor/v0.5.2 样式
+
+用户要求界面完全换成旧版样式，进度页不再显示逐文件检验明细、只留 `12.0MB / 40.0MB
+(3.0MB/s)` 与进度条，明细记录到日志。外观取值逐条对齐 `refactor/v0.5.2` 的
+`src/index.css` / `src/App.vue` / `src/Dialog.vue`。
+
+| 改动 | 落点 | 说明 |
+| --- | --- | --- |
+| 步骤表与状态 | `web/layout.css` 的 `.step-desc` / `.substep` / `.current-status` | 回到竖排 14px / 8px 间距 / 16px 图标；状态行单行省略（全文进 `title`），统计行 `12.0MB / 40.0MB (3.0MB/s)` |
+| 进度块 | `web/layout.css` 的 `.progress` | 保留 `flex: 1 1 auto; min-height: 0; overflow-y: auto` 与隐藏滚动条，新增 44px 下内边距给浮动取消按钮留位 |
+| 取消按钮 | `web/layout.css` | 去掉 32px 特例，回到 `.btn-install` 的 40px / 距底 20px |
+| 弹窗与协议 | `web/layout.css` 的 `.dialog` / `.dialog-footer` / `.agreement-body` | 弹窗去掉自身内边距，footer `6px 8px 10px`；协议正文回到带边框与浅底的卡片，标题字号 13.5px/600，行高 1.8，引用块 3px 品牌色左边框，新增 `hr` 分隔线 |
+| 协议说明行 | `web/panels/AgreementPanel.tsx`、`locales/*.tsv` | 新增 `dialog.agreement_hint`，标题下显示「请在使用 {title} 前完整阅读以下条款。」 |
+| 确认页 | `web/layout.css` 的 `.read` / `.lnk` / `.more` / `.cdk-input` | 去掉换行与截断，CDK 输入框回到 `30px 10px / 48px` 外边距 |
+| 逐文件明细 | `native/session/state.rs`、`web/state.ts` | 删除 `Progress.files`、`FileProgress`、`ByteProgress`；`FileAction` 保留（执行侧 IPC 快照与日志行仍用） |
+| 明细落日志 | `native/session/run.rs` 的 `ProgressHandle::callback` | 动作切换与任务完成各记一行 INFO，字节后缀由 `byte_suffix` 格式化 |
+| native 路径 | `native/host/native.rs` 的 `progress_current` | 同步去掉明细行，两个渲染器语义一致 |
+| 文案键 | `locales/*.tsv` | 新增 `dialog.agreement_hint`，删除 6 个 `file_action.*`（界面不再渲染动作名）；两个文件各 155 行，键集一致 |
+
+证据（本机 WSL，非 Windows 运行验证）：`dist/index.html` 由 rsbuild 1.5.10 production
+构建产出（90,280 字节），在 chrome-headless 155.0.8059.79 中按 520×280 与 520×250 加载。
+520×280 下 `running`、`runningStep3`、`runningLongStatus` 三种夹具的文本行与取消按钮
+重叠数均为 0，`.progress` 的 `scrollHeight` 与 `clientHeight` 同为 195，进度条恒在
+276..280；520×250 下后两种夹具各量到 8 处重叠，确认窗口高度不能回到 250。协议弹窗
+`.dialog` 4..280 / 16..504、正文卡片 75..232 带边框与浅底。`pnpm exec tsc --noEmit` 无
+输出，`pnpm test` 41 用例全绿，`tools/devcheck/devcheck.ps1` 七层通过（rust 层因缺 MSVC
+跳过），`cargo check --target x86_64-pc-windows-msvc --all-targets` 退出码 0。
+
+细节、落选方案与真机待确认项见
+`docs/notes/implemented/2026-10-15-ui-matches-v052.md`。
 
 ## 未验证项（阻塞）
 

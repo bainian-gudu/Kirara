@@ -53,6 +53,7 @@ WEBVIEW2_FAULT	安装界面无法显示，请重新运行安装器
 WEBVIEW2_REQUIRED	该安装源需要 WebView2，请使用「高级安装」
 dialog.agreement_accept	我已阅读并同意
 dialog.agreement_close	关闭
+dialog.agreement_hint	请在使用 {title} 前完整阅读以下条款。
 dialog.cancel	取消
 dialog.copy	复制
 dialog.crash	安装程序发生内部错误，已终止运行。请重新运行安装程序。
@@ -152,9 +153,3 @@ progress.write_registry	写入注册表……
 running.cancelling	正在取消，等待任务结束并清理……
 running.network_speed	网络接收速度
 running.processing_speed	文件处理速度
-file_action.download	下载
-file_action.extract	解压
-file_action.patch	修补
-file_action.verify	校验
-file_action.flush	写入磁盘
-file_action.retry	重试

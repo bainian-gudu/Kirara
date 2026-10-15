@@ -1,6 +1,6 @@
 # 安装过程信息展示对齐
 
-Status: proposed
+Status: rejected — 活动文件列表与逐文件明细被否决：进度页只保留总体字节量与速度，明细记入日志，见 [界面复刻 refactor/v0.5.2 外观，逐文件明细只记日志](../implemented/2026-10-15-ui-matches-v052.md)。提案中的速度、总体计数、取消状态与计量单位已落地。
 
 ## Problem
 

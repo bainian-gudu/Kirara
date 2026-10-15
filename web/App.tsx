@@ -211,6 +211,7 @@ export function App() {
       {showAgreement && agreement ? (
         <AgreementPanel
           agreement={agreement}
+          product={ui.project.title}
           onClose={() => setShowAgreement(false)}
           onAccept={() => {
             setAgreeChoice(true);

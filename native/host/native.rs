@@ -855,19 +855,6 @@ fn progress_current(p: &Progress) -> String {
     if let Some(speed) = speed {
         text.push_str(&format!("  {}/s", i18n::format_size(speed)));
     }
-    for file in &p.files {
-        text.push_str(&format!(
-            "\n{}  {}",
-            file.name,
-            i18n::t(&format!("file_action.{}", file.action.as_str()), &[])
-        ));
-        if let Some(bytes) = &file.bytes {
-            text.push_str(&format!("  {}", i18n::format_size(bytes.done)));
-            if let Some(total) = bytes.total {
-                text.push_str(&format!(" / {}", i18n::format_size(total)));
-            }
-        }
-    }
     text
 }
 

@@ -53,6 +53,7 @@ WEBVIEW2_FAULT	The installer window could not be displayed. Run the installer ag
 WEBVIEW2_REQUIRED	This source requires WebView2. Use "Advanced install"
 dialog.agreement_accept	I have read and agree
 dialog.agreement_close	Close
+dialog.agreement_hint	Please read the following terms in full before using {title}.
 dialog.cancel	Cancel
 dialog.copy	Copy
 dialog.crash	The installer encountered an internal error and has stopped. Please run it again.
@@ -152,9 +153,3 @@ progress.write_registry	Writing registry…
 running.cancelling	Cancelling, waiting for tasks and cleanup…
 running.network_speed	Network receive speed
 running.processing_speed	File processing speed
-file_action.download	Download
-file_action.extract	Extract
-file_action.patch	Patch
-file_action.verify	Verify
-file_action.flush	Flush
-file_action.retry	Retry

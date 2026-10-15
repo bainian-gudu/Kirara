@@ -38,7 +38,11 @@ pub struct UiState {
     pub pending: Option<Prompt>,     // 有值即显示模态确认
 }
 
-pub struct Progress { sub_step: u32, percent: f64, stage: &'static str, subject: Option<String>, done: Option<u64>, total: Option<u64> }
+pub struct Progress {
+    step: Option<u8>, stage: ProgressStage, subject: Option<String>, percent: Option<f64>,
+    cancel: CancelState, summary: Option<ProgressCounter>,
+    processing_bps: Option<u64>, network_bps: Option<u64>, network_pending: bool,
+}
 pub struct Prompt { id: String, kind: &'static str, items: Vec<String>, params: BTreeMap<&'static str, String> }
 
 pub enum Intent {
@@ -134,7 +138,7 @@ bridge 暴露两层：`error_dialog({ code, detail, subject, sid, event_id })` �
 
 ### 进度阶段键
 
-`stage` 取值与文案键 `progress.<stage>` 一一对应，插值参数在括号内：`prepare`、`metadata`、`hash_scan`、`plan`、`download(subject, done, total)`、`patch(subject)`、`extract(subject, done, total)`、`delete(subject)`、`runtime_download(subject, done, total)`、`runtime_install(subject)`、`shortcut`、`registry`、`finalize`、`uninstall_scan`、`uninstall_delete(subject, done, total)`、`mirrorc_metadata`、`mirrorc_download(done, total)`、`mirrorc_verify`、`install_done`、`already_latest`、`uninstall_done`。结局按三种分开是因为三者文案不同、渲染器不能从 `Phase::Done` 之外的信息推出该显示哪句。`done` / `total` 为字节数的阶段列在 `session/state.rs::BYTE_STAGES`（`download`、`runtime_download`、`mirrorc_download`），其余按计数解释；前端 `screens/Running.tsx` 持同一列表。步骤标题为文案键 `step.default.<n>` / `step.mirrorc.<n>`，渲染器按当前源是否为 `mirrorc://` 选择。
+`stage` 取值与文案键 `progress.<stage>` 一一对应，由 `session/state.rs::progress_stages!` 一处定义，`ProgressStage::i18n_key` 给出键名。阶段共十七个：`prepare`、`fetch_metadata`、`scan_files`、`prepare_download`、`create_download_session`、`process_files`、`download_archive`、`verify_archive`、`extract_archive`、`commit`、`download_runtime`、`install_runtime`、`create_shortcuts`、`write_registry`、`finalize`、`uninstall_scan`、`uninstall_delete`；需要插值对象的阶段（`extract_archive`、`download_runtime`、`install_runtime`）取 `{subject}`。计量单位由 `ProgressStage::unit` 决定：`process_files` / `download_archive` / `download_runtime` 为字节，`commit` 为操作数，其余为文件数；渲染器按 `summary.unit` 选择格式化方式，不再各自维护阶段名单。步骤标题为文案键 `step.default.<n>` / `step.mirrorc.<n>`，渲染器按当前源是否为 `mirrorc://` 选择。
 
 ### 计数遥测
 

@@ -75,19 +75,22 @@ export function Running({ ui, progress }: { ui: UiState; progress: Progress }) {
           ) : null,
         )}
       </div>
-      <div class="current-status">{status}</div>
-      <div class="progress-summary">
-        {stat !== null ? <span>{stat}</span> : null}
-        {speed !== null ? <span title={speedLabel}>{formatSize(speed)}/s</span> : null}
-      </div>
-      <div class="active-files">
-        {progress.files.map((file) => (
-          <div class="active-file" key={file.id}>
-            <span class="active-file-name" title={file.name}>{file.name}</span>
-            <span>{t('file_action.' + file.action)}</span>
-            {file.bytes !== null ? <span class="active-file-counter">{counter(file.bytes, true)}</span> : null}
-          </div>
-        ))}
+      {/* 逐文件的进度明细只进日志，界面只留总体字节量与速度。 */}
+      <div class="current-status">
+        {/* 状态行只占一行：换行会把统计顶到右下角的取消按钮上，全文见 title。 */}
+        <div class="current-status-line" title={status}>
+          {status}
+        </div>
+        <div class="d-single-stat">
+          {stat !== null ? <span>{stat}</span> : null}
+          {speed !== null ? (
+            <>
+              {' ('}
+              <span title={speedLabel}>{formatSize(speed)}/s</span>
+              {')'}
+            </>
+          ) : null}
+        </div>
       </div>
       <div class={`progress-bar ${progress.percent === null ? 'indeterminate' : ''}`}
         role="progressbar" aria-valuenow={progress.percent ?? undefined}
