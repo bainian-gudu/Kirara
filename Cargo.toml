@@ -87,7 +87,7 @@ windows-registry = "0.5"
 # 不再用 xytoki/zip2 fork：它只把 `read.rs` 的 UTF-8 判定写死成 true。这里改用
 # crates.io 的 zip，并在 native/thirdparty/mirrorc.rs 里按 name_raw() 自己解条目名。
 # deflate 走纯 Rust 的 zlib-rs 后端，不引入新的 C 依赖。
-zip = { version = "8.6", default-features = false, features = [
+zip = { version = "9", default-features = false, features = [
     "deflate-flate2-zlib-rs",
     "deflate64",
     "zstd",
