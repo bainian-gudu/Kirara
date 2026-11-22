@@ -277,7 +277,8 @@ async function main() {
   step('旧包装入');
   await clearLogFile();
   assertExitOk(
-    await runInstaller(oldPackage, [FLAGS, '-D', installDir], '旧包安装', '10m'),
+    // 上游 runInstaller 第 4 参是 cwd（超时走 waitForProcess 默认 3 分钟），不再传 '10m'。
+    await runInstaller(oldPackage, [FLAGS, '-D', installDir], '旧包安装'),
     '旧包安装',
   );
   for (const name of APP_FILES) {
@@ -301,7 +302,7 @@ async function main() {
 
   step('升级到新包');
   assertExitOk(
-    await runInstaller(newPackage, [FLAGS, '-D', installDir], '新包升级', '10m'),
+    await runInstaller(newPackage, [FLAGS, '-D', installDir], '新包升级'),
     '新包升级',
   );
   const upgraded = await findUninstallRecord();
@@ -322,7 +323,6 @@ async function main() {
       path.join(installDir, `${APP}.uninst.exe`),
       [FLAGS],
       '新卸载器',
-      '10m',
     ),
     '新卸载器',
   );
