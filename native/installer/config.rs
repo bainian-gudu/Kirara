@@ -1,14 +1,14 @@
 use crate::{
     cli::arg::InstallArgs,
-    local::{get_config_from_embedded, get_embedded, mmap, Embedded},
-    utils::{error::TAResult, uac::check_elevated},
+    local::{get_config_from_embedded, get_embedded, mmap},
+    pack_format::Embedded,
+    utils::uac::check_elevated,
 };
 use anyhow::Context;
-use serde::Serialize;
 use serde_json::Value;
 use std::path::Path;
 
-#[derive(Serialize, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub struct InstallerConfig {
     pub install_path: String,
     pub install_path_exists: bool,
@@ -18,11 +18,10 @@ pub struct InstallerConfig {
     pub embedded_index: Option<Vec<Embedded>>,
     pub embedded_config: Option<Value>,
     pub enbedded_metadata: Option<crate::utils::metadata::RepoMetadata>,
-    pub embedded_image: Option<String>,
+    pub embedded_image: Option<Vec<u8>>,
     pub exe_path: String,
     pub args: crate::cli::arg::InstallArgs,
     pub elevated: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub preset: Option<crate::session::types::SessionInput>,
 }
 
@@ -39,15 +38,14 @@ pub async fn get_config_pre(
     let mut embedded_image = None;
     if scan_exe {
         let file = mmap().await;
-        if let Ok(embedded_files_res) = get_embedded(file).await {
-            if let Ok(res) = get_config_from_embedded(&embedded_files_res).await {
-                embedded_config = res.0;
-                enbedded_metadata = res.1;
-                embedded_index = res.2;
-                embedded_image = res.3;
-            }
-            embedded_files = Some(embedded_files_res);
+        let embedded_files_res = get_embedded(file);
+        if let Ok(res) = get_config_from_embedded(&embedded_files_res).await {
+            embedded_config = res.0;
+            enbedded_metadata = res.1;
+            embedded_index = res.2;
+            embedded_image = res.3;
         }
+        embedded_files = Some(embedded_files_res);
         #[cfg(debug_assertions)]
         {
             if embedded_config.is_none() {
@@ -74,10 +72,7 @@ pub async fn get_config_pre(
                     let image_bin = exe_dir.join(".image.bin");
                     if image_bin.exists() {
                         if let Ok(image_content) = tokio::fs::read(&image_bin).await {
-                            use base64::Engine;
-                            embedded_image = Some(
-                                base64::engine::general_purpose::STANDARD.encode(&image_content),
-                            );
+                            embedded_image = Some(image_content);
                         }
                     }
                 }
@@ -122,13 +117,27 @@ pub async fn get_config_pre(
 }
 
 impl InstallerConfig {
+    /// Every block the package's `\0INDEX` lists was found by the scan where
+    /// the index places it; a truncated or damaged package fails this.
+    pub fn index_matches_blocks(&self) -> bool {
+        let (Some(index), Some(files)) = (&self.embedded_index, &self.embedded_files) else {
+            return true;
+        };
+        index.iter().all(|i| {
+            files
+                .iter()
+                .find(|e| e.name == i.name)
+                .is_some_and(|e| e.offset == i.offset && e.raw_offset == i.raw_offset)
+        })
+    }
+
     pub fn fill(
         mut self,
         install_path: &Path,
         install_path_exists: bool,
         install_path_source: &'static str,
     ) -> InstallerConfig {
-        self.install_path = install_path.to_string_lossy().to_string();
+        self.install_path = crate::utils::path::long_path(&install_path.to_string_lossy());
         self.install_path_exists = install_path_exists;
         self.install_path_source = install_path_source;
         self
@@ -236,10 +245,4 @@ fn string_list(embedded: &Value, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-pub async fn get_installer_config(args: &InstallArgs, scan_exe: bool) -> TAResult<InstallerConfig> {
-    resolve_installer_config(args.clone(), scan_exe)
-        .await
-        .map_err(crate::utils::error::TACommandError::new)
 }

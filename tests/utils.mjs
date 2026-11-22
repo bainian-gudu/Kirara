@@ -83,39 +83,84 @@ export async function removeUserShortcuts(appName) {
   await fs.remove(path.join(programs, appName));
 }
 
+/** 新安装建的桌面与开始菜单快捷方式都指向 `<installDir>\<exeName>`、起始位置为安装目录；返回不符项。 */
+export async function verifyUserShortcuts(appName, installDir, exeName) {
+  const { $, usePwsh } = await import('zx');
+  usePwsh();
+  const failed = [];
+  const expectedTarget = path.join(installDir, exeName).toLowerCase();
+  const desktop = (await $`[Environment]::GetFolderPath('Desktop')`.quiet()).stdout.trim();
+  const programs = (await $`[Environment]::GetFolderPath('Programs')`.quiet()).stdout.trim();
+  for (const lnk of [
+    path.join(desktop, `${appName}.lnk`),
+    path.join(programs, appName, `${appName}.lnk`),
+  ]) {
+    if (!(await fs.pathExists(lnk))) {
+      failed.push(`Missing shortcut: ${lnk}`);
+      continue;
+    }
+    const read =
+      await $`(New-Object -ComObject WScript.Shell).CreateShortcut(${lnk}) | Select-Object TargetPath, WorkingDirectory | ConvertTo-Json -Compress`.quiet();
+    const { TargetPath, WorkingDirectory } = JSON.parse(read.stdout);
+    if (
+      normalizeInstallPath(TargetPath) !== normalizeInstallPath(expectedTarget) ||
+      normalizeInstallPath(WorkingDirectory) !== normalizeInstallPath(installDir)
+    ) {
+      failed.push(`Shortcut ${lnk}: target=${TargetPath} start-in=${WorkingDirectory}`);
+    }
+    // The shortcut's fields must be written in the canonical long form; the
+    // normalized compare above would also pass for a short (8.3) spelling.
+    if (WorkingDirectory !== fs.realpathSync.native(installDir)) {
+      failed.push(`Shortcut ${lnk}: start-in not canonical: ${WorkingDirectory}`);
+    }
+  }
+  return failed;
+}
+
+/** Canonical form for comparing paths the installer hands back (registry
+ * records, .lnk fields, log lines): realpath expands 8.3 short-name
+ * components (e.g. `RUNNER~1`) so either form compares equal; non-existent
+ * paths keep their textual form. */
 export function normalizeInstallPath(p) {
+  if (fs.existsSync(p)) {
+    p = fs.realpathSync.native(p);
+  }
   return p
     .replaceAll('/', '\\')
     .replace(/[\\]+$/, '')
     .toLowerCase();
 }
 
-/** Both places a staging directory for `installDir` can live: beside it
- * (elevated writer or another volume) and under `%TEMP%`. */
-export function stagingCandidates(installDir) {
-  const normalized = installDir
-    .replaceAll('/', '\\')
-    .replace(/[\\]+$/, '')
-    .toLowerCase();
-  const hash = crypto
-    .createHash('sha256')
-    .update(normalized)
-    .digest('hex')
-    .slice(0, 16);
-  return [
-    path.join(
-      path.dirname(installDir),
-      `${path.basename(installDir)}.kachina-staged`,
-    ),
-    path.join(os.tmpdir(), 'kachina-staged', hash),
-  ];
+/** Staging roots the installer log records for `installDir`, from its
+ * `staging opened for "<install>" at "<root>"` lines (Rust debug-quoted). */
+export async function loggedStagingRoots(installDir) {
+  const logFile = getLogFilePath();
+  if (!(await fs.pathExists(logFile))) {
+    return [];
+  }
+  const want = normalizeInstallPath(installDir);
+  const quoted = String.raw`("(?:[^"\\]|\\.)*")`;
+  const line = new RegExp(`staging opened for ${quoted} at ${quoted}`, 'g');
+  const roots = new Set();
+  for (const match of (await fs.readFile(logFile, 'utf-8')).matchAll(line)) {
+    if (normalizeInstallPath(JSON.parse(match[1])) === want) {
+      roots.add(JSON.parse(match[2]));
+    }
+  }
+  return [...roots];
 }
 
 export async function assertStagingRemoved(installDir) {
+  const roots = await loggedStagingRoots(installDir);
+  if (roots.length === 0) {
+    throw new Error(
+      `The installer log names no staging root for ${installDir}`,
+    );
+  }
   const leftovers = [];
-  for (const candidate of stagingCandidates(installDir)) {
-    if (await fs.pathExists(candidate)) {
-      leftovers.push(candidate);
+  for (const root of roots) {
+    if (await fs.pathExists(root)) {
+      leftovers.push(root);
     }
   }
   if (leftovers.length > 0) {
@@ -278,18 +323,14 @@ export async function clearLogFile() {
   }
 }
 
-export async function runInstaller(exe, args, label, timeout = '3m', cwd) {
-  const { $, usePwsh } = await import('zx');
-  usePwsh();
-  const run = cwd ? $({ cwd }) : $;
+// 直接拉起安装器并等它退出，返回 { exitCode, signal }，退出码非 0 时不抛出。
+// release 安装器是 GUI 子系统程序，经 zx 的 pwsh `& exe` 启动拿不到它的退出码（结果为 0）。
+export async function runInstaller(exe, args, label, cwd) {
   try {
-    const result = await run`& ${exe} ${args}`.timeout(timeout);
-    return result;
+    return await waitForProcess(spawn(exe, args, { cwd, stdio: 'ignore' }));
   } catch (error) {
-    if (error.message && error.message.includes('timed out')) {
-      console.error(chalk.red(`${label} timed out after ${timeout}`));
-      await printLogFileIfExists();
-    }
+    console.error(chalk.red(`${label}: ${error.message}`));
+    await printLogFileIfExists();
     throw error;
   }
 }
@@ -301,6 +342,15 @@ export function assertDfs2BatchCoverage(state, label) {
   if (state.singleRequests.length !== 0) {
     throw new Error(
       `${label}: fell back to ${state.singleRequests.length} single DFS2 URL requests`,
+    );
+  }
+  const undeclared = state.batchRequests.flatMap((request) => {
+    const declared = new Set(state.sessions.get(request.sid)?.declared ?? []);
+    return request.ranges.filter((range) => !declared.has(range));
+  });
+  if (undeclared.length > 0) {
+    throw new Error(
+      `${label}: batch URLs were requested for ranges the session did not declare: ${undeclared.join(', ')}`,
     );
   }
   const batchRanges = new Set(
@@ -325,14 +375,7 @@ export function assertDfs2BatchCoverage(state, label) {
   }
 }
 
-export function spawnInstaller(exe, args) {
-  return spawn(exe, args, {
-    windowsHide: true,
-    stdio: 'ignore',
-  });
-}
-
-export function waitForProcess(child, timeout = 180000) {
+function waitForProcess(child, timeout = 180000) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       child.kill();

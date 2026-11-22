@@ -61,8 +61,8 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result
     Ok(Some(body))
 }
 
-// `Chunk` 用元组：u32/u64 不同型，位置写反编译不过；`BytesOf`/`CountOf`/`Extract`
-// 的同型字段保留具名，写反不会被编译器发现。
+// `BytesOf`/`CountOf`/`Extract` 的字段同型，写成元组时位置写反编译器发现不了，
+// 所以保留具名。
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum Progress {
     Insight(crate::dfs::InsightItem),
@@ -97,11 +97,17 @@ pub struct IpcError {
     pub sid: Option<String>,
     pub cancelled: bool,
     pub insight: Option<InsightItem>,
+    /// 未挂码错误链上的网络失败（标签、下载码）。错误类型不过管道，父进程据此
+    /// 还原一个可识别的链节点，挂码时与未提权路径得到同一个码。
+    pub network: Option<(String, String)>,
+    /// 没有网络失败时，链上本地 io 错误的码，用途同 `network`。
+    pub local_io: Option<String>,
 }
 
 impl IpcError {
     pub fn from_ta(err: &TACommandError) -> Self {
-        use crate::utils::code::{extract, Extracted};
+        use crate::utils::code::{extract, local_io_code, Extracted};
+        let (mut network, mut local_io) = (None, None);
         let (message, code, subject, sid, cancelled) = match extract(&err.error) {
             Extracted::Coded(c) => (
                 c.detail.clone().unwrap_or_default(),
@@ -111,7 +117,14 @@ impl IpcError {
                 false,
             ),
             Extracted::Cancelled => (String::new(), None, None, None, true),
-            Extracted::Uncoded { detail } => (detail, None, None, None, false),
+            Extracted::Uncoded { detail } => {
+                network = crate::utils::net_failure::find(err.error.as_ref())
+                    .map(|f| (f.tag, f.code.to_string()));
+                if network.is_none() {
+                    local_io = local_io_code(&err.error).map(str::to_string);
+                }
+                (detail, None, None, None, false)
+            }
         };
         Self {
             message,
@@ -120,11 +133,23 @@ impl IpcError {
             sid,
             cancelled,
             insight: err.insight.clone(),
+            network,
+            local_io,
         }
     }
 
     pub fn into_ta(self) -> TACommandError {
-        use crate::utils::code::{code_from_str, Cancelled, Coded};
+        use crate::utils::code::{code_from_str, Cancelled, Carried, CarriedCause, Coded};
+        use crate::utils::net_failure::NetFailure;
+        let network = self.network.and_then(|(tag, code)| {
+            Some(CarriedCause::Network(NetFailure {
+                tag,
+                code: code_from_str(&code)?,
+            }))
+        });
+        let local_io = self
+            .local_io
+            .and_then(|code| Some(CarriedCause::LocalIo(code_from_str(&code)?)));
         let error = if self.cancelled {
             anyhow::Error::new(Cancelled)
         } else if let Some(code) = self.code.as_deref().and_then(code_from_str) {
@@ -133,6 +158,11 @@ impl IpcError {
             coded.subject = self.subject;
             coded.sid = self.sid;
             anyhow::Error::new(coded)
+        } else if let Some(cause) = network.or(local_io) {
+            anyhow::Error::new(Carried {
+                text: self.message,
+                cause,
+            })
         } else {
             anyhow::anyhow!(self.message)
         };
@@ -191,7 +221,6 @@ pub enum PipeMsg {
     Progress(String, Progress),
     Ok(String, IpcResult, network::Stats),
     Err(String, IpcError, network::Stats),
-    Disconnect(String),
     Resolve(download::Resolve),
 }
 
@@ -236,6 +265,8 @@ mod tests {
                         sid: None,
                         cancelled: false,
                         insight: Some(insight(Some("HASH_MISMATCH_ERR"))),
+                        network: Some(("NET_RESET".into(), "DOWNLOAD_FAILED".into())),
+                        local_io: None,
                     }),
                 ],
                 insight: insight(None),
@@ -392,15 +423,17 @@ mod tests {
 
     #[tokio::test]
     async fn read_frame_splits_stream_and_reports_eof() {
-        let mut stream = encode_frame(&PipeMsg::Disconnect("a".into())).unwrap();
-        stream.extend(encode_frame(&PipeMsg::Disconnect("b".into())).unwrap());
+        let first_msg = PipeMsg::Ok("a".into(), IpcResult::DiscardStaging, network::Stats::default());
+        let second_msg = PipeMsg::Ok("b".into(), IpcResult::DiscardStaging, network::Stats::default());
+        let mut stream = encode_frame(&first_msg).unwrap();
+        stream.extend(encode_frame(&second_msg).unwrap());
         let mut reader = &stream[..];
         let first: PipeMsg =
             decode_frame(&read_frame(&mut reader).await.unwrap().unwrap()).unwrap();
         let second: PipeMsg =
             decode_frame(&read_frame(&mut reader).await.unwrap().unwrap()).unwrap();
-        assert!(matches!(first, PipeMsg::Disconnect(s) if s == "a"));
-        assert!(matches!(second, PipeMsg::Disconnect(s) if s == "b"));
+        assert!(matches!(first, PipeMsg::Ok(s, IpcResult::DiscardStaging, _) if s == "a"));
+        assert!(matches!(second, PipeMsg::Ok(s, IpcResult::DiscardStaging, _) if s == "b"));
         assert!(read_frame(&mut reader).await.unwrap().is_none());
 
         let mut truncated = &stream[..6];

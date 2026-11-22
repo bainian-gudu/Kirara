@@ -2,6 +2,7 @@ use crate::fs::commit::CommitArgs;
 use crate::installer::registry::RegHive;
 use crate::ipc::{IpcResult, ProgressNotify, StagingOpened};
 use crate::utils::error::{IntoTAResult, TAResult};
+use tokio_util::sync::CancellationToken;
 
 // 外部标签（serde 默认）：内部标签/untagged 会拉进 serde 的 Content 缓冲机制，
 // 单态化体积大；此协议仅在同一二进制的两个进程间使用，形状可自由选择
@@ -43,6 +44,9 @@ pub enum IpcOperation {
         file_list: Vec<String>,
         #[serde(default)]
         skip_hash: Vec<String>,
+        /// Planned deletes, see [`crate::fs::check_local_files`].
+        #[serde(default)]
+        delete_list: Vec<String>,
     },
     ProbeWritable(Vec<String>),
     RunMirrorcDownload {
@@ -69,9 +73,19 @@ pub enum IpcOperation {
     /// The session is over: the elevated helper refuses every later
     /// operation and only waits for the launcher to disconnect.
     Retire,
+    /// Stop the in-flight request with this id. Only the operations that
+    /// watch their stop token end early, with `Cancelled`: the hash scan and
+    /// the Mirror酱 extraction.
+    Cancel(String),
 }
 
-pub async fn run_opr(op: IpcOperation, notify: ProgressNotify) -> TAResult<IpcResult> {
+/// `stop` is the request's cancel token: the user's token when the operation
+/// runs in this process, the helper's token for the request otherwise.
+pub async fn run_opr(
+    op: IpcOperation,
+    notify: ProgressNotify,
+    stop: CancellationToken,
+) -> TAResult<IpcResult> {
     let op_name = match &op {
         IpcOperation::BeginDownload(_) => "BeginDownload",
         IpcOperation::CancelDownload(_) => "CancelDownload",
@@ -99,6 +113,7 @@ pub async fn run_opr(op: IpcOperation, notify: ProgressNotify) -> TAResult<IpcRe
         IpcOperation::DiscardStaging(..) => "DiscardStaging",
         IpcOperation::ScheduleCleanup(..) => "ScheduleCleanup",
         IpcOperation::Retire => "Retire",
+        IpcOperation::Cancel(_) => "Cancel",
     };
     tracing::info!("IPC operation: {}", op_name);
     match op {
@@ -125,7 +140,10 @@ pub async fn run_opr(op: IpcOperation, notify: ProgressNotify) -> TAResult<IpcRe
             };
             let ctx = super::download::context(&job, network)?;
             let result = super::download::CURRENT
-                .scope(ctx.clone(), Box::pin(run_opr(*operation, notify.clone())))
+                .scope(
+                    ctx.clone(),
+                    Box::pin(run_opr(*operation, notify.clone(), stop)),
+                )
                 .await;
             let finished = super::download::finish(&ctx, result.is_ok()).await;
             for insight in ctx.insights.lock().unwrap().iter() {
@@ -184,9 +202,18 @@ pub async fn run_opr(op: IpcOperation, notify: ProgressNotify) -> TAResult<IpcRe
             hash_algorithm,
             file_list,
             skip_hash,
+            delete_list,
         } => Ok(IpcResult::CheckLocalFiles(
-            crate::fs::check_local_files(source, hash_algorithm, file_list, skip_hash, notify)
-                .await?,
+            crate::fs::check_local_files(
+                source,
+                hash_algorithm,
+                file_list,
+                skip_hash,
+                delete_list,
+                notify,
+                stop,
+            )
+            .await?,
         )),
         IpcOperation::ProbeWritable(file_list) => Ok(IpcResult::ProbeWritable(
             crate::fs::probe_writable(file_list).await,
@@ -200,8 +227,10 @@ pub async fn run_opr(op: IpcOperation, notify: ProgressNotify) -> TAResult<IpcRe
             new_dir,
             sha256,
         } => Ok(IpcResult::RunMirrorcInstall(
-            crate::thirdparty::mirrorc::run_mirrorc_install(&zip_path, &new_dir, &sha256, notify)
-                .await?,
+            crate::thirdparty::mirrorc::run_mirrorc_install(
+                &zip_path, &new_dir, &sha256, notify, stop,
+            )
+            .await?,
         )),
         IpcOperation::OpenStaging(install_dir) => {
             let beside = crate::utils::uac::check_elevated().unwrap_or(false);
@@ -232,5 +261,7 @@ pub async fn run_opr(op: IpcOperation, notify: ProgressNotify) -> TAResult<IpcRe
             Ok(IpcResult::Ping)
         }
         IpcOperation::Retire => Ok(IpcResult::Ping),
+        // sent to the helper only, whose read loop handles it
+        IpcOperation::Cancel(_) => Ok(IpcResult::Ping),
     }
 }

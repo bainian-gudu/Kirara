@@ -398,9 +398,9 @@ function Test-RustLogic {
 }
 
 function Test-Frontend {
-    # 直接跑仓库自己的前端检查：tsc --noEmit 覆盖 web/ 全量（strict），vitest 覆盖
-    # web/__tests__。这里不另建一套最小 TS 工程 —— 那会与根 tsconfig 漂移，而根
-    # tsconfig 才是构建真正用的那份。
+    # 直接跑仓库自己的前端检查：tsc --noEmit 覆盖 web/ 全量（strict）。这里不另建
+    # 一套最小 TS 工程 —— 那会与根 tsconfig 漂移，而根 tsconfig 才是构建真正用的那份。
+    # 前端单测随上游一并删除（D2），本层不再跑 vitest。
     $pnpm = Get-Tool 'pnpm'
     if (-not $pnpm) { Skip-Layer 'pnpm 不在 PATH（corepack enable，或 npm i -g pnpm）' }
     if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot 'node_modules'))) {
@@ -412,7 +412,6 @@ function Test-Frontend {
     }
     $checks = @(
         @{ What = 'tsc --noEmit（web/ 全量 strict）'; Args = @('exec', 'tsc', '--noEmit') }
-        @{ What = 'vitest run'; Args = @('test') }
         # 只查我们自己维护的协议渲染文件（web/ 其余文件沿用上游格式，全量 prettier
         # 会把上游代码的既有风格当成回归）。--end-of-line auto：换行交给 .gitattributes。
         @{ What = 'prettier --check'; Args = @('exec', 'prettier', '--check', '--end-of-line', 'auto', 'web/agreement.ts') }
@@ -421,5 +420,5 @@ function Test-Frontend {
         $r = Invoke-Native -FilePath $pnpm -Arguments $c.Args -WorkingDirectory $RepoRoot -Tail 30
         if ($r.ExitCode -ne 0) { throw "$($c.What) 失败" }
     }
-    return 'tsc --strict / vitest / prettier(协议渲染) 均通过'
+    return 'tsc --strict / prettier(协议渲染) 均通过'
 }

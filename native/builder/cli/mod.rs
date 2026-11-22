@@ -84,6 +84,12 @@ pub struct ReplaceBinArgs {
     /// 输出的新安装包文件
     #[clap(long, short = 'o')]
     pub output: PathBuf,
+    /// 显式指定新 base 程序；缺省取 bundle 末位 PE
+    #[clap(long)]
+    pub base: Option<PathBuf>,
+    /// 写入新 base 的图标；应用名称与窗口标题取自包内配置
+    #[clap(long)]
+    pub icon: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Clone, Debug)]

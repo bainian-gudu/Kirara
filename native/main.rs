@@ -14,9 +14,13 @@ pub mod installer;
 pub mod ipc;
 pub mod local;
 pub mod module;
+// 与 builder、sfx 共用，各二进制只用到其中一部分
+#[allow(dead_code)]
+pub mod pack_format;
 pub mod session;
 pub mod thirdparty;
 pub mod utils;
+pub mod verified_write;
 use cli::arg::{Command, InstallArgs};
 use std::time::Duration;
 
@@ -89,9 +93,6 @@ lazy_static::lazy_static! {
 
         builder.build()
     };
-
-    /// Legacy alias - will be removed after migration
-    pub static ref REQUEST_CLIENT: &'static reqwest_middleware::ClientWithMiddleware = &*API_CLIENT;
 }
 
 fn main() {
@@ -109,24 +110,26 @@ fn main() {
         crash_dialog();
         return;
     }
-    let show_crash_dialog = match &command {
-        Command::Install(a) => !a.silent,
-        _ => true,
+    // 静默安装及其提权子进程都不弹框（含崩溃提示）
+    let silent = match &command {
+        Command::Install(a) => a.silent,
+        Command::HeadlessUac(uac) => uac.silent,
+        _ => false,
     };
-    utils::crash::install_panic_hook(show_crash_dialog);
+    ipc::manager::SILENT_SESSION.store(silent, std::sync::atomic::Ordering::SeqCst);
+    utils::crash::install_panic_hook(!silent);
 
     // 日志：控制台 + %TEMP%\KachinaInstaller.log，INFO 级全局过滤；
     // 提权子进程写启动进程传来的文件。
     let log_path = match &command {
         Command::HeadlessUac(uac) => uac.log_path.clone(),
-        _ => None,
+        _ => utils::log::path(),
     };
-    utils::log::init(&log_path.unwrap_or_else(utils::log::path));
+    utils::log::init(&log_path);
 
     // Initialize H3/QUIC probe early — before any client is created
     capabilities::init();
 
-    // command is not  Command::Install, can be anything
     match command {
         Command::HeadlessUac(args) => {
             tokio::runtime::Builder::new_multi_thread()
@@ -180,6 +183,12 @@ fn main() {
     // 所有入口共用的最终收尾：成功替换过自身的会话（Native / 静默）在此
     // 安排 staging 清理；WebView 路径若已在消息循环里清理过，这里为空操作。
     installer::uninstall::delete_self_on_exit();
+    // 用过 msquic 的进程不能从 main 返回：返回后的 CRT exit() 里，seera-msquic 的
+    // `#[ctor::dtor]` 调 MsQuicClose 拆库，而 DOWNLOAD_CLIENT 的 H3 registration
+    // 与连接池活到进程结束。拆库后活连接的定时器或收包访问已释放的内存
+    // （0xc0000005），或主线程一直等 worker pool 而卡死；debug 构建直接断言失败。
+    // process::exit 走 ExitProcess，不执行 CRT 的退出回调。
+    std::process::exit(0);
 }
 
 fn crash_dialog() {

@@ -11,6 +11,23 @@
 | 迁移分支 | `main`（迁移期间名 `codex/migrate-upstream-main`，完成后改名并设为默认分支） |
 | 共同祖先 | 无（按行为逐项移植，不做 merge / cherry-pick） |
 
+## 2026-11-22 同步 upstream/main `f2a5184`
+
+迁移完成后 `main` 与上游已有共同祖先，后续同步改为**普通合并**。本次把上游
+`05a1410` → `f2a5184`（51 个提交）合并进来；逐文件处置与决策依据见
+[`docs/upstream-sync-plan-2026-11-22.md`](docs/upstream-sync-plan-2026-11-22.md)。
+
+| 项目 | 值 |
+| --- | --- |
+| 上游增量 | 51 个提交、132 文件：新增 `kachina-sfx` 便携运行器、写后回读与共享写管线、8.3 短名归一、H3/msquic 稳定性修复、遥测管道死代码清理、笔记与测试矩阵重组 |
+| 冲突 | 40 处（34 内容 + 6 改删），约 85 个冲突块；集中在锁文件、`native/session/{run,state}.rs`、`native/ipc/mod.rs` |
+| 决策 D1 | H3 保留本地 quinn + rustls（上游是 msquic）：`native/capabilities/h3.rs` 取本地，`native/utils/net_failure.rs` 按 quinn 错误类型重写 QUIC 分类，上游 3 个 msquic 专属修复按 quinn 语义核对 |
+| 决策 D2 | 前端单测跟随上游删除：删 `web/__tests__`、`vitest`/`jsdom`/`@testing-library` 依赖与 `"test": "vitest run"`；`tools/devcheck` 的 `front` 层与自检用例同步去掉 vitest |
+| 上游吸收 | 第 16 项 `mslnk` → Shell Link API（上游 `6c866bc` 用 `IShellLinkW` 实现；本地 `installer/lnk.rs` 取上游 + `utils/shell_link.rs`）；第 7 项的 envelope 管道、GitHub JS 插件、图片 base64 往返（上游 `c4aff58`/`fec120b` 已删） |
+| 本地保留 | 遥测移除（上游仍有 Sentry 与 `Breadcrumb`）、改名兼容、标准构建目标、zip 去 fork、H3 quinn、左栏图与图标配置化、界面复刻、交付形态、devcheck、P6 重演 |
+| 台账 | 现行本地补丁清单改由 [`LOCAL_PATCHES.md`](LOCAL_PATCHES.md) 维护，本文件只留迁移期证据与退役记录 |
+
+
 ## 状态说明
 
 - **完成**：改动已落地并有证据。
@@ -36,7 +53,7 @@
 | --- | --- | --- |
 | 1 / 1b / 1c 卸载注册表、快捷方式、计划任务扩展 | 完成 | 见下「P3 已落地改动与证据」 |
 | 2 协议文件、格式、标题、弹窗 | 完成 | 见下「P2 / P4 已落地改动与证据」 |
-| 3 删除范围与提权面安全阀 | 完成 | 卸载侧四类判定、清单路径越界拦截、提权管道 ACL、下载后执行验签均已落地；宿主侧 `UninstallLauncher` / `ResolveDotNetCli` 不在本仓库（见下） |
+| 3 删除范围与提权面安全阀 | 完成 | 卸载侧四类判定、清单路径越界拦截、下载后执行验签均已落地；提权管道 ACL 在 2026-11-22 同步时改用上游更严格的形式（仅 `SY` + `BA`，f2a5184 `e29a11a`）；宿主侧 `UninstallLauncher` / `ResolveDotNetCli` 不在本仓库（见下） |
 | 4 vendored rcedit 兼容 | 完成 | `vendor/rcedit-rs/` 副本 + `rescle.cc` 的 `std::locale::classic()`；根 `Cargo.toml` 改 path 依赖（见下） |
 | 5 弹窗 footer | 完成 | `.dialog` 改纵向 flex、footer 回文档流；见下 |
 | 6 多用户与临时残留清理 | 完成 | `%VAR%` 展开、跨用户重放、`%TEMP%` 白名单、卸载前结束进程，见下 |
@@ -49,7 +66,7 @@
 | 13 Windows 10/11 标准目标 | 完成 | 目标、`-Z build-std`、`rust-src`、`ctor` patch、`STATIC_VCRUNTIME` 已处理（见下）；CI 的 `CARGO_PROFILE_RELEASE_DEBUG: "false"` 已落地（`bb7510b`），Build 工作流全绿 |
 | 14 zip 去 fork 与中文名解码 | 完成 | 改用 crates.io `zip 8.6`；`native/thirdparty/mirrorc.rs` 按 `name_raw()` 自己解条目名（见下） |
 | 15 H3 改 `quinn`/`rustls` | 完成 | `native/capabilities/h3.rs` 整份换成 quinn + rustls + h3-quinn；`[patch.crates-io]` 的 msquic fork 删除（见下） |
-| 16 旧依赖替换与许可证 | 完成 | `mslnk` → Shell Link API、`nt_version` → ntdll、`libs/` 许可证补齐（见下） |
+| 16 旧依赖替换与许可证 | 完成（已上游化） | `nt_version` → ntdll、`libs/` 许可证补齐仍在本地；`mslnk` → Shell Link API 已由上游 `6c866bc`（`IShellLinkW`）等价实现，2026-11-22 起不再算本地补丁 |
 | 17 打包器修复 | 完成 | 上游 `05a1410` 已含等价实现，逐条核对见下；额外去掉 `chksum-md5` 的 `async-runtime-tokio` feature |
 | 18 安装行为测试与单测 | 完成 | 上游行为矩阵保留且 `userdata-ignore` / `builder-extract-replace` 场景断言在位；`dump-offline-install` 由 `unit-test` job 用 debug 产物执行（见下） |
 

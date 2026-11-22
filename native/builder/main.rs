@@ -8,6 +8,10 @@ mod gen;
 mod local;
 mod metadata;
 mod pack;
+// 与安装器、sfx 共用，各二进制只用到其中一部分
+#[path = "../pack_format.rs"]
+#[allow(dead_code)]
+mod pack_format;
 mod replace_bin;
 mod utils;
 
@@ -29,9 +33,19 @@ async fn async_main() {
     }
     let command = command.take().unwrap();
     match command {
-        Command::Pack(args) => pack::pack_cli(args).await,
+        Command::Pack(args) => {
+            if let Err(e) = pack::pack_cli(args).await {
+                eprintln!("Pack failed: {e}");
+                std::process::exit(1);
+            }
+        }
         Command::Gen(args) => gen::gen_cli(args).await,
-        Command::Append(args) => append::append_cli(args).await,
+        Command::Append(args) => {
+            if let Err(e) = append::append_cli(args).await {
+                eprintln!("Append failed: {e}");
+                std::process::exit(1);
+            }
+        }
         Command::Extract(args) => {
             if let Err(e) = extract::extract_cli(args).await {
                 eprintln!("Extract failed: {e}");

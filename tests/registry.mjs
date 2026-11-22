@@ -5,7 +5,7 @@ import {
   clearLogFile,
   getFileHash,
   printLogFileIfExists,
-  stagingCandidates,
+  loggedStagingRoots,
   waitForServer,
   readUninstallRecord,
   writeUninstallRecord,
@@ -109,6 +109,13 @@ async function expectRecord(check, hive, dir, metadata) {
     normalizeInstallPath(dir),
     normalizeInstallPath(record.InstallLocation ?? ''),
   );
+  // Records must be written in the canonical long form; normalizeInstallPath
+  // would also pass for a short (8.3) spelling, so check the raw value too.
+  check.equal(
+    `${hive}.InstallLocation raw form`,
+    fs.realpathSync.native(dir),
+    record.InstallLocation ?? '',
+  );
   const uninstaller = path.join(dir, 'uninstall.exe');
   // ARP 的命令行整体加引号：路径带空格时 `C:\Program Files\...` 才不会截断。
   check.equal(
@@ -204,7 +211,6 @@ async function runUpdaterInDir(dir, label, extra = []) {
     path.join(dir, 'updater.exe'),
     [FLAGS, '--source', 'local-v2', ...extra],
     label,
-    '3m',
     dir,
   );
   assertExitOk(result, label);
@@ -270,7 +276,6 @@ async function uninstall(dir, otherDir) {
     path.join(dir, 'uninstall.exe'),
     [FLAGS],
     'Uninstall',
-    '3m',
     dir,
   );
   assertExitOk(result, 'Uninstall');
@@ -371,7 +376,6 @@ async function machineUninstall(dir) {
     path.join(dir, 'uninstall.exe'),
     [FLAGS, HELPER],
     'Helper uninstall',
-    '3m',
     dir,
   );
   assertExitOk(result, 'Helper uninstall');
@@ -392,8 +396,10 @@ async function cleanup() {
     await removeUninstallRecord(hive, REG_NAME);
   }
   await removeUserShortcuts(APP_NAME);
+  // Each run clears the log, so only the last run's staging is listed; the
+  // earlier runs exited 0, and a run that exits 0 removes its staging.
   for (const dir of dirs) {
-    for (const target of [dir, ...stagingCandidates(dir)]) {
+    for (const target of [dir, ...(await loggedStagingRoots(dir))]) {
       await fs.remove(target).catch((error) => {
         console.warn(
           chalk.yellow(`Failed to remove ${target}: ${error.message}`),

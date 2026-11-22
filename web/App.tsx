@@ -30,6 +30,8 @@ function PromptModal({ ui }: { ui: UiState }) {
   const prompt = ui.pending;
   if (!prompt) return null;
   const title = t(`prompt.${prompt.kind}.title`, prompt.params);
+  // copy that names the items in its sentence gets no separate list
+  const listed = !t(`prompt.${prompt.kind}.message`).includes('{items}');
   const message = t(`prompt.${prompt.kind}.message`, {
     ...prompt.params,
     items: prompt.items.join('\n'),
@@ -55,7 +57,7 @@ function PromptModal({ ui }: { ui: UiState }) {
         </>
       }
     >
-      {prompt.items.length ? (
+      {listed && prompt.items.length ? (
         <ul class="prompt-items">
           {prompt.items.map((item) => (
             <li key={item}>{item}</li>
@@ -167,6 +169,7 @@ export function App() {
             </button>
           </div>
         ) : null}
+        {/* a CSS theme draws `.image` itself */}
         <div class="image">
           <img src={ui.theme === 'image' ? '/theme.webp' : leftArt} alt={ui.project.title} />
         </div>

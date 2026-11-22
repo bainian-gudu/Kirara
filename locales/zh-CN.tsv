@@ -33,6 +33,7 @@ PLUGIN_NOT_FOUND	未找到插件
 PLUGIN_NO_UI	该安装源需要图形界面
 PROCESS_KILL_FAILED	结束进程失败
 REGISTRY_READ_FAILED	无法读取安装记录，不能继续
+ROLLBACK_INCOMPLETE	更新未能完成，部分文件暂时无法恢复。请关闭正在使用安装目录的程序，然后重新运行安装程序完成修复
 REGISTRY_WRITE_FAILED	写入注册表失败
 REMOTE_FILE_MISSING	无法获取所需文件，请检查网络连接或更换下载源
 RUNTIME_INSTALL_FAILED	安装{subject}失败，请手动安装
@@ -51,13 +52,13 @@ VERSION_REGEX_INVALID	版本号规则无效
 WEBVIEW2_FAILED	WebView2 安装失败
 WEBVIEW2_FAULT	安装界面无法显示，请重新运行安装器
 WEBVIEW2_REQUIRED	该安装源需要 WebView2，请使用「高级安装」
-dialog.agreement_accept	我已阅读并同意
-dialog.agreement_close	关闭
-dialog.agreement_hint	请在使用 {title} 前完整阅读以下条款。
 dialog.cancel	取消
 dialog.copy	复制
 dialog.crash	安装程序发生内部错误，已终止运行。请重新运行安装程序。
 dialog.error	出错了
+dialog.agreement_accept	我已阅读并同意
+dialog.agreement_close	关闭
+dialog.agreement_hint	请在使用 {title} 前完整阅读以下条款。
 dialog.mirrorc_cdk_get	获取 CDK
 dialog.mirrorc_cdk_hint	Mirror酱是独立的第三方软件下载平台，提供付费的软件下载加速服务。如果你有 Mirror酱的 CDK，可以在这里输入。
 dialog.mirrorc_cdk_placeholder	请输入 Mirror酱 CDK
@@ -95,8 +96,10 @@ progress.shortcut	创建快捷方式……
 progress.uninstall_delete	正在卸载……
 progress.uninstall_done	卸载完成
 progress.uninstall_scan	准备卸载……
-prompt.occupied_files.message	检测到部分文件被占用，继续安装可能无法成功，是否继续？ {items}
+prompt.occupied_files.message	检测到部分文件被占用，继续安装可能无法成功，是否继续？
 prompt.occupied_files.title	提示
+prompt.process_running.message	检测到{items}正在运行，是否结束进程并继续安装？
+prompt.process_running.title	提示
 prompt.version_mismatch.message	当前安装包不是最新版本，是否直接安装最新版本？
 prompt.version_mismatch.title	提示
 ready.advanced	高级安装
@@ -125,6 +128,12 @@ running.cancel_message	已下载的内容将被丢弃，当前已安装的文件
 running.cancel_no	否，继续
 running.cancel_title	确定要取消吗？
 running.cancel_yes	是，取消
+running.force_exit_message	现在退出会立即结束安装程序，正在进行的操作不会完成；未完成的部分在下次运行安装程序时处理。
+running.force_exit_no	继续等待
+running.force_exit_title	要强制退出吗？
+running.force_exit_yes	强制退出
+running.processing_speed	文件处理速度
+running.network_speed	网络接收速度
 shortcut.uninstall	卸载{subject}
 step.default.0	获取最新版本
 step.default.1	校验更新内容
@@ -151,5 +160,3 @@ progress.install_runtime	安装 {subject}……
 progress.create_shortcuts	创建快捷方式……
 progress.write_registry	写入注册表……
 running.cancelling	正在取消，等待任务结束并清理……
-running.network_speed	网络接收速度
-running.processing_speed	文件处理速度

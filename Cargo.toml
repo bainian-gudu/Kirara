@@ -38,6 +38,8 @@ reqwest = { version = "0.12", default-features = false, features = [
     "stream",
     "system-proxy"
 ] }
+# reqwest 的 TLS 后端；直接依赖只为按类型识别握手失败（utils/net_failure.rs）。
+native-tls = "0.2"
 futures = "0.3"
 tokio-util = { version = "0.7", features = ["io-util"] }
 async-walkdir = "2.0"
@@ -101,7 +103,6 @@ log = { version = "0.4", features = ["release_max_level_info"] }
 win32-version-info = "0.2.0"
 bytes = "1.10.1"
 url = "2.5"
-base64 = "0.22.1"
 # H3 的传输层用 quinn + rustls + h3-quinn。上游那套 h3-msquic-async +
 # xytoki/msquic-async-rs fork + seera-msquic 不在 crates.io 主线维护，还要链一份
 # 静态 msquic；证书固定语义与对外接口保持不变，见 MIGRATION_LEDGER.md 第 15 项。
@@ -150,6 +151,10 @@ path = "native/main.rs"
 name = "kachina-builder"
 path = "native/builder/main.rs"
 
+[[bin]]
+name = "kachina-sfx"
+path = "native/sfx/main.rs"
+
 [profile.dev]
 incremental = true # Compile your binary in smaller steps.
 rustflags = ["-Zthreads=16"] # Better compile performance.
@@ -173,3 +178,4 @@ opt-level = 3
 opt-level = 3
 [profile.release.package.chksum-md5]
 opt-level = 3
+

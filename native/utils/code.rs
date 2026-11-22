@@ -5,7 +5,9 @@ use std::fmt;
 
 use serde::Serialize;
 
-// --- N: download itself ---
+use crate::utils::net_failure;
+
+// --- N: download itself, do not report ---
 pub const DOWNLOAD_TIMEOUT: &str = "DOWNLOAD_TIMEOUT";
 pub const DOWNLOAD_REFUSED: &str = "DOWNLOAD_REFUSED";
 pub const DOWNLOAD_FAILED: &str = "DOWNLOAD_FAILED";
@@ -19,6 +21,9 @@ pub const PERMISSION_DENIED: &str = "PERMISSION_DENIED";
 pub const DISK_FULL: &str = "DISK_FULL";
 pub const FILE_IN_USE: &str = "FILE_IN_USE";
 pub const FILE_IO_FAILED: &str = "FILE_IO_FAILED";
+/// A failed commit could not put every file back; the staging directory and
+/// its journal are kept for the next session's recovery.
+pub const ROLLBACK_INCOMPLETE: &str = "ROLLBACK_INCOMPLETE";
 pub const UNINSTALL_INCOMPLETE: &str = "UNINSTALL_INCOMPLETE";
 pub const TEMP_DIR_UNAVAILABLE: &str = "TEMP_DIR_UNAVAILABLE";
 pub const PROCESS_KILL_FAILED: &str = "PROCESS_KILL_FAILED";
@@ -85,6 +90,7 @@ pub const ALL_CODES: &[&str] = &[
     DISK_FULL,
     FILE_IN_USE,
     FILE_IO_FAILED,
+    ROLLBACK_INCOMPLETE,
     UNINSTALL_INCOMPLETE,
     TEMP_DIR_UNAVAILABLE,
     PROCESS_KILL_FAILED,
@@ -382,6 +388,7 @@ pub fn class_of(code: &str) -> Option<Class> {
         | DISK_FULL
         | FILE_IN_USE
         | FILE_IO_FAILED
+        | ROLLBACK_INCOMPLETE
         | UNINSTALL_INCOMPLETE
         | TEMP_DIR_UNAVAILABLE
         | PROCESS_KILL_FAILED
@@ -470,37 +477,53 @@ pub fn coded_from_error(err: &anyhow::Error) -> Option<Coded> {
     }
 }
 
+/// Removes every `scheme://…` URL (http, https, http3, sftp, ssh+http, …).
 fn strip_urls(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
-    while !rest.is_empty() {
-        let next_http = rest.find("http://");
-        let next_https = rest.find("https://");
-        let start = match (next_http, next_https) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
+    while let Some(sep) = rest.find("://") {
+        // Scheme characters are ASCII, so walking bytes back stops on a char
+        // boundary.
+        let bytes = rest.as_bytes();
+        let mut start = sep;
+        while start > 0
+            && (bytes[start - 1].is_ascii_alphanumeric()
+                || matches!(bytes[start - 1], b'+' | b'-' | b'.'))
+        {
+            start -= 1;
+        }
+        if start == sep || !bytes[start].is_ascii_alphabetic() {
+            out.push_str(&rest[..sep + 3]);
+            rest = &rest[sep + 3..];
+            continue;
+        }
+        out.push_str(&rest[..start]);
+        let body = &rest[sep + 3..];
+        let end = body
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, ')' | ',' | '"' | '\'' | '>' | ']' | ';')
+            })
+            .unwrap_or(body.len());
+        rest = &body[end..];
+        // Drop what only framed the URL, so "for url (…): x" reads
+        // "for url: x", "TAG […]: x" reads "TAG: x" and "ctx: … x"
+        // keeps a single space.
+        let close = match out.chars().last() {
+            Some('(') => Some(')'),
+            Some('[') => Some(']'),
+            _ => None,
         };
-        match start {
-            None => {
-                out.push_str(rest);
-                break;
+        if close.is_some_and(|c| rest.starts_with(c)) {
+            out.pop();
+            if out.ends_with(' ') {
+                out.pop();
             }
-            Some(i) => {
-                out.push_str(&rest[..i]);
-                let after = &rest[i..];
-                let scheme_len = if after.starts_with("https://") { 8 } else { 7 };
-                let url_body = &after[scheme_len..];
-                let end_rel = url_body
-                    .find(|c: char| {
-                        c.is_whitespace() || matches!(c, ')' | ',' | '"' | '\'' | '>' | ']' | ';')
-                    })
-                    .unwrap_or(url_body.len());
-                rest = &url_body[end_rel..];
-            }
+            rest = &rest[1..];
+        } else if (out.is_empty() || out.ends_with(' ')) && rest.starts_with(' ') {
+            rest = &rest[1..];
         }
     }
+    out.push_str(rest);
     out
 }
 
@@ -549,102 +572,98 @@ fn reqwest_ref<'a>(err: &'a (dyn std::error::Error + 'static)) -> Option<&'a req
     None
 }
 
-fn code_for_reqwest(e: &reqwest::Error) -> &'static str {
-    if e.is_timeout() {
-        DOWNLOAD_TIMEOUT
-    } else if e.is_connect() {
-        DOWNLOAD_REFUSED
-    } else if e.status().is_some() {
-        SERVER_HTTP_ERROR
-    } else {
-        DOWNLOAD_FAILED
-    }
-}
-
-fn code_for_io_kind(kind: std::io::ErrorKind) -> &'static str {
-    use std::io::ErrorKind as K;
-    match kind {
-        K::PermissionDenied => PERMISSION_DENIED,
-        K::StorageFull => DISK_FULL,
-        K::TimedOut => DOWNLOAD_TIMEOUT,
-        K::ConnectionRefused | K::AddrNotAvailable => DOWNLOAD_REFUSED,
-        K::ConnectionReset
-        | K::ConnectionAborted
-        | K::NotConnected
-        | K::UnexpectedEof
-        | K::BrokenPipe => DOWNLOAD_FAILED,
+/// Code for a local file-system failure (rename, copy, delete inside the
+/// install directory). Sharing / lock violations are `FILE_IN_USE`. Network
+/// io errors are classified by `net_failure`, never here.
+pub fn code_for_local_io(io: &std::io::Error) -> &'static str {
+    match (io.raw_os_error(), io.kind()) {
+        (Some(32 | 33), _) => FILE_IN_USE,
+        (_, std::io::ErrorKind::PermissionDenied) => PERMISSION_DENIED,
+        (_, std::io::ErrorKind::StorageFull) => DISK_FULL,
         _ => FILE_IO_FAILED,
     }
 }
 
-/// Code for a local file-system failure (rename, copy, delete inside the
-/// install directory). Sharing / lock violations are `FILE_IN_USE`.
-pub fn code_for_local_io(io: &std::io::Error) -> &'static str {
-    match io.raw_os_error() {
-        Some(32) | Some(33) => FILE_IN_USE,
-        _ => code_for_io_kind(io.kind()),
+/// An error of the elevated helper, rebuilt by the launcher from the pipe
+/// (`IpcError::into_ta`) with what the helper read from its typed causes. Only
+/// the text of the original chain crosses, so it displays that text and has
+/// no source.
+#[derive(Debug)]
+pub struct Carried {
+    pub text: String,
+    pub cause: CarriedCause,
+}
+
+#[derive(Debug)]
+pub enum CarriedCause {
+    Network(net_failure::NetFailure),
+    /// The `code_for_local_io` code of a local io error.
+    LocalIo(&'static str),
+}
+
+impl fmt::Display for Carried {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.text)
     }
 }
 
-pub fn code_for_network_type(kind: &crate::fs::NetworkErrorType) -> &'static str {
-    use crate::fs::NetworkErrorType as N;
-    match kind {
-        N::DownloadStalled | N::DownloadTooSlow => DOWNLOAD_STALLED,
-        N::ConnectionTimeout | N::RequestTimeout => DOWNLOAD_TIMEOUT,
-        N::DnsResolutionFailed | N::NetworkUnreachable => DOWNLOAD_REFUSED,
-        _ => DOWNLOAD_FAILED,
-    }
-}
+impl std::error::Error for Carried {}
 
-/// `io::Error::source()` skips the custom payload itself, so the stream layer's
-/// `ClassifiedNetworkError` has to be read through `get_ref()`.
-fn classified_ref(io: &std::io::Error) -> Option<&crate::fs::ClassifiedNetworkError> {
-    io.get_ref()
-        .and_then(|e| e.downcast_ref::<crate::fs::ClassifiedNetworkError>())
-}
-
-/// Download-family code inferred from typed causes only. `None` when the chain
-/// has no network / io / HTTP-status cause (e.g. a malformed API response).
-fn download_code(err: &anyhow::Error) -> Option<&'static str> {
-    download_code_in(err.chain())
-}
-
-fn download_code_in<'a>(
-    chain: impl IntoIterator<Item = &'a (dyn std::error::Error + 'static)>,
-) -> Option<&'static str> {
-    for cause in chain {
-        if let Some(c) = cause.downcast_ref::<crate::fs::ClassifiedNetworkError>() {
-            return Some(code_for_network_type(&c.error_type));
-        }
+/// Code of the first local io error in a chain without a network cause. An io
+/// error that only carries another error (`io::Error::other`, as a stream
+/// reports a failure of its producer) gives way to an io error further down,
+/// which says what actually failed.
+pub fn local_io_code(err: &anyhow::Error) -> Option<&'static str> {
+    let mut carrier = None;
+    for cause in err.chain() {
         if let Some(io) = cause.downcast_ref::<std::io::Error>() {
-            if let Some(c) = classified_ref(io) {
-                return Some(code_for_network_type(&c.error_type));
+            let carries = io.kind() == std::io::ErrorKind::Other
+                && io.raw_os_error().is_none()
+                && io.get_ref().is_some();
+            if !carries {
+                return Some(code_for_local_io(io));
             }
-            return Some(code_for_io_kind(io.kind()));
+            carrier.get_or_insert(io);
+            continue;
         }
-        if let Some(e) = reqwest_ref(cause) {
-            return Some(code_for_reqwest(e));
-        }
-        if cause.downcast_ref::<crate::dfs::HttpStatus>().is_some() {
-            return Some(SERVER_HTTP_ERROR);
+        if let Some(carried) = cause.downcast_ref::<Carried>() {
+            return match carried.cause {
+                CarriedCause::LocalIo(code) => Some(code),
+                CarriedCause::Network(_) => None,
+            };
         }
     }
-    None
+    carrier.map(code_for_local_io)
 }
 
-/// Code to record in `InsightItem.error`: the hung code if any, otherwise the
-/// download-family inference, otherwise `INTERNAL_ERROR`.
-pub fn insight_code(err: &anyhow::Error) -> &'static str {
-    match extract(err) {
-        Extracted::Cancelled => "cancelled",
-        Extracted::Coded(c) => c.code,
-        Extracted::Uncoded { .. } => download_code(err).unwrap_or(INTERNAL_ERROR),
+/// The chain text led by the network failure tag. A failed body read already
+/// names it (`ClassifiedNetworkError` displays the tag first).
+fn tagged_detail(tag: &str, err: &anyhow::Error) -> String {
+    let text = strip_urls(&format!("{err:#}"));
+    if text.contains(tag) {
+        text
+    } else if text.is_empty() {
+        tag.to_string()
+    } else {
+        format!("{tag}: {text}")
     }
 }
 
-pub fn insight_code_for_io(io: &std::io::Error) -> &'static str {
-    let dyn_err: &(dyn std::error::Error + 'static) = io;
-    download_code_in(std::iter::once(dyn_err)).unwrap_or(FILE_IO_FAILED)
+/// Value for `InsightItem.error`: the network failure tag if the chain has a
+/// network cause, otherwise the hung code, otherwise the code of a local io
+/// cause, otherwise `INTERNAL_ERROR`.
+pub fn insight_code(err: &anyhow::Error) -> String {
+    let extracted = extract(err);
+    if matches!(extracted, Extracted::Cancelled) {
+        return "cancelled".into();
+    }
+    if let Some(failure) = net_failure::find(err.as_ref()) {
+        return failure.tag;
+    }
+    match extracted {
+        Extracted::Coded(c) => c.code.into(),
+        _ => local_io_code(err).unwrap_or(INTERNAL_ERROR).into(),
+    }
 }
 
 fn metadata_code(err: &anyhow::Error) -> &'static str {
@@ -680,6 +699,8 @@ pub fn attach_download(
 
 /// Like `attach_download`, but a chain without any network / io / HTTP-status
 /// cause (the peer answered, the answer is unusable) gets `fallback` instead.
+/// With a network cause, the detail also names its tag, the value the DFS
+/// insight records.
 pub fn attach_download_or(
     err: anyhow::Error,
     fallback: &'static str,
@@ -689,7 +710,12 @@ pub fn attach_download_or(
     if already_coded(&err) {
         return err;
     }
-    let mut coded = Coded::bare(download_code(&err).unwrap_or(fallback));
+    let failure = net_failure::find(err.as_ref());
+    let mut coded = Coded::bare(match &failure {
+        Some(failure) => failure.code,
+        None => local_io_code(&err).unwrap_or(fallback),
+    });
+    coded.detail = failure.map(|f| tagged_detail(&f.tag, &err));
     coded.subject = subject.map(str::to_string);
     coded.sid = sid.map(str::to_string);
     attach_coded(coded, err)
@@ -811,6 +837,30 @@ mod tests {
             }
             other => panic!("expected Coded, got {other:?}"),
         }
+
+        // nothing is left of the brackets or the space around a removed URL
+        for (text, stripped) in [
+            (
+                "error sending request for url (https://a.example/f): timed out",
+                "error sending request for url: timed out",
+            ),
+            ("NET_EOF [http://a.example/f]: closed", "NET_EOF: closed"),
+            (
+                "in create_http_stream: http://a.example/f: refused",
+                "in create_http_stream: refused",
+            ),
+            ("http://a.example/f failed", "failed"),
+            // every scheme, not only http(s)
+            (
+                "in create_http_stream: ssh+http://h:22/f: 404",
+                "in create_http_stream: 404",
+            ),
+            ("SFTP sftp://h/f#user=u&pass=p: x", "SFTP x"),
+            ("下载sftp://h/f失败", "下载"),
+            ("not a url: ://x", "not a url: ://x"),
+        ] {
+            assert_eq!(strip_urls(text), stripped);
+        }
     }
 
     #[test]
@@ -831,13 +881,13 @@ mod tests {
 
     #[test]
     fn download_or_uses_fallback_only_without_network_cause() {
-        let typed = attach_download_or(
-            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+        let local = attach_download_or(
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::StorageFull)),
             NO_DOWNLOAD_NODE,
             None,
             None,
         );
-        assert!(matches!(extract(&typed), Extracted::Coded(c) if c.code == DOWNLOAD_TIMEOUT));
+        assert!(matches!(extract(&local), Extracted::Coded(c) if c.code == DISK_FULL));
 
         let status = attach_download_or(
             anyhow::Error::new(crate::dfs::HttpStatus::new(503, "busy")),
@@ -856,18 +906,39 @@ mod tests {
         assert!(matches!(extract(&garbage), Extracted::Coded(c) if c.code == NO_DOWNLOAD_NODE));
 
         let stalled = attach_download(
-            anyhow::Error::new(std::io::Error::from(
-                crate::fs::ClassifiedNetworkError::new(
-                    crate::fs::NetworkErrorType::DownloadStalled,
-                    Box::new(std::io::Error::other("stalled")),
-                    "https://x".into(),
-                    vec![],
-                ),
-            )),
+            anyhow::Error::new(std::io::Error::other(crate::fs::ClassifiedNetworkError {
+                failure: net_failure::NetFailure::stalled(),
+                original_error: "stalled".into(),
+                url: "https://x".into(),
+            })),
             None,
             None,
         );
         assert!(matches!(extract(&stalled), Extracted::Coded(c) if c.code == DOWNLOAD_STALLED));
+    }
+
+    /// An io error that only carries another error, as a stream reports a
+    /// failure of its producer, takes the code of the io error under it.
+    #[test]
+    fn local_io_code_looks_through_carrying_io_errors() {
+        #[derive(Debug)]
+        struct Producer(std::io::Error);
+        impl fmt::Display for Producer {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("producer failed")
+            }
+        }
+        impl std::error::Error for Producer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let in_use = || std::io::Error::from_raw_os_error(32);
+        let carried = |payload: Box<dyn std::error::Error + Send + Sync>| {
+            local_io_code(&anyhow::Error::new(std::io::Error::other(payload)).context("read"))
+        };
+        assert_eq!(carried(Box::new(Producer(in_use()))), Some(FILE_IN_USE));
+        assert_eq!(carried("no io below".into()), Some(FILE_IO_FAILED));
     }
 
     #[test]

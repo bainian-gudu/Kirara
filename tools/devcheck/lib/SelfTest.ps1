@@ -168,18 +168,6 @@ jobs:
         -Run { Test-Frontend } `
         -Cleanup { Restore-RepoFile -Backup (Get-RepoBackupPath -Path $agreementFile) -Path $agreementFile }
 
-    # ---- front：类型仍然合法、但把协议净化改坏（只有 vitest 抓得到）----
-    #      证明单测不是摆设：tsc 只看得懂类型，`<script>` 会不会被剥掉只有用例知道。
-    Add-Case 'front 层能抓到协议净化被改坏' `
-        -Mutate {
-            $original = [System.IO.File]::ReadAllText($agreementFile)
-            $mutated = $original.Replace("'script',", "'script2',")
-            if ($mutated -eq $original) { throw '注入失败：没找到 FORBID_TAGS 里的 script 项' }
-            [System.IO.File]::WriteAllText($agreementFile, $mutated)
-        } `
-        -Run { Test-Frontend } `
-        -Cleanup { Restore-RepoFile -Backup (Get-RepoBackupPath -Path $agreementFile) -Path $agreementFile }
-
     # ---- ci：工作流里的 action 版本低于登记的下限 ----
     $devcheckYml = Join-Path $RepoRoot '.github/workflows/devcheck.yml'
     Add-Case 'ci 层能抓到 action 版本低于下限' `

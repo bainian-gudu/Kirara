@@ -20,7 +20,7 @@ Status: implemented
 
 ### E2E 场景
 
-`tests/dfs2.mjs` 提供 `online-install-dfs2` 和 `online-update-dfs2`。两个场景验证 metadata、session、MD5 challenge、批量签名 URL、Range 下载、session 删除和最终文件集；`assertDfs2BatchCoverage` 要求 batch endpoint 被调用、single URL 请求为零、实际下载 ranges 全部由 batch response 覆盖，且 batch 请求过的每个 range 都被实际下载。
+`tests/dfs2.mjs` 提供 `online-install-dfs2`、`online-update-dfs2` 和 `online-install-dfs2-sliced`。前两个场景验证 metadata、session、MD5 challenge、批量签名 URL、Range 下载、session 删除和最终文件集；`online-install-dfs2-sliced` 验证切片与首片失败后的整文件回退。`assertDfs2BatchCoverage` 要求 batch endpoint 被调用、single URL 请求为零、batch 请求的每个 range 都在创建 session 时申报过、实际下载 ranges 全部由 batch response 覆盖，且 batch 请求过的每个 range 都被实际下载。
 
 `tests/updater-survival.mjs` 使用普通 packed HTTP source，不绑定 DFS2。测试 server 在 v2 metadata/index 请求完成并开始实际 Range 下载后持续断开连接；更新进程失败，安装目录中的受管文件和 canonical updater 保持 v1，staging 被清理；关闭故障后再次运行 updater 成功更新到 v2。该场景代表阶段一网络失败，并不为每种故障变体增加独立矩阵项。
 
@@ -31,6 +31,8 @@ Status: implemented
 `package.json` 提供 `test:dfs2` 和 `test:updater-survival`，`test:all` 将两个聚合入口加入完整回归。CI matrix 保留原有十项场景，并增加一个 `dfs2` 聚合 job 和一个 `updater-survival` 聚合 job，不为故障变体逐项增加 job。
 
 CI 另设 `unit-test` job，在 Windows 2022 上执行 `cargo test`；release job 等待该 job 成功后才发布。
+
+场景脚本经 `tests/utils.mjs` 的 `runInstaller` 用 `child_process.spawn` 直接拉起安装器，`assertExitOk` 断言的是安装器自己的退出码。经 zx 的 pwsh `& exe` 启动时，release 构建（GUI 子系统）的安装器无论以何退出码结束，结果都是 0，见[进程退出不拆除 msquic](./2026-11-05-exit-without-msquic-teardown.md)的 Verification。
 
 测试 server 的故障控制只读取测试进程环境变量，不进入 installer 的 release binary。正式 release binary 不包含阶段退出或自动取消的测试逻辑。
 
