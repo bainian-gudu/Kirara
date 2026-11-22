@@ -398,6 +398,12 @@ mod tests {
             r"..\..\Windows\System32\gone.dll".to_string(),
             String::new(),
         ];
+        // 上游 f2a5184 起只删「扫描确实看到」的文件，越界项也要先进扫描才轮得到下面那道安全阀。
+        input.local = DiskFiles::new(vec![
+            local("old.txt", "o"),
+            local(r"..\..\Windows\System32\gone.dll", "g"),
+            local("", "e"),
+        ]);
         let plan = build_plan(&input);
         assert_eq!(
             plan.files

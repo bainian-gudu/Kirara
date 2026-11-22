@@ -74,14 +74,19 @@ $script:LogicMirrorcItems = @(
     @{ Kind = 'fn'; Name = 'decode_entry_name' }
 )
 
-# 包体识别（PE 起点）与嵌入名规则：识别错了会拿安装器当 builder 打包，嵌入名两边
-# 不一致会静默丢数据。
+# bundle 里 PE 起点扫描（builder 侧）：识别错了会拿安装器当 builder 打包。
 $script:LogicBuilderItems = @(
+    @{ Kind = 'fn'; Name = 'pe_image_starts' }
+)
+
+# PE 起点识别与嵌入名 hash 选择自上游 f2a5184 起搬进 pack_format.rs（builder 与安装器共用）。
+$script:LogicPackFormatItems = @(
     @{ Kind = 'const'; Name = 'PE_LFANEW_MIN' }
     @{ Kind = 'const'; Name = 'PE_LFANEW_MAX' }
     @{ Kind = 'fn'; Name = 'preferred_file_hash' }
-    @{ Kind = 'fn'; Name = 'pe_image_starts' }
     @{ Kind = 'fn'; Name = 'is_pe_at' }
+    @{ Kind = 'fn'; Name = 'le_u32' }
+    @{ Kind = 'fn'; Name = 'relative_under_root' }
 )
 
 # 嵌入名长度与保留名规则（TLV / 索引名）。
@@ -104,7 +109,6 @@ $script:LogicEmbeddedItems = @(
 
 # 解包路径安全阀：包内相对路径必须落在输出根内。
 $script:LogicExtractItems = @(
-    @{ Kind = 'fn'; Name = 'relative_under_root' }
     @{ Kind = 'fn'; Name = 'sanitize_output_name' }
 )
 
@@ -138,6 +142,7 @@ function New-LogicGen {
     $secureTemp = Read-RustSource -Path (Join-Path $native 'utils/secure_temp.rs')
     $mirrorc = Read-RustSource -Path (Join-Path $native 'thirdparty/mirrorc.rs')
     $builderLocal = Read-RustSource -Path (Join-Path $native 'builder/local.rs')
+    $packFormat = Read-RustSource -Path (Join-Path $native 'pack_format.rs')
     $embeddedName = Read-RustSource -Path (Join-Path $native 'embedded_name.rs')
     $builderExtract = Read-RustSource -Path (Join-Path $native 'builder/extract.rs')
     $h3 = Read-RustSource -Path (Join-Path $native 'capabilities/h3.rs')
@@ -165,6 +170,7 @@ fn has_reparse_point(path: &Path) -> bool {
         @{ Items = $script:LogicSecureTempItems;   Src = $secureTemp;   Name = 'utils/secure_temp.rs' }
         @{ Items = $script:LogicMirrorcItems;      Src = $mirrorc;      Name = 'thirdparty/mirrorc.rs' }
         @{ Items = $script:LogicBuilderItems;      Src = $builderLocal; Name = 'builder/local.rs' }
+        @{ Items = $script:LogicPackFormatItems;   Src = $packFormat;   Name = 'pack_format.rs' }
         @{ Items = $script:LogicEmbeddedItems;     Src = $embeddedName; Name = 'embedded_name.rs' }
         @{ Items = $script:LogicExtractItems;      Src = $builderExtract; Name = 'builder/extract.rs' }
         @{ Items = $script:LogicH3Items;           Src = $h3;           Name = 'capabilities/h3.rs' }

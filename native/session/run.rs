@@ -32,7 +32,7 @@ use crate::session::merge::{
 };
 use crate::session::plan::{
     build_plan, collect_skip_hash, files_to_probe_writable, is_under, join_install,
-    mark_unwritable, normalize_rel, strip_install_prefix, DiskFiles,
+    mark_unwritable, normalize_existing, normalize_rel, strip_install_prefix, DiskFiles,
     HashKey, InstallPlan, LocalFile, PlanAction, PlanInput, SkipReason,
 };
 use crate::session::source::{
@@ -1731,13 +1731,13 @@ async fn prepare_process(
         let IpcResult::FindProcessByName(procs) = found else {
             bail!("IPC_SHAPE_ERR");
         };
-        let target = join_install(&settings.install_path, name)
-            .replace('\\', "/")
-            .to_lowercase();
+        // 安装目录可能来自 8.3 短名（%TEMP% / RUNNER~1 之类），进程路径却是长名；
+        // 统一按 long form 比较，否则「正在运行的 app.exe」会被判成不匹配而漏杀。
+        let target = normalize_existing(&join_install(&settings.install_path, name));
         running.extend(
             procs
                 .into_iter()
-                .filter(|(_, path)| path.replace('\\', "/").to_lowercase() == target),
+                .filter(|(_, path)| !path.is_empty() && normalize_existing(path) == target),
         );
     }
     if running.is_empty() {
