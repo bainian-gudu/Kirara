@@ -4,13 +4,14 @@
 //! （崩溃对话框、退出后自删的 `cmd`）。std 的 `Command` 为通用性携带 stdio 管道、
 //! 环境块合并、PATH 解析等代码，本模块只保留命令行拼接与一个 `hide_window` 开关。
 //! 退出清理的 `cmd /S /C` 不把用户路径拼进命令行，见 [`spawn_system_cmd`]。
+//! kachina-sfx 拉起应用时另带环境变量与来源快捷方式，见 [`spawn_from_link`]。
 //!
 //! 子进程不继承句柄、不进 Job，父进程退出后继续存活；拉起即走的调用方直接丢弃
 //! 返回的 [`Child`] 即可。
 
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
 use windows::core::{HSTRING, PCWSTR, PWSTR};
@@ -18,7 +19,7 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED};
 use windows::Win32::System::Threading::{
     CreateProcessW, GetExitCodeProcess, GetProcessId, WaitForSingleObject, CREATE_NO_WINDOW,
     CREATE_UNICODE_ENVIRONMENT, INFINITE, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
-    STARTUPINFOW,
+    STARTF_TITLEISLINKNAME, STARTUPINFOW,
 };
 use windows::Win32::UI::Shell::{
     ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW,
@@ -32,6 +33,16 @@ pub struct Child(HANDLE);
 unsafe impl Send for Child {}
 
 impl Child {
+    /// 接管一个进程句柄，例如 `ShellExecuteExW` 在 `SEE_MASK_NOCLOSEPROCESS` 下返回的
+    /// `hProcess`；Drop 时关闭。
+    ///
+    /// # Safety
+    /// `handle` 必须是有效的进程句柄，且此后不再由别处关闭。
+    #[allow(dead_code)] // kachina-sfx 的提权拉起用；安装器的提权助手自己持有句柄
+    pub unsafe fn from_raw(handle: HANDLE) -> Self {
+        Self(handle)
+    }
+
     /// 阻塞等待子进程退出并返回退出码。
     pub async fn wait(self) -> io::Result<u32> {
         tokio::task::spawn_blocking(move || self.wait_blocking())
@@ -73,7 +84,26 @@ pub fn spawn<P: AsRef<OsStr>, A: AsRef<OsStr>>(
 ) -> io::Result<Child> {
     let mut cmdline = make_command_line(program.as_ref(), args.iter().map(AsRef::as_ref));
     cmdline.push(0);
-    create_process(None, &mut cmdline, None, hide_window)
+    create_process(None, &mut cmdline, None, hide_window, None)
+}
+
+/// 与 [`spawn`] 一样拉起 `program`（窗口不隐藏），子进程的环境是本进程的环境叠加
+/// `extra_env`。
+///
+/// `link` 给出时作为来源快捷方式（`STARTF_TITLEISLINKNAME`）传给子进程：任务栏把它的窗口
+/// 认作从这个 `.lnk` 启动，固定到任务栏时固定的是 `.lnk` 的目标而不是 `program`。子进程自己
+/// 调用 `SetCurrentProcessExplicitAppUserModelID` 后这个身份被它设的 AppID 取代。
+#[allow(dead_code)] // kachina-sfx 拉起应用用
+pub fn spawn_from_link<P: AsRef<OsStr>, A: AsRef<OsStr>, V: AsRef<OsStr>>(
+    program: P,
+    args: &[A],
+    extra_env: &[(&str, V)],
+    link: Option<&OsStr>,
+) -> io::Result<Child> {
+    let mut cmdline = make_command_line(program.as_ref(), args.iter().map(AsRef::as_ref));
+    cmdline.push(0);
+    let mut env = (!extra_env.is_empty()).then(|| unicode_env_block(extra_env));
+    create_process(None, &mut cmdline, env.as_deref_mut(), false, link)
 }
 
 /// `%SystemRoot%\System32\cmd.exe /S /C "<command>"`。
@@ -95,6 +125,7 @@ pub fn spawn_system_cmd(
         &mut cmdline,
         env.as_deref_mut(),
         hide_window,
+        None,
     )
 }
 
@@ -119,16 +150,15 @@ fn create_process(
     cmdline: &mut [u16],
     env: Option<&mut [u16]>,
     hide_window: bool,
+    link: Option<&OsStr>,
 ) -> io::Result<Child> {
-    let mut app = application.map(|a| {
-        let mut w: Vec<u16> = a.encode_wide().collect();
-        w.push(0);
-        w
-    });
-    let app_ptr = match app.as_mut() {
+    let wide = |s: &OsStr| -> Vec<u16> { s.encode_wide().chain(std::iter::once(0)).collect() };
+    let app = application.map(wide);
+    let app_ptr = match app.as_ref() {
         Some(w) => PCWSTR(w.as_ptr()),
         None => PCWSTR::null(),
     };
+    let mut link = link.map(wide);
     let mut flags = if hide_window {
         CREATE_NO_WINDOW
     } else {
@@ -137,10 +167,14 @@ fn create_process(
     if env.is_some() {
         flags |= CREATE_UNICODE_ENVIRONMENT;
     }
-    let si = STARTUPINFOW {
+    let mut si = STARTUPINFOW {
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,
         ..Default::default()
     };
+    if let Some(link) = link.as_mut() {
+        si.dwFlags |= STARTF_TITLEISLINKNAME;
+        si.lpTitle = PWSTR(link.as_mut_ptr());
+    }
     let mut pi = PROCESS_INFORMATION::default();
     unsafe {
         CreateProcessW(
@@ -160,7 +194,7 @@ fn create_process(
     Ok(Child(pi.hProcess))
 }
 
-fn unicode_env_block(extra: &[(&str, &str)]) -> Vec<u16> {
+fn unicode_env_block<V: AsRef<OsStr>>(extra: &[(&str, V)]) -> Vec<u16> {
     let mut block = Vec::new();
     'parent: for (k, v) in std::env::vars_os() {
         for (ek, _) in extra {
@@ -171,7 +205,7 @@ fn unicode_env_block(extra: &[(&str, &str)]) -> Vec<u16> {
         push_env_pair(&mut block, &k, &v);
     }
     for (k, v) in extra {
-        push_env_pair(&mut block, OsStr::new(*k), OsStr::new(*v));
+        push_env_pair(&mut block, OsStr::new(*k), v.as_ref());
     }
     block.push(0);
     block
@@ -198,6 +232,19 @@ pub fn shell_open<P: AsRef<OsStr>>(target: P) -> io::Result<()> {
     };
     unsafe { ShellExecuteExW(&mut sei)? };
     Ok(())
+}
+
+/// 参数按 [`spawn`] 的规则拼成一条不含程序名的命令行，用作 `ShellExecuteExW` 的 `lpParameters`。
+#[allow(dead_code)] // kachina-sfx 的提权拉起用；安装器的提权助手参数自行拼接
+pub fn join_args<A: AsRef<OsStr>>(args: &[A]) -> OsString {
+    let mut line = Vec::new();
+    for (i, arg) in args.iter().enumerate() {
+        if i > 0 {
+            line.push(b' ' as u16);
+        }
+        append_arg(&mut line, arg.as_ref(), false);
+    }
+    OsString::from_wide(&line)
 }
 
 /// 与 `std::process::Command` 在 Windows 上的拼接规则一致：argv[0] 总是加引号；
@@ -270,6 +317,13 @@ mod tests {
     }
 
     #[test]
+    fn joined_args_have_no_program_and_same_escaping() {
+        let joined = join_args(&["/c", "exit 42", r#"say "hi""#]);
+        assert_eq!(joined, OsString::from(r#"/c "exit 42" "say \"hi\"""#));
+        assert_eq!(join_args::<&str>(&[]), OsString::new());
+    }
+
+    #[test]
     fn spawn_system_cmd_reads_exit_code() {
         let child = spawn_system_cmd("exit 7", &[], true).unwrap();
         assert_eq!(child.wait_blocking().unwrap(), 7);
@@ -293,6 +347,41 @@ mod tests {
         assert!(pairs
             .iter()
             .any(|(k, _)| k.eq_ignore_ascii_case("SystemRoot")));
+    }
+
+    #[test]
+    fn child_sees_the_link_it_started_from_and_the_extra_env() {
+        use windows::Win32::System::Threading::GetStartupInfoW;
+        const PROBE: &str = "KACHINA_STARTUP_PROBE";
+        // 子进程是本测试程序自己：带 PROBE 变量时只把自己的启动信息写到它给的路径
+        if let Some(report) = std::env::var_os(PROBE) {
+            let mut si = STARTUPINFOW::default();
+            unsafe { GetStartupInfoW(&mut si) };
+            let from_link = si.dwFlags.contains(STARTF_TITLEISLINKNAME);
+            let title = unsafe { si.lpTitle.to_string() }.unwrap_or_default();
+            std::fs::write(report, format!("{from_link} {title}")).unwrap();
+            return;
+        }
+
+        let report =
+            std::env::temp_dir().join(format!("kachina-startup-probe-{}.txt", std::process::id()));
+        let link = r"C:\Portable Apps\App.lnk";
+        let exe = std::env::current_exe().unwrap();
+        let filter = [
+            "child_sees_the_link_it_started_from_and_the_extra_env",
+            "--test-threads=1",
+        ];
+        let child = spawn_from_link(
+            &exe,
+            &filter,
+            &[(PROBE, report.as_os_str())],
+            Some(OsStr::new(link)),
+        )
+        .unwrap();
+        assert_eq!(child.wait_blocking().unwrap(), 0);
+        let seen = std::fs::read_to_string(&report).unwrap();
+        let _ = std::fs::remove_file(&report);
+        assert_eq!(seen, format!("true {link}"));
     }
 
     #[test]

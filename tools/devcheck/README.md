@@ -30,7 +30,7 @@ pwsh tools/devcheck/devcheck.ps1 -SkipInstall    # 缺工具链时 SKIP 而不�
 | `gen` | 从 `native/` 按名字抽出 logic 层要断言的 item | pwsh 7 | ~0.3s |
 | `rust` | 根 crate 的 `cargo check --target x86_64-pc-windows-msvc --all-targets`（含 lib/bin/单测目标） | cargo + MSVC（`cl.exe`） | 首次数分钟，之后 ~1s |
 | `logic` | 被抽出来的安全阀与纯逻辑的**行为断言**（160 条）：路径越界、删目录 / 删快捷方式 / 删计划任务 / 环境变量展开 / 跨用户重放 / `%TEMP%` 白名单、安装计划归一化与模板展开、未识别配置键点名、协议内联、包体 PE 识别、嵌入名规则、解包路径越界、zip 条目名解码、微软签名判定、H3 证书固定（用 openssl 交叉验证过的样例证书） | cargo | 首次 ~15s，之后 ~0.4s |
-| `front` | 仓库自己的 `tsc --noEmit`（`web/` 全量 strict）+ `vitest run` + 协议渲染文件的 prettier | node + pnpm | ~10s |
+| `front` | 仓库自己的 `tsc --noEmit`（`web/` 全量 strict）+ 协议渲染文件的 prettier | node + pnpm | ~8s |
 | `ci` | 工作流里 action 的版本不低于下面登记的下限、每一层都真的接进了 `devcheck.yml`、构建入口与交付名一致 | pwsh 7 | ~1s |
 
 全套热跑 ≈ 15 秒（`rust` 依赖 Windows + MSVC，缺平台时直接 SKIP）。
@@ -123,7 +123,8 @@ openssl x509 -in dc.crt -pubkey -noout | openssl pkey -pubin -outform DER | open
 旧架构下前端要装一整套 Tauri / Vue 依赖，所以 devcheck 自带一个最小 TS 工程。
 现在前端就是仓库根的一份 Preact + TS 源码，根 `tsconfig.json` 才是构建真正用的
 那份 —— 再维护第二份最小工程只会与它漂移。所以这一层直接跑
-`pnpm exec tsc --noEmit`、`pnpm test`（vitest）以及协议渲染文件的 prettier。
+`pnpm exec tsc --noEmit` 以及协议渲染文件的 prettier。前端单测随上游一并删除，
+这一层不再跑 vitest。
 
 prettier 只查 `web/agreement.ts`：`web/` 其余文件沿用上游既有格式，全量检查会把
 上游代码的风格当成回归。
@@ -146,7 +147,7 @@ prettier 只查 `web/agreement.ts`：`web/` 其余文件沿用上游既有格式
 17 个用例覆盖上面每一层，包括：源码变成 submodule、工作流里出现外部拉取、ARP 用了
 不存在的选项、`rescle.cc` 用回 `locale::empty()`、遥测调用 / 依赖 / 上报域名回到树里、
 停更依赖被写回、抽取清单里的 item 被改名、删目录安全阀被放宽、Rust 类型错误、
-TS 类型错误、协议净化被改坏（只有 vitest 抓得到）、action 版本低于下限、
+TS 类型错误、action 版本低于下限、
 工作流不再跑 `all` 集合、`build` 脚本丢掉拼接一步。
 
 `-SelfTest` 会临时改写**仓库里的真实文件**来验证各层真的会报错，因此有两个保护：

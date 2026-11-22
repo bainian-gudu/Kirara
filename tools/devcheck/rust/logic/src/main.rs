@@ -9,7 +9,7 @@
 //!
 //! 其余全是仓库原码。断言失败 → 退出码 1。
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 // ---- 仓库模块路径的 shim ----
@@ -616,23 +616,23 @@ fn main() {
         "索引名字超一个字节拒绝",
     );
 
-    group("解包路径安全阀 builder/extract.rs");
+    group("解包路径安全阀 pack_format.rs");
     let out_root = abs("/out");
     eq(
         relative_under_root(&out_root, "a/b").map(|p| posix(&p)),
-        Ok(format!("{}/a/b", posix(&out_root))),
+        Some(format!("{}/a/b", posix(&out_root))),
         "普通相对路径拼在输出根下",
     );
     check(
-        relative_under_root(&out_root, "../x").is_err(),
+        relative_under_root(&out_root, "../x").is_none(),
         "`..` 拒绝",
     );
     check(
-        relative_under_root(&out_root, "/abs").is_err(),
+        relative_under_root(&out_root, "/abs").is_none(),
         "绝对路径拒绝",
     );
     check(
-        relative_under_root(&out_root, "").is_err(),
+        relative_under_root(&out_root, "").is_none(),
         "空路径拒绝",
     );
     // `Path::components()` 会把中间的 `.` 归一掉（只有开头的 `.` 会留下 CurDir
@@ -644,7 +644,7 @@ fn main() {
         "中间的 `.` 归一后仍在根内",
     );
     check(
-        relative_under_root(&out_root, "./a").is_err(),
+        relative_under_root(&out_root, "./a").is_none(),
         "开头的 `.` 拒绝",
     );
     eqs(sanitize_output_name(""), "_unnamed", "空名换成占位名");

@@ -2,7 +2,6 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use base64::Engine;
 use serde_json::Value;
 
 use crate::cli::arg::InstallArgs;
@@ -67,6 +66,16 @@ impl GuiRuntime {
         }
     }
 
+    /// Cancel state shown for the running session; `Unavailable` when no
+    /// progress is shown.
+    pub fn cancel_state(&self) -> crate::session::state::CancelState {
+        let session = self.session.lock().unwrap_or_else(|e| e.into_inner());
+        match &session.state.phase {
+            Phase::Running(progress) => progress.cancel,
+            _ => crate::session::state::CancelState::Unavailable,
+        }
+    }
+
     fn fresh_cancel(&self) -> tokio_util::sync::CancellationToken {
         let token = tokio_util::sync::CancellationToken::new();
         *self.cancel.lock().unwrap_or_else(|e| e.into_inner()) = token.clone();
@@ -104,22 +113,9 @@ pub async fn prepare_gui(args: InstallArgs, preset: Option<SessionInput>) -> Arc
         None => return failed_runtime_with_config(config, Coded::bare(PKG_BROKEN)),
     };
 
-    if let (Some(index), Some(files)) = (&config.embedded_index, &config.embedded_files) {
-        let mut broken = false;
-        for i in index {
-            match files.iter().find(|e| e.name == i.name) {
-                None => broken = true,
-                Some(target) if target.offset != i.offset || target.raw_offset != i.raw_offset => {
-                    broken = true;
-                }
-                _ => {}
-            }
-        }
-        if broken {
-            tracing::error!("embedded index does not match packed files");
-            return ready_runtime(args, preset, config, project, Some(Coded::bare(PKG_BROKEN)))
-                .await;
-        }
+    if !config.index_matches_blocks() {
+        tracing::error!("embedded index does not match packed files");
+        return ready_runtime(args, preset, config, project, Some(Coded::bare(PKG_BROKEN))).await;
     }
 
     let is_uninstall = config.is_uninstall || args.uninstall;
@@ -211,6 +207,7 @@ async fn ready_runtime(
         },
         project: ProjectView {
             window_title: project.window_title.clone(),
+            app_name: project.app_name.clone(),
             title: project.title.clone(),
             description: project.description.clone(),
             borderless: project.window_borderless.unwrap_or(false),
@@ -349,14 +346,11 @@ pub(crate) fn visible_sources(project: &ProjectConfig, _current_uri: &str) -> Ve
     }
 }
 
-fn apply_theme(image_b64: Option<&str>) -> Theme {
-    let Some(b64) = image_b64.filter(|s| !s.is_empty()) else {
-        return Theme::None;
-    };
-    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) else {
-        return Theme::None;
-    };
-    identify_and_install_theme(&bytes)
+fn apply_theme(image: Option<&[u8]>) -> Theme {
+    match image {
+        Some(bytes) if !bytes.is_empty() => identify_and_install_theme(bytes),
+        _ => Theme::None,
+    }
 }
 
 fn identify_and_install_theme(bytes: &[u8]) -> Theme {
@@ -413,7 +407,7 @@ pub(crate) fn settings_from_ui(
     let st = &sess.state;
     let registry = sess.registry.clone().unwrap_or_default();
     Settings {
-        install_path: st.options.install_path.clone(),
+        install_path: crate::utils::path::long_path(&st.options.install_path),
         source_uri: st.options.source_uri.clone(),
         create_lnk: st.options.create_lnk,
         delete_user_data: st.options.delete_user_data,

@@ -38,11 +38,7 @@ pub struct UiState {
     pub pending: Option<Prompt>,     // 有值即显示模态确认
 }
 
-pub struct Progress {
-    step: Option<u8>, stage: ProgressStage, subject: Option<String>, percent: Option<f64>,
-    cancel: CancelState, summary: Option<ProgressCounter>,
-    processing_bps: Option<u64>, network_bps: Option<u64>, network_pending: bool,
-}
+pub struct Progress { sub_step: u32, percent: f64, stage: &'static str, subject: Option<String>, done: Option<u64>, total: Option<u64> }
 pub struct Prompt { id: String, kind: &'static str, items: Vec<String>, params: BTreeMap<&'static str, String> }
 
 pub enum Intent {
@@ -107,11 +103,11 @@ pub struct Coded {
 
 - **构造只有两种方式**：对已有错误 `.attach(code)` / `.attach_with(code, subject)`（`Result` 与 `anyhow::Error` 上的 `Attach` trait），或无源错误的 `Coded::bare(code)` / `Coded::bare_with(code, subject)`。没有接收消息字符串的构造器。
 - **`attach` 的语义是"若尚未挂码，则为此码"**：链上已有 `Coded` 时原样返回。内层操作知道自己的语义先挂码，外层 `attach` 是兜底。
-- **挂码点在知道操作语义的那一层**：`utils/url.rs` 的 `HttpContextExt` 只保留上下文，不挂码；`fetch_metadata` 挂 `METADATA_*`，下载流挂 `DOWNLOAD_*`，`get_mirrorc_status` 的调用方挂 `MIRRORC_*`。网络错误细分只看类型：`fs.rs` 的 `ClassifiedNetworkError`（经 `io::Error::get_ref()` 取回）、`io::ErrorKind`、`reqwest::Error::is_timeout()` / `is_connect()`、`dfs.rs::HttpStatus`（类型化的非 2xx 响应），不做文本匹配。`attach_download_or(err, fallback)` 在无法细分时挂调用方给的兜底码。
+- **挂码点在知道操作语义的那一层**：`utils/url.rs` 的 `HttpContextExt` 只保留上下文，不挂码；`fetch_metadata` 挂 `METADATA_*`，下载流挂 `DOWNLOAD_*`，`get_mirrorc_status` 的调用方挂 `MIRRORC_*`。网络错误细分只看类型（`utils/net_failure.rs`）：沿错误链读 `reqwest`、`hyper`、`native-tls`、h3、msquic、russh 的错误，`io::ErrorKind` 与 OS 码，`dfs.rs::HttpStatus`（类型化的非 2xx 响应），以及 H3、SSH、SFTP 中间件作为原因保留下来的错误（`SshAuthRejected`、`SftpStatus`、自建超时的 io `TimedOut`、畸形报文的 io `InvalidData`）；唯一读取的文本是 native-tls 错误里的 OS 码。用户码分阶段：连接、发送请求与等待响应头时，连接类失败（DNS、拒绝、TLS、不可达、SSH 密钥交换 / 主机密钥 / 认证 / 通道、QUIC 传输层）为 `DOWNLOAD_REFUSED`，超时为 `DOWNLOAD_TIMEOUT`；读响应体时超时、停滞与过慢为 `DOWNLOAD_STALLED`；HTTP 状态为 `SERVER_HTTP_ERROR`；其余为 `DOWNLOAD_FAILED`。响应体的读错误在 `fs.rs::NetworkInsightStream` 里包成带分类结果的 `ClassifiedNetworkError`，经切片下载等路径再包成 `io::Error` 后仍按网络失败处理。同一个流核对响应体长度：范围请求以请求的长度为准，整体请求以响应头的 `Content-Length` 为准（不取 reqwest 的 `content_length()`，它对中间件包装的响应体恒为空），提前结束为 `NET_SHORT_BODY`，超出为 `NET_LONG_BODY`；范围响应的 `Content-Range`、长度或内容编码不对为发送阶段的 `NET_BAD_RANGE`，三者都是 `DOWNLOAD_FAILED`。源数据读完而 zstd 解不开时挂 `HASH_MISMATCH`，与 hash 不符同码；整体请求的响应没有声明长度时，帧在数据末尾还没完按 `NET_SHORT_BODY` 处理。链上没有网络层类型的 io 错误是本地错误，按 `code_for_local_io` 取码（共享冲突 `FILE_IN_USE`、拒绝访问 `PERMISSION_DENIED`、磁盘满 `DISK_FULL`，其余 `FILE_IO_FAILED`）；只包着另一个错误的 io 错误（`io::Error::other`，如切片下载转交的失败）不取码，取它下面的 io 错误。`attach_download_or(err, fallback)` 在链上没有网络、io 与 HTTP 状态原因时挂调用方给的兜底码；有网络原因时 detail 带上网络失败标签（即 insight 记录的值，见下）：发送阶段的失败以标签开头，响应体读失败由 `ClassifiedNetworkError` 的显示文本带出标签。错误对话框的正文因此同时有标签与系统错误文本，供用户自行排查。
 - `Coded` 作为链节点入 anyhow 链，`Display` 只输出码。DFS 会话 id 是另一个链节点 `DfsSession`：`run_dfs_install` 建立会话后用 `tag_session` 给会话内的失败打标，`extract` 时折进 `Coded.sid`。
 - **边界提取** `extract(&anyhow::Error) -> Extracted { Cancelled | Coded(Coded) | Uncoded { detail } }`，遍历链、先查 `Cancelled` 标记再查 `Coded`。`Uncoded` 是缺陷，`detail` 为整条链的 `{:#}`。
-- **上报由码的类决定**（`class_of` / `should_report_error`）：N（下载本身）、E（用户机器环境）、U（用户输入）不上报；C（打包方配置）、S（服务端 / 第三方服务）、M（第一方元数据 API）上报；`Uncoded` 上报。`fail` counter 的 `kind` 维度取 `fail_kind`：`n` / `e` / `u` / `c` / `s` / `m` / `uncoded` / `cancelled`。上报咽喉是 `TACommandError::report_if_needed`（非 pipe、无 insight、类要求上报时调用 `capture_anyhow`，返回事件 id）与 `main.rs::fatal_error`。`classify()`、`Expected`、`FailKind`、`kind_from_text`、`hide()`、`friendly()` 及中文常量不存在；`dfs.rs` 的 `InsightItem.error` 直接取码（`insight_code` / `insight_code_for_io`）。
-- 提权管道：`ipc/mod.rs::IpcError` 携带 `code` / `subject` / `sid` / `cancelled`，`into_ta` 经 `code_from_str` 还原 `Coded`，提权侧的码在主进程原样呈现。
+- **上报由码的类决定**（`class_of` / `should_report_error`）：N（下载本身）、E（用户机器环境）、U（用户输入）不上报；C（打包方配置）、S（服务端 / 第三方服务）、M（第一方元数据 API）上报；`Uncoded` 上报。`fail` counter 的 `kind` 维度取 `fail_kind`：`n` / `e` / `u` / `c` / `s` / `m` / `uncoded` / `cancelled`。上报咽喉是 `TACommandError::report_if_needed`（非 pipe、无 insight、类要求上报时调用 `capture_anyhow`，返回事件 id）与 `main.rs::fatal_error`。这条规则取代[遥测通道职责收敛](./2026-08-28-telemetry-channels.md)以 `Expected` 标记和 `classify()` 实现的过滤，该 note 的三通道分工仍然有效。`classify()`、`Expected`、`FailKind`、`kind_from_text`、`hide()`、`friendly()` 及中文常量不存在；`dfs.rs` 的 `InsightItem.error` 取 `insight_code`：链上有网络原因时为网络失败标签，否则为挂的码，再否则为本地 io 错误的码或 `INTERNAL_ERROR`。标签由下载调度器直接聚类，取名称加可选的状态、协议或 OS 码，保持低基数，例如 `NET_CONNECT_REFUSED`、`NET_READ_TIMEOUT`、`NET_EOF`、`NET_HTTP_503`、`NET_TLS:0x800b0101`、`H3_STREAM_RESET:H3_REQUEST_CANCELLED`、`QUIC_TRANSPORT:CONNECTION_REFUSED`、`SSH_HOST_KEY`、`SSH_AUTH`、`SFTP_STATUS:2`、`NET_STALLED`、`NET_SHORT_BODY`、`NET_BAD_RANGE`、`NET_OTHER`。切片下载的 `HASH_MISMATCH` 记在送来坏数据的那一片上，规则见[下载规划器](./2026-09-21-download-planner.md)的切片读取一节。
+- 提权管道：`ipc/mod.rs::IpcError` 携带 `code` / `subject` / `sid` / `cancelled`，`into_ta` 经 `code_from_str` 还原 `Coded`，提权侧的码在主进程原样呈现。错误类型不过管道：未挂码的错误带上链上的网络失败（标签与下载码），没有网络失败时带上本地 io 错误的码；`into_ta` 还原为 `utils/code.rs::Carried` 节点（显示原链文本），主进程挂码时得到与未提权路径相同的码与 detail。
 - `dfs.rs` 的 API 函数返回 `anyhow::Result<T>`；Mirror酱 数字码经 `code_for_mirrorc_status` 映射：`1001 / 8001 / 8002 / 8003 / 8004 → MIRRORC_CONFIG_INVALID`，`7001 → MIRRORC_CDK_EXPIRED`，`7002 → MIRRORC_CDK_INVALID`，`7003 → MIRRORC_CDK_QUOTA_EXCEEDED`，`7004 → MIRRORC_CDK_MISMATCH`，`7005 → MIRRORC_CDK_BANNED`，其它非零 → `MIRRORC_FAILED`；`detail` 放 API 原始 `msg`。
 
 错误码（类、是否上报、`subject` 约定）：
@@ -119,8 +115,8 @@ pub struct Coded {
 | 类 | 码 | subject |
 |---|---|---|
 | N 不上报 | `DOWNLOAD_TIMEOUT` `DOWNLOAD_REFUSED` `DOWNLOAD_FAILED` `DOWNLOAD_STALLED` `SERVER_HTTP_ERROR` `HASH_MISMATCH` `SOURCE_NEEDS_VERIFICATION` | host / 文件名 |
-| E 不上报 | `PERMISSION_DENIED` `DISK_FULL` `FILE_IN_USE` `FILE_IO_FAILED` `TEMP_DIR_UNAVAILABLE` `PROCESS_KILL_FAILED` `REGISTRY_WRITE_FAILED` `SHORTCUT_FAILED` `ELEVATE_FAILED` `RUNTIME_INSTALL_FAILED` `WEBVIEW2_REQUIRED` `WEBVIEW2_FAILED` `WEBVIEW2_FAULT` `SELF_UPDATE_FAILED` | 文件 / 键 / 运行库名 |
-| U 不上报 | `MIRRORC_CDK_MISSING` `MIRRORC_CDK_EXPIRED` `MIRRORC_CDK_INVALID` `MIRRORC_CDK_MISMATCH` `MIRRORC_CDK_QUOTA_EXCEEDED` `MIRRORC_CDK_BANNED` `INSTALL_PATH_INVALID` | — |
+| E 不上报 | `PERMISSION_DENIED` `DISK_FULL` `FILE_IN_USE` `FILE_IO_FAILED` `ROLLBACK_INCOMPLETE` `UNINSTALL_INCOMPLETE` `TEMP_DIR_UNAVAILABLE` `PROCESS_KILL_FAILED` `REGISTRY_WRITE_FAILED` `REGISTRY_READ_FAILED` `SHORTCUT_FAILED` `ELEVATE_FAILED` `RUNTIME_INSTALL_FAILED` `WEBVIEW2_REQUIRED` `WEBVIEW2_FAILED` `WEBVIEW2_FAULT` `SELF_UPDATE_FAILED` `STAGING_IN_USE` | 文件 / 键 / 运行库名 |
+| U 不上报 | `MIRRORC_CDK_MISSING` `MIRRORC_CDK_EXPIRED` `MIRRORC_CDK_INVALID` `MIRRORC_CDK_MISMATCH` `MIRRORC_CDK_QUOTA_EXCEEDED` `MIRRORC_CDK_BANNED` `INSTALL_PATH_INVALID` `ELEVATED_DRIVE_UNAVAILABLE` | — |
 | C 上报 | `PKG_BROKEN` `SOURCE_INVALID` `VERSION_REGEX_INVALID` `MIRRORC_CONFIG_INVALID` `PLUGIN_NO_UI` `PLUGIN_NOT_FOUND` `PLUGIN_FAILED` `PLUGIN_HOST_FAILED` `RUNTIME_UNSUPPORTED` `UNINSTALL_INFO_MISSING` `HASH_ALGORITHM_UNSUPPORTED` | 源 uri / 插件名 |
 | S 上报 | `SOURCE_METADATA_INVALID` `REMOTE_FILE_MISSING` `NO_DOWNLOAD_NODE` `EXTRACT_FAILED` `MIRRORC_FAILED` `MIRRORC_UNREACHABLE` | 文件名 |
 | M 上报 | `METADATA_UNREACHABLE` `METADATA_HTTP_ERROR` `METADATA_INVALID` | — |
@@ -138,7 +134,7 @@ bridge 暴露两层：`error_dialog({ code, detail, subject, sid, event_id })` �
 
 ### 进度阶段键
 
-`stage` 取值与文案键 `progress.<stage>` 一一对应，由 `session/state.rs::progress_stages!` 一处定义，`ProgressStage::i18n_key` 给出键名。阶段共十七个：`prepare`、`fetch_metadata`、`scan_files`、`prepare_download`、`create_download_session`、`process_files`、`download_archive`、`verify_archive`、`extract_archive`、`commit`、`download_runtime`、`install_runtime`、`create_shortcuts`、`write_registry`、`finalize`、`uninstall_scan`、`uninstall_delete`；需要插值对象的阶段（`extract_archive`、`download_runtime`、`install_runtime`）取 `{subject}`。计量单位由 `ProgressStage::unit` 决定：`process_files` / `download_archive` / `download_runtime` 为字节，`commit` 为操作数，其余为文件数；渲染器按 `summary.unit` 选择格式化方式，不再各自维护阶段名单。步骤标题为文案键 `step.default.<n>` / `step.mirrorc.<n>`，渲染器按当前源是否为 `mirrorc://` 选择。
+`stage` 取值与文案键 `progress.<stage>` 一一对应，插值参数在括号内：`prepare`、`metadata`、`hash_scan`、`plan`、`download(subject, done, total)`、`patch(subject)`、`extract(subject, done, total)`、`delete(subject)`、`runtime_download(subject, done, total)`、`runtime_install(subject)`、`shortcut`、`registry`、`finalize`、`uninstall_scan`、`uninstall_delete(subject, done, total)`、`mirrorc_metadata`、`mirrorc_download(done, total)`、`mirrorc_verify`、`install_done`、`already_latest`、`uninstall_done`。结局按三种分开是因为三者文案不同、渲染器不能从 `Phase::Done` 之外的信息推出该显示哪句。`done` / `total` 为字节数的阶段列在 `session/state.rs::BYTE_STAGES`（`download`、`runtime_download`、`mirrorc_download`），其余按计数解释；前端 `screens/Running.tsx` 持同一列表。步骤标题为文案键 `step.default.<n>` / `step.mirrorc.<n>`，渲染器按当前源是否为 `mirrorc://` 选择。
 
 ### 计数遥测
 
@@ -156,7 +152,7 @@ bridge 暴露两层：`error_dialog({ code, detail, subject, sid, event_id })` �
 
 ### 主题槽位
 
-打包格式不变，`\0IMAGE` 槽位继续一槽多用，识别在 `session/commands.rs::apply_theme`：`RIFF….WEBP` 魔数为图片；`28 B5 2F FD` 为 zstd 帧，解开后首个非空白字符为 `<` 是 HTML、否则是 CSS；其余按前 16 字节可打印 ASCII 视为明文 CSS，否则视为图片。识别结果进 `UiState.theme`；字节本体走资产端点：图片 `theme.webp`、CSS `theme.css`；HTML 直接替换 `index.html` 条目。`InstallerConfig.embedded_image` 不以 base64 进入任何命令返回值。空包不携带内联图片，`theme == None` 时渲染器用内置默认图，见 [左栏默认图与图片 / 图标自定义](./2026-10-10-left-art-and-icon-overrides.md)。
+打包格式不变，`\0IMAGE` 槽位继续一槽多用，识别在 `session/commands.rs::apply_theme`：`RIFF….WEBP` 魔数为图片；`28 B5 2F FD` 为 zstd 帧，解开后首个非空白字符为 `<` 是 HTML、否则是 CSS；其余按前 16 字节可打印 ASCII 视为明文 CSS，否则视为图片。识别结果进 `UiState.theme`；字节本体走资产端点：图片 `theme.webp`、CSS `theme.css`；HTML 直接替换 `index.html` 条目。`InstallerConfig.embedded_image` 是槽位的原始字节，只交给 `apply_theme`，不进入任何命令返回值。空包不携带默认图片；各主题下图片区域显示什么见[前端重写为 Preact 渲染器](./2026-09-02-frontend-preact-renderer.md)的渲染规则。
 
 ### 插件宿主
 
@@ -173,7 +169,7 @@ bridge 暴露两层：`error_dialog({ code, detail, subject, sid, event_id })` �
 - 每语言单独一个 zstd 资产：比宽表多约 320 字节，且加语言要改资产清单；宽表加语言只是加一列，缺翻译一眼可见。
 - 文案表并入 `index.html` 的压缩帧：native 路径为读 2 KiB 文案要解码整个前端 HTML，方向与 native 路径不依赖 WebView 的初衷相反。
 - 新增打包字段标注 `\0IMAGE` 内容类型：改变包格式；魔数识别在运行时零成本且兼容既有包。
-- 用 UI 自动化（CDP 驱动 WebView2、UIA 驱动 TaskDialog）验收：渲染器变薄后行为逻辑全部在 `UiSession::apply` 与 `extract` 中，用 Rust 单测与前端组件测试覆盖；UI 自动化只多覆盖"窗口真的弹出"一层，代价是 CI 交互桌面依赖与 flake。
+- 用 UI 自动化（CDP 驱动 WebView2、UIA 驱动 TaskDialog）验收：渲染器变薄后行为逻辑全部在 `UiSession::apply` 与 `extract` 中，用 Rust 单测覆盖；UI 自动化只多覆盖"窗口真的弹出"一层，代价是 CI 交互桌面依赖与 flake。
 - 先给现有 Vue 写一层 `UiState` → `ref` 适配、模板不动，再另开 Preact 重写：那等于独立重写一份 Vue 渲染器，契约形状会在过渡协议上冻一版，e2e 还要回归两遍。
 - `Intent` 改 serde 外部标签（`{"set_path":{"path":…}}`）以出图 `Content` 机制：体积与手写 `match` 相当，但让上行 `intent` 与下行 `ui-state` 的标签风格不对称，前端、测试与两篇 note 都要跟着改；手写解析形状不变、只碰一个文件。
 - 错误对话框把码显示在脚注、复制按钮对所有错误可用：码对用户无意义，E / U / C 类复制出来也无人能用；改为 id 进脚注、复制只给对端可查的类。
@@ -198,13 +194,13 @@ bridge 暴露两层：`error_dialog({ code, detail, subject, sid, event_id })` �
 
 ## Consequences
 
-- 收益：三个界面共用一份状态机与一张文案表；错误在代码里只有码，文案、上报、`fail` 维度、insight 码都从码派生，文本匹配消失；自定义 HTML 只需实现 `ui-state` / `intent` 与插件宿主两条契约。
+- 收益：三个界面共用一份状态机与一张文案表；错误在代码里只有码，文案、上报、`fail` 维度都从码派生，insight 取网络失败的类型或码，没有文本匹配；自定义 HTML 只需实现 `ui-state` / `intent` 与插件宿主两条契约。
 - `Uncoded` 上报是发现漏挂码的机制：真实用户错误若以 `INTERNAL_ERROR` 呈现并上报，按错误上报后端的分组补码。`attach` 只在知道操作语义的层调用，评审时对新增 `attach` 保持敏感。
 - `prefer-user` 策略下可写目录不再提权：这是 `probe_dir` 取代旧 `inspect_dir` 后的行为变化，旧实现对已存在目录恒报 `Unwritable`。
 - `PLUGIN_HOST_FAILED` 覆盖宿主线程 / setup / `plugin_host_ready` 超时；`PLUGIN_FAILED` 覆盖插件 `ok: false`。两者均为 C 类、上报；对话框无复制按钮（C 类规则）。`SHORTCUT_FAILED` 挂在 `CreateLnk`（subject 为 `.lnk` 路径），经 `notify` 弹窗后安装继续。`MIRRORC_UNREACHABLE` 覆盖 `get_mirrorc_status` 在未挂更具体码时的连接失败。
-- `Intent::Cancel` 在会话层是空操作，`Cancelled` 只由用户拒绝确认的路径构造；进行中取消依赖 rollback，接口预留。
+- `Intent::Cancel` 在会话层是空操作，由宿主处理：会话运行中调用 `cancel_running`，写入暂存目录的阶段响应取消，交换阶段忽略。
 - 错误上报事件仍以整条链逐个 `to_string` 作 `exception.values`、无 fingerprint，分组尚未按 `code` 收敛；`detail` / `subject` 进入 extra 也未做。C 类继续上报但对话框无复制按钮。
-- `Coded.detail` 含路径、Win32 错误文本、HTTP body 片段，进入上报 extra 与用户可复制的对话框：URL 已剥除，body 截断 512 字节；Mirror酱 API 的 `msg` 不回显 CDK。
+- `Coded.detail` 含路径、Win32 错误文本、HTTP body 片段，进入上报 extra 与用户可复制的对话框：任何 `scheme://` URL（http(s)、http3、sftp、ssh+http）连同只包着它的括号一起剥除，body 截断 512 字节；Mirror酱 API 的 `msg` 不回显 CDK。
 - `UiState` 携带 `mirrorc_cdk` 明文推给前端，自定义 HTML 能读到它；凭据写入仍只在 Rust。
 - 文案键与代码常量分离，改名会漂移：`locale_covers_codes_stages_prompts` 守覆盖率；缺键时 `t(key)` 返回键名本身，界面可见但不崩。
 - `UiSession::apply` 集中了原本散在两个前端的推导，是新的复杂点，由逐意图单测覆盖；`run_install` / `run_uninstall` 本体只多了 `base` 参数。

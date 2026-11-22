@@ -61,6 +61,53 @@ pub fn dotnet_runtime_installed(framework: &str, major: &str) -> bool {
     false
 }
 
+/// `(latest.version URL, installer URL, shared framework)` of a
+/// `Microsoft.DotNet.<kind>.<version>` tag; `$` in the URLs is the version.
+fn dotnet_spec(tag: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    let kind = tag.split('.').take(3).collect::<Vec<&str>>().join(".");
+    match kind.as_str() {
+        "Microsoft.DotNet.DesktopRuntime" => Some((
+            "https://builds.dotnet.microsoft.com/dotnet/WindowsDesktop/$/latest.version",
+            "https://builds.dotnet.microsoft.com/dotnet/WindowsDesktop/$/windowsdesktop-runtime-$-win-x64.exe",
+            "Microsoft.WindowsDesktop.App",
+        )),
+        "Microsoft.DotNet.Runtime" => Some((
+            "https://builds.dotnet.microsoft.com/dotnet/Runtime/$/latest.version",
+            "https://builds.dotnet.microsoft.com/dotnet/Runtime/$/dotnet-runtime-$-win-x64.exe",
+            "Microsoft.NETCore.App",
+        )),
+        _ => None,
+    }
+}
+
+/// `(installer URL, registry key with Installed = 1)` of a VC++ redistributable tag.
+fn vcredist_spec(tag: &str) -> Option<(&'static str, String)> {
+    let x64_prefix = "SOFTWARE\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\";
+    let x86_prefix = "SOFTWARE\\Wow6432Node\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\";
+    match tag {
+        "Microsoft.VCRedist.2015+.x64" => Some((
+            "https://aka.ms/vs/17/release/vc_redist.x64.exe",
+            format!("{x64_prefix}x64"),
+        )),
+        "Microsoft.VCRedist.2015+.x86" => Some((
+            "https://aka.ms/vs/17/release/vc_redist.x86.exe",
+            format!("{x86_prefix}x86"),
+        )),
+        _ => None,
+    }
+}
+
+/// Whether the runtime `tag` is already on this machine, by the same checks
+/// [`install_runtime`] makes before installing. `None` for a tag it cannot
+/// install. Reads HKLM and Program Files only, so it needs no elevation.
+pub fn runtime_installed(tag: &str) -> Option<bool> {
+    if let Some((_, _, framework)) = dotnet_spec(tag) {
+        let major = tag.split('.').nth(3)?;
+        return Some(dotnet_runtime_installed(framework, major));
+    }
+    vcredist_spec(tag).map(|(_, reg)| check_vcredist(&reg))
+}
+
 /// `dl_dir` is the staging `dl\` directory the installer package is downloaded
 /// into; it goes away with the staging directory.
 pub async fn install_runtime(
@@ -96,21 +143,8 @@ pub async fn install_dotnet(
     dl_dir: &std::path::Path,
     notify: ProgressNotify,
 ) -> Result<String> {
-    let tag_without_version = tag.split('.').take(3).collect::<Vec<&str>>().join(".");
-    let runtime = match tag_without_version.as_str() {
-        "Microsoft.DotNet.DesktopRuntime" => (
-            "https://builds.dotnet.microsoft.com/dotnet/WindowsDesktop/$/latest.version",
-            "https://builds.dotnet.microsoft.com/dotnet/WindowsDesktop/$/windowsdesktop-runtime-$-win-x64.exe",
-            "Microsoft.WindowsDesktop.App",
-        ),
-        "Microsoft.DotNet.Runtime" => (
-            "https://builds.dotnet.microsoft.com/dotnet/Runtime/$/latest.version",
-            "https://builds.dotnet.microsoft.com/dotnet/Runtime/$/dotnet-runtime-$-win-x64.exe",
-            "Microsoft.NETCore.App",
-        ),
-        _ => {
-            return Err(anyhow::anyhow!("UNSUPPORTED_DOTNET_RUNTIME"));
-        }
+    let Some(runtime) = dotnet_spec(&tag) else {
+        return Err(anyhow::anyhow!("UNSUPPORTED_DOTNET_RUNTIME"));
     };
     let version_primary = tag
         .split('.')
@@ -125,7 +159,7 @@ pub async fn install_dotnet(
         .context("CREATE_TARGET_FILE_ERR")?;
     let (mut stream, len) = if offset.is_some() || size.is_some() {
         // runtime packed, just extract and run
-        let stream = create_local_stream(offset.unwrap(), size.unwrap(), true)
+        let stream = create_local_stream(offset.unwrap(), size.unwrap())
             .await
             .context("RUNTIME_EXTRACT_ERR")?;
         tracing::info!(
@@ -156,7 +190,7 @@ pub async fn install_dotnet(
         }
         // get real download url
         let url = runtime.1.replace("$", &vernum);
-        let (stream, len, _insight) = create_http_stream(&url, 0, 0, true, None)
+        let (stream, len, _insight) = create_http_stream(&url, 0, 0, None)
             .await
             .map_err(|e| e.error)
             .context("RUNTIME_DOWNLOAD_ERR")?;
@@ -209,20 +243,8 @@ pub async fn install_vcredist(
     dl_dir: &std::path::Path,
     notify: ProgressNotify,
 ) -> Result<String> {
-    let x64_prefix = "SOFTWARE\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\";
-    let x86_prefix = "SOFTWARE\\Wow6432Node\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\";
-    let (url, reg) = match tag.as_str() {
-        "Microsoft.VCRedist.2015+.x64" => (
-            "https://aka.ms/vs/17/release/vc_redist.x64.exe",
-            format!("{}{}", x64_prefix, "x64"),
-        ),
-        "Microsoft.VCRedist.2015+.x86" => (
-            "https://aka.ms/vs/17/release/vc_redist.x86.exe",
-            format!("{}{}", x86_prefix, "x86"),
-        ),
-        _ => {
-            return Err(anyhow::anyhow!("UNSUPPORTED_TAG"));
-        }
+    let Some((url, reg)) = vcredist_spec(&tag) else {
+        return Err(anyhow::anyhow!("UNSUPPORTED_TAG"));
     };
     // check registry for already installed
     if check_vcredist(&reg) {
@@ -231,7 +253,7 @@ pub async fn install_vcredist(
     let installer_path = dl_dir.join(format!("Kachina.RuntimePackage.{tag}.exe"));
     let (mut stream, len) = if offset.is_some() || size.is_some() {
         // runtime packed, just extract and run
-        let stream = create_local_stream(offset.unwrap(), size.unwrap(), true)
+        let stream = create_local_stream(offset.unwrap(), size.unwrap())
             .await
             .context("RUNTIME_EXTRACT_ERR")?;
         tracing::info!(
@@ -242,7 +264,7 @@ pub async fn install_vcredist(
         );
         (stream, size.unwrap())
     } else {
-        let (stream, len, _insight) = create_http_stream(url, 0, 0, true, None)
+        let (stream, len, _insight) = create_http_stream(url, 0, 0, None)
             .await
             .map_err(|e| e.error)
             .context("RUNTIME_DOWNLOAD_ERR")?;

@@ -16,7 +16,7 @@
              --all-targets）。native 依赖带 C++，只在有 MSVC 的 Windows 上跑，
              其它平台 SKIP
       logic  被抽出来的那批安全阀与纯逻辑的**行为断言**（任意平台可跑）
-      front  web/ 的 tsc --noEmit（strict）+ vitest + 协议渲染文件的 prettier
+      front  web/ 的 tsc --noEmit（strict）+ 协议渲染文件的 prettier
       ci     工作流里 action 的版本下限、每一层有没有真的接进 devcheck.yml、
              构建入口与交付名是否一致
 

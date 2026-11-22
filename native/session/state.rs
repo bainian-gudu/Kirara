@@ -112,6 +112,7 @@ pub enum Mode {
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectView {
     pub window_title: String,
+    pub app_name: String,
     pub title: String,
     pub description: String,
     pub borderless: bool,
@@ -184,6 +185,7 @@ pub struct Progress {
     pub processing_bps: Option<u64>,
     pub network_bps: Option<u64>,
     pub network_pending: bool,
+    pub files: Vec<FileProgress>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,16 +211,15 @@ pub enum ProgressUnit {
     Operations,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FileAction {
-    Download,
-    Extract,
-    Patch,
-    Verify,
-    Flush,
-    Retry,
+#[derive(Debug, Clone, Serialize)]
+pub struct FileProgress {
+    pub id: u32,
+    pub name: String,
+    pub done: u64,
+    pub total: u64,
 }
+
+
 
 impl ProgressStage {
     pub fn cancellable(self) -> bool {
@@ -244,18 +245,6 @@ impl ProgressStage {
         }
     }
 }
-impl FileAction {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Download => "download",
-            Self::Extract => "extract",
-            Self::Patch => "patch",
-            Self::Verify => "verify",
-            Self::Flush => "flush",
-            Self::Retry => "retry",
-        }
-    }
-}
 impl Progress {
     pub fn new(stage: ProgressStage, step: Option<u8>, percent: Option<f64>) -> Self {
         Self {
@@ -274,6 +263,7 @@ impl Progress {
             processing_bps: None,
             network_bps: None,
             network_pending: false,
+            files: Vec::new(),
         }
     }
 
@@ -368,9 +358,9 @@ impl Intent {
     }
 }
 
-/// Holds `UiState` and applies user intents. `apply` is sync this step:
-/// option / path / source / cdk-gate / answer / dismiss. `Start` only gates
-/// mirrorc CDK; it does not call `run_install`.
+/// Holds `UiState` and applies user intents synchronously: options, path,
+/// source, the Mirror酱 CDK gate, prompt answers and dismissal. `Start` only
+/// applies the CDK gate; the host runs the session.
 pub struct UiSession {
     pub state: UiState,
     all_sources: Vec<SourceItem>,
@@ -392,6 +382,7 @@ impl Default for UiState {
             mode: Mode::Install,
             project: ProjectView {
                 window_title: String::new(),
+                app_name: String::new(),
                 title: String::new(),
                 description: String::new(),
                 borderless: false,
@@ -500,7 +491,6 @@ impl UiSession {
                 {
                     self.state.phase = Phase::Failed(Coded::bare(MIRRORC_CDK_MISSING));
                 }
-                // run_install / run_uninstall are step 2.
             }
             // The answer itself goes to `PromptHub`; the running session decides what
             // follows (cancelled → `Ready`), so only the modal is cleared here.
@@ -514,7 +504,7 @@ impl UiSession {
                     self.state.phase = Phase::Ready;
                 }
             }
-            // Cancel / Launch / Advanced / Close: host-owned this step.
+            // The host handles these.
             Intent::Cancel | Intent::Launch | Intent::Advanced | Intent::Close => {}
         }
     }

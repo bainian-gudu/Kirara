@@ -2,9 +2,10 @@ use super::operation::run_opr;
 use super::operation::IpcOperation;
 use super::{
     decode_frame, encode_frame, progress_notify, read_frame, IpcError, IpcResult, PipeMsg,
-    Progress, ProgressNotify,
+    ProgressNotify,
 };
 use crate::utils::acl::create_security_attributes;
+use crate::utils::code::{Attach, ELEVATE_FAILED};
 use crate::utils::error::TAResult;
 use crate::utils::uac::check_elevated;
 use crate::utils::uac::run_elevated;
@@ -21,8 +22,10 @@ use tokio::net::windows::named_pipe::NamedPipeServer;
 use tokio::net::windows::named_pipe::ServerOptions;
 use tokio::sync::oneshot;
 use tokio::time;
-use windows::Win32::Foundation::{ERROR_PIPE_BUSY, HANDLE};
-use windows::Win32::System::Pipes::GetNamedPipeServerProcessId;
+use tokio_util::sync::CancellationToken;
+use windows::Win32::Foundation::{ERROR_PIPE_BUSY, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::System::Pipes::{GetNamedPipeClientProcessId, GetNamedPipeServerProcessId};
+use windows::Win32::System::Threading::{GetProcessId, WaitForSingleObject};
 
 const PIPE_BUFFER_SIZE: usize = 64 * 1024;
 
@@ -32,9 +35,11 @@ pub struct IpcInner {
     id: String,
 }
 
-/// One waiter per in-flight request, keyed by request id. Results are
-/// delivered here; progress goes over a broadcast that may lag without
-/// consequence.
+/// One waiter per in-flight request, keyed by request id. The pipe reader
+/// calls the request's notify for each of its progress frames, in pipe order,
+/// and takes the entry out when the result arrives; progress for an id without
+/// an entry is dropped. The notify runs on the reader task, so it must not
+/// block: a slow notify delays every later frame, results included.
 pub type Pending =
     Arc<Mutex<HashMap<String, (oneshot::Sender<Result<IpcResult, IpcError>>, ProgressNotify)>>>;
 
@@ -46,6 +51,8 @@ fn retired_error() -> IpcError {
         sid: None,
         cancelled: false,
         insight: None,
+        network: None,
+        local_io: None,
     }
 }
 
@@ -57,6 +64,8 @@ pub fn disconnect_error() -> IpcError {
         sid: None,
         cancelled: false,
         insight: None,
+        network: None,
+        local_io: None,
     }
 }
 
@@ -65,12 +74,13 @@ pub fn disconnect_error() -> IpcError {
 pub struct ManagedElevate {
     process: tokio::sync::RwLock<Option<SendableHandle>>,
     started: AtomicBool,
+    /// [`start`](Self::start) failed once; it is not retried.
+    start_failed: AtomicBool,
     /// The helper holds an exit-time staging cleanup and must outlive this
     /// process.
     holds_cleanup: AtomicBool,
     mpsc_tx: tokio::sync::mpsc::Sender<IpcInner>,
     mpsc_rx: tokio::sync::RwLock<Option<tokio::sync::mpsc::Receiver<IpcInner>>>,
-    progress_tx: tokio::sync::broadcast::Sender<(String, Progress)>,
     pending: Pending,
     pipe_id: String,
     already_elevated: bool,
@@ -119,7 +129,6 @@ impl ManagedElevate {
     }
 
     pub fn new() -> Self {
-        let (progress_tx, _progress_rx) = tokio::sync::broadcast::channel(256);
         let (mpsc_tx, mpsc_rx) = tokio::sync::mpsc::channel(100);
         let (resolve_tx, resolve_rx) = tokio::sync::mpsc::unbounded_channel();
         let pipe_id = format!("{}", uuid::Uuid::new_v4());
@@ -128,8 +137,8 @@ impl ManagedElevate {
             resolve_rx: tokio::sync::Mutex::new(resolve_rx),
             process: tokio::sync::RwLock::new(None),
             started: AtomicBool::new(false),
+            start_failed: AtomicBool::new(false),
             holds_cleanup: AtomicBool::new(false),
-            progress_tx,
             mpsc_tx,
             mpsc_rx: tokio::sync::RwLock::new(Some(mpsc_rx)),
             pending: Arc::new(Mutex::new(HashMap::new())),
@@ -139,68 +148,83 @@ impl ManagedElevate {
     }
 
     /// A manager whose "elevated side" is whatever the test drives through
-    /// the returned request receiver, replying via `pending` / `progress_tx`.
+    /// the returned request receiver, replying via `pending`.
     #[cfg(test)]
-    fn detached() -> (
-        Self,
-        tokio::sync::mpsc::Receiver<IpcInner>,
-        Pending,
-        tokio::sync::broadcast::Sender<(String, Progress)>,
-    ) {
+    fn detached() -> (Self, tokio::sync::mpsc::Receiver<IpcInner>, Pending) {
         let mut me = Self::new();
         me.already_elevated = false;
         me.started.store(true, Ordering::SeqCst);
         let rx = me.mpsc_rx.get_mut().take().unwrap();
         let pending = me.pending.clone();
-        let progress_tx = me.progress_tx.clone();
-        (me, rx, pending, progress_tx)
+        (me, rx, pending)
     }
+    /// The only instance of the pipe. Its DACL admits SYSTEM and enabled
+    /// Administrators only ([`create_security_attributes`]): the helper is
+    /// elevated, while the launching user's other processes (and every
+    /// medium or low integrity process) cannot open it.
     pub fn create_pipe(name: &str) -> anyhow::Result<NamedPipeServer> {
         let mut attr = create_security_attributes();
         Ok(unsafe {
             ServerOptions::new()
                 .first_pipe_instance(true)
+                .max_instances(1)
                 .reject_remote_clients(true)
                 .create_with_security_attributes_raw(name, &mut attr as *mut _ as *mut c_void)
         }?)
     }
+
+    /// Start the helper once per session. A failed start (UAC declined, the
+    /// helper never connected) is final for this manager: later elevated
+    /// operations fail with the same code instead of asking again.
     pub async fn start(&self) -> anyhow::Result<()> {
         let mut process = self.process.write().await;
-        if process.is_none() {
-            let name = self.pipe_id.clone();
-            let name = format!(r"\\.\pipe\Kachina-Elevate-{name}");
-
-            // 先创建pipe服务器
-            let mut server = Self::create_pipe(&name).context("ELEVATE_ERR")?;
-            tracing::info!("Pipe server created at {:?}", name);
-
-            // pipe服务器创建成功后再启动UAC进程
-            let command = run_elevated(
-                std::env::current_exe().unwrap(),
-                format!(
-                    "headless-uac {} \"{}\"",
-                    self.pipe_id,
-                    crate::utils::log::path().display()
-                ),
-            )
-            .context("ELEVATE_ERR")?;
-            process.replace(command);
-            tracing::info!("UAC process started, waiting for pipe connection...");
-
-            let rx = self.mpsc_rx.write().await.take().unwrap();
-            if !wait_conn(&mut server).await {
-                return Err(anyhow::anyhow!("Failed to wait for connection").context("ELEVATE_ERR"));
-            }
-            handle_pipe(
-                server,
-                self.progress_tx.clone(),
-                self.pending.clone(),
-                rx,
-                self.resolve_tx.clone(),
-            )
-            .await;
-            self.started.store(true, Ordering::SeqCst);
+        // checked first: a failed start may still have left a helper handle
+        if self.start_failed.load(Ordering::SeqCst) {
+            return Err(anyhow::anyhow!("elevated helper unavailable").attach(ELEVATE_FAILED));
         }
+        if process.is_some() {
+            return Ok(());
+        }
+        let result = self.start_helper(&mut process).await;
+        if result.is_err() {
+            self.start_failed.store(true, Ordering::SeqCst);
+        }
+        result.map_err(|err| err.attach(ELEVATE_FAILED))
+    }
+
+    async fn start_helper(&self, process: &mut Option<SendableHandle>) -> anyhow::Result<()> {
+        let name = format!(r"\\.\pipe\Kachina-Elevate-{}", self.pipe_id);
+        let mut server = Self::create_pipe(&name).context("create elevation pipe")?;
+        tracing::info!("Pipe server created at {:?}", name);
+
+        // the helper is started only after the pipe exists
+        let mut helper_args = format!(
+            "headless-uac {} \"{}\" {}",
+            self.pipe_id,
+            crate::utils::log::path().display(),
+            std::process::id()
+        );
+        if SILENT_SESSION.load(Ordering::SeqCst) {
+            helper_args.push_str(" --silent");
+        }
+        let helper = run_elevated(
+            std::env::current_exe().context("CURRENT_EXE_ERR")?,
+            helper_args,
+        )
+        .context("start elevated helper")?;
+        let helper_raw = helper.0 .0 as isize;
+        process.replace(helper);
+        tracing::info!("UAC process started, waiting for pipe connection...");
+
+        accept_helper(&mut server, helper_raw).await?;
+        let rx = self
+            .mpsc_rx
+            .write()
+            .await
+            .take()
+            .context("elevation pipe already used")?;
+        handle_pipe(server, self.pending.clone(), rx, self.resolve_tx.clone()).await;
+        self.started.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -210,11 +234,28 @@ impl ManagedElevate {
         elevate: bool,
         on_progress: ProgressNotify,
     ) -> TAResult<IpcResult> {
+        self.run_cancellable(ipc, elevate, on_progress, &CancellationToken::new())
+            .await
+    }
+
+    /// [`run`](Self::run), with `cancel` reaching the operation as its stop
+    /// token. The caller still waits for the result: a stopped operation
+    /// returns `Cancelled` once it has let go of what it was writing.
+    pub async fn run_cancellable(
+        &self,
+        ipc: IpcOperation,
+        elevate: bool,
+        on_progress: ProgressNotify,
+        cancel: &CancellationToken,
+    ) -> TAResult<IpcResult> {
         if !self.uses_helper(elevate) {
+            let stop = cancel.clone();
             let (result, snapshot) = super::download::RESOLVER
                 .scope(
                     self.resolve_tx.clone(),
-                    super::network::measure(on_progress.clone(), |notify| run_opr(ipc, notify)),
+                    super::network::measure(on_progress.clone(), |notify| {
+                        run_opr(ipc, notify, stop)
+                    }),
                 )
                 .await;
             snapshot.publish(&on_progress);
@@ -229,12 +270,11 @@ impl ManagedElevate {
             self.holds_cleanup.store(true, Ordering::SeqCst);
         }
         let id = uuid::Uuid::new_v4().to_string();
-        let (tx, mut result_rx) = oneshot::channel();
+        let (tx, result_rx) = oneshot::channel();
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(id.clone(), (tx, on_progress.clone()));
-        let mut progress_rx = self.progress_tx.subscribe();
+            .insert(id.clone(), (tx, on_progress));
         // 管道任务已退出时接收端不存在，此处不返回就会永远等不到回包
         if self
             .mpsc_tx
@@ -253,37 +293,33 @@ impl ManagedElevate {
                 .context("IPC_ERR")
                 .into());
         }
-        loop {
+        tokio::pin!(result_rx);
+        let mut cancel_sent = false;
+        let result = loop {
             tokio::select! {
-                res = &mut result_rx => {
-                    return match res {
-                        Ok(Ok(data)) => Ok(data),
-                        Ok(Err(error)) => Err(error.into_ta()),
-                        Err(_) => Err(anyhow::anyhow!("Failed to receive response from elevate process")
-                            .context("IPC_ERR")
-                            .into()),
-                    };
+                result = &mut result_rx => break result,
+                _ = cancel.cancelled(), if !cancel_sent => {
+                    cancel_sent = true;
+                    // like a resolve reply, the helper's read loop handles it
+                    // and sends nothing back
+                    let _ = self
+                        .mpsc_tx
+                        .send(IpcInner {
+                            op: IpcOperation::Cancel(id.clone()),
+                            id: String::new(),
+                        })
+                        .await;
                 }
-                p = progress_rx.recv() => match p {
-                    Ok((msgid, data)) if msgid == id => on_progress(data),
-                    Ok(_) => {}
-                    // 进度洪水只丢进度，不丢结果
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::debug!("progress broadcast lagged by {n}");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        // keep waiting for the result alone
-                        let res = (&mut result_rx).await;
-                        return match res {
-                            Ok(Ok(data)) => Ok(data),
-                            Ok(Err(error)) => Err(error.into_ta()),
-                            Err(_) => Err(anyhow::anyhow!("Failed to receive response from elevate process")
-                                .context("IPC_ERR")
-                                .into()),
-                        };
-                    }
-                },
             }
+        };
+        match result {
+            Ok(Ok(data)) => Ok(data),
+            Ok(Err(error)) => Err(error.into_ta()),
+            Err(_) => Err(
+                anyhow::anyhow!("Failed to receive response from elevate process")
+                    .context("IPC_ERR")
+                    .into(),
+            ),
         }
     }
 
@@ -339,20 +375,49 @@ fn fail_all_pending(pending: &Pending) {
     }
 }
 
-pub async fn wait_conn(server: &mut NamedPipeServer) -> bool {
-    if let Err(err) = server.connect().await {
-        tracing::warn!("Failed to accept pipe connection: {:?}", err);
-        return false;
+/// Set by a silent launch (`-S`): the helper is started with `--silent` and
+/// shows no dialogs either.
+pub static SILENT_SESSION: AtomicBool = AtomicBool::new(false);
+
+/// Accept the helper's connection and check that the client is the helper
+/// process this session started. Fails once the helper exits without
+/// connecting (it could not open the pipe, or was refused).
+async fn accept_helper(server: &mut NamedPipeServer, helper: isize) -> anyhow::Result<()> {
+    // `HANDLE` is not `Send`; it is rebuilt at each use instead of held across awaits
+    let helper_handle = || HANDLE(helper as *mut c_void);
+    let exited = async {
+        loop {
+            if unsafe { WaitForSingleObject(helper_handle(), 0) } == WAIT_OBJECT_0 {
+                return;
+            }
+            time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+    tokio::select! {
+        conn = server.connect() => conn.context("accept elevated helper connection")?,
+        _ = exited => anyhow::bail!("elevated helper exited before connecting"),
+    }
+    let mut client_pid = 0u32;
+    let pipe = HANDLE(std::os::windows::io::AsRawHandle::as_raw_handle(server));
+    unsafe { GetNamedPipeClientProcessId(pipe, &mut client_pid) }
+        .context("query elevation pipe client")?;
+    // 0 when the handle from the elevation lacks query rights; the pipe's
+    // DACL already limits clients to elevated processes, and the helper
+    // checks this side's pid in turn
+    let helper_pid = unsafe { GetProcessId(helper_handle()) };
+    if helper_pid == 0 {
+        tracing::warn!("helper pid unavailable, client {client_pid} not matched");
+    } else if client_pid != helper_pid {
+        anyhow::bail!("elevation pipe client {client_pid} is not the helper {helper_pid}");
     }
     tracing::info!("Client connected to pipe");
-    true
+    Ok(())
 }
 /// 读写各一个任务：`read_frame` 不可取消，不能放进与写端共用的 `select!`。
 /// 任一端结束（对端关闭、帧错位、读写错误、`ManagedElevate` 被丢弃）就停掉另一端，
 /// 让两个半边一起释放、管道真正关闭，并让所有等待中的 `run` 收到断连错误。
 pub async fn handle_pipe(
     server: NamedPipeServer,
-    progress_tx: tokio::sync::broadcast::Sender<(String, Progress)>,
     pending: Pending,
     mut rx: tokio::sync::mpsc::Receiver<IpcInner>,
     resolve_tx: tokio::sync::mpsc::UnboundedSender<(super::download::Resolve, bool)>,
@@ -385,7 +450,16 @@ pub async fn handle_pipe(
             };
             match msg {
                 Ok(PipeMsg::Progress(id, p)) => {
-                    let _ = progress_tx.send((id, p));
+                    // the guard is dropped at the end of this statement: the
+                    // notify runs with `pending` unlocked
+                    let notify = reader_pending
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&id)
+                        .map(|(_, notify)| notify.clone());
+                    if let Some(notify) = notify {
+                        notify(p);
+                    }
                 }
                 Ok(PipeMsg::Ok(id, data, snapshot)) => {
                     if let Some((tx, notify)) = reader_pending
@@ -410,7 +484,6 @@ pub async fn handle_pipe(
                 Ok(PipeMsg::Resolve(query)) => {
                     let _ = resolve_tx.send((query, true));
                 }
-                Ok(PipeMsg::Disconnect(_)) => {}
                 Err(err) => {
                     tracing::error!("Failed to read from pipe: {:?}", err);
                     break;
@@ -449,24 +522,39 @@ pub async fn uac_ipc_main(args: crate::cli::arg::UacArgs) {
         }
     };
 
-    if let Err(err) = client {
-        let detail = format!("{err:?}");
-        crate::utils::taskdialog::show_error(
-            crate::utils::taskdialog::ErrorDialog {
-                detail: Some(&detail),
-                ..crate::utils::taskdialog::ErrorDialog::code(crate::utils::code::ELEVATE_FAILED)
-            },
-            windows::Win32::Foundation::HWND::default(),
+    let client = match client {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::error!("elevated helper cannot open the pipe: {err:?}");
+            // the launcher sees this process exit and fails the session itself
+            if !args.silent {
+                let detail = format!("{err:?}");
+                crate::utils::taskdialog::show_error(
+                    crate::utils::taskdialog::ErrorDialog {
+                        detail: Some(&detail),
+                        ..crate::utils::taskdialog::ErrorDialog::code(ELEVATE_FAILED)
+                    },
+                    windows::Win32::Foundation::HWND::default(),
+                );
+            }
+            return;
+        }
+    };
+    // the pipe's server must be the process that started this helper
+    let mut server_pid = 0u32;
+    let handle = HANDLE(std::os::windows::io::AsRawHandle::as_raw_handle(&client));
+    if let Err(err) = unsafe { GetNamedPipeServerProcessId(handle, &mut server_pid) } {
+        tracing::error!("elevation pipe server unknown: {err}");
+        return;
+    }
+    if server_pid != args.launcher_pid {
+        tracing::error!(
+            "elevation pipe server {server_pid} is not the launcher {}",
+            args.launcher_pid
         );
         return;
     }
-    let client = client.unwrap();
-    let mut launcher = 0u32;
-    let handle = HANDLE(std::os::windows::io::AsRawHandle::as_raw_handle(&client));
-    match unsafe { GetNamedPipeServerProcessId(handle, &mut launcher) } {
-        Ok(()) => crate::fs::staging::set_lock_owner(launcher),
-        Err(err) => tracing::warn!("launcher pid unavailable: {err}"),
-    }
+    crate::fs::staging::set_lock_owner(server_pid);
     let (clientrx, mut clienttx) = tokio::io::split(client);
     let mut clientrx = tokio::io::BufReader::with_capacity(PIPE_BUFFER_SIZE, clientrx);
 
@@ -482,6 +570,8 @@ pub async fn uac_ipc_main(args: crate::cli::arg::UacArgs) {
         let mut cancel_rx = cancel_rx.resubscribe();
         tokio::spawn(async move {
             let mut retired = false;
+            // stop token of each request still running, by request id
+            let running: Arc<Mutex<HashMap<String, CancellationToken>>> = Default::default();
             loop {
                 let frame = tokio::select! {
                     _ = cancel_rx.recv() => {
@@ -530,10 +620,19 @@ pub async fn uac_ipc_main(args: crate::cli::arg::UacArgs) {
                             .await;
                         continue;
                     }
+                    IpcOperation::Cancel(id) => {
+                        if let Some(stop) = running.lock().unwrap().get(&id) {
+                            stop.cancel();
+                        }
+                        continue;
+                    }
                     _ => {}
                 }
                 let tx = tx.clone();
                 let id = res.id.clone();
+                let stop = CancellationToken::new();
+                running.lock().unwrap().insert(id.clone(), stop.clone());
+                let running = running.clone();
                 tokio::spawn(async move {
                     let (resolve_tx, mut resolve_rx) = tokio::sync::mpsc::unbounded_channel();
                     let progress_tx = tx.clone();
@@ -544,7 +643,9 @@ pub async fn uac_ipc_main(args: crate::cli::arg::UacArgs) {
                     });
                     let mut operation = Box::pin(super::download::RESOLVER.scope(
                         resolve_tx,
-                        super::network::measure(notify.clone(), |notify| run_opr(res.op, notify)),
+                        super::network::measure(notify.clone(), |notify| {
+                            run_opr(res.op, notify, stop)
+                        }),
                     ));
                     let (result, snapshot) = loop {
                         tokio::select! {
@@ -552,6 +653,7 @@ pub async fn uac_ipc_main(args: crate::cli::arg::UacArgs) {
                             Some((query, _)) = resolve_rx.recv() => { let _ = tx.send(PipeMsg::Resolve(query)).await; }
                         }
                     };
+                    running.lock().unwrap().remove(&id);
                     let msg = match result {
                         Ok(data) => PipeMsg::Ok(id, data, snapshot),
                         Err(err) => PipeMsg::Err(id, IpcError::from_ta(&err), snapshot),
@@ -628,20 +730,24 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pipe_roundtrip_and_disconnect() {
         let pipe_id = uuid::Uuid::new_v4().to_string();
-        let server =
-            ManagedElevate::create_pipe(&format!(r"\\.\pipe\Kachina-Elevate-{pipe_id}")).unwrap();
+        // default security: the test process is not elevated, and the real
+        // pipe admits elevated clients only
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(format!(r"\\.\pipe\Kachina-Elevate-{pipe_id}"))
+            .unwrap();
         let client = tokio::spawn(uac_ipc_main(UacArgs {
             pipe_id,
-            log_path: None,
+            log_path: std::env::temp_dir().join("kachina-test.log"),
+            launcher_pid: std::process::id(),
+            silent: true,
         }));
         server.connect().await.unwrap();
 
-        let (progress_tx, _progress_rx) = tokio::sync::broadcast::channel(16);
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let (mpsc_tx, mpsc_rx) = tokio::sync::mpsc::channel(16);
         handle_pipe(
             server,
-            progress_tx,
             pending.clone(),
             mpsc_rx,
             tokio::sync::mpsc::unbounded_channel().0,
@@ -709,48 +815,255 @@ mod tests {
             .unwrap();
     }
 
-    /// 1000 条进度先于结果到达、超出广播容量：`run` 仍拿到 `Ok`，只丢进度。
+    fn is_cancelled(err: &crate::utils::error::TACommandError) -> bool {
+        matches!(
+            crate::utils::code::extract(&err.error),
+            crate::utils::code::Extracted::Cancelled
+        )
+    }
+
+    /// In helper mode a cancel sends `Cancel` with the request's id, and the
+    /// caller still waits for the helper's result.
+    #[tokio::test]
+    async fn cancel_is_forwarded_and_the_result_awaited() {
+        let (mgr, mut requests, pending) = ManagedElevate::detached();
+        let cancel = CancellationToken::new();
+        let run = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                mgr.run_cancellable(
+                    IpcOperation::Ping,
+                    true,
+                    super::super::progress_noop(),
+                    &cancel,
+                )
+                .await
+            })
+        };
+        let sent = requests.recv().await.unwrap();
+        cancel.cancel();
+        let forwarded = time::timeout(Duration::from_secs(5), requests.recv())
+            .await
+            .expect("no Cancel was sent")
+            .unwrap();
+        assert!(
+            matches!(&forwarded.op, IpcOperation::Cancel(id) if *id == sent.id),
+            "{forwarded:?}"
+        );
+        assert!(!run.is_finished());
+        let (tx, _) = pending.lock().unwrap().remove(&sent.id).unwrap();
+        let cancelled = crate::utils::error::TACommandError {
+            error: anyhow::Error::new(crate::utils::code::Cancelled),
+            insight: None,
+        };
+        let _ = tx.send(Err(IpcError::from_ta(&cancelled)));
+        let err = time::timeout(Duration::from_secs(5), run)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(is_cancelled(&err), "{:#}", err.error);
+    }
+
+    /// The helper gives each request a stop token and `Cancel` stops it: a
+    /// scan of a 128 MiB file that is cancelled at its first report ends with
+    /// a cancelled error.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn progress_flood_does_not_lose_result() {
-        let (mgr, mut requests, pending, progress_tx) = ManagedElevate::detached();
-        let responder = tokio::spawn(async move {
-            let req = requests.recv().await.unwrap();
-            for i in 0..1000u64 {
-                let _ = progress_tx.send((
-                    req.id.clone(),
-                    Progress::BytesOf {
-                        done: i,
-                        total: 1000,
-                    },
-                ));
-            }
-            let tx = pending.lock().unwrap().remove(&req.id).unwrap();
-            tx.0.send(Ok(IpcResult::Ping)).unwrap();
-        });
-        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let seen2 = seen.clone();
-        let res = time::timeout(
-            Duration::from_secs(5),
-            mgr.run(
-                IpcOperation::Ping,
-                true,
+    async fn helper_cancel_stops_a_running_scan() {
+        let pipe_id = uuid::Uuid::new_v4().to_string();
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(format!(r"\\.\pipe\Kachina-Elevate-{pipe_id}"))
+            .unwrap();
+        let client = tokio::spawn(uac_ipc_main(UacArgs {
+            pipe_id,
+            log_path: std::env::temp_dir().join("kachina-test.log"),
+            launcher_pid: std::process::id(),
+            silent: true,
+        }));
+        server.connect().await.unwrap();
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let (mpsc_tx, mpsc_rx) = tokio::sync::mpsc::channel(16);
+        handle_pipe(
+            server,
+            pending.clone(),
+            mpsc_rx,
+            tokio::sync::mpsc::unbounded_channel().0,
+        )
+        .await;
+
+        let dir = crate::fs::staging::scratch_file(&format!(
+            "kachina-scan-cancel-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // zeros past the valid data length: read without disk io, hashed for
+        // far longer than a cancel takes to cross the pipe
+        std::fs::File::create(dir.join("big.bin"))
+            .unwrap()
+            .set_len(128 * 1024 * 1024)
+            .unwrap();
+        let (first_tx, first_rx) = oneshot::channel();
+        let first_tx = Mutex::new(Some(first_tx));
+        let (tx, reply) = oneshot::channel();
+        pending.lock().unwrap().insert(
+            "scan".into(),
+            (
+                tx,
                 progress_notify(move |_| {
-                    seen2.fetch_add(1, Ordering::Relaxed);
+                    if let Some(tx) = first_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
                 }),
             ),
+        );
+        mpsc_tx
+            .send(IpcInner {
+                op: IpcOperation::CheckLocalFiles {
+                    source: dir.to_string_lossy().to_string(),
+                    hash_algorithm: "md5".into(),
+                    file_list: vec!["big.bin".into()],
+                    skip_hash: vec![],
+                    delete_list: vec![],
+                },
+                id: "scan".into(),
+            })
+            .await
+            .unwrap();
+        time::timeout(Duration::from_secs(5), first_rx)
+            .await
+            .expect("no scan progress")
+            .unwrap();
+        mpsc_tx
+            .send(IpcInner {
+                op: IpcOperation::Cancel("scan".into()),
+                id: String::new(),
+            })
+            .await
+            .unwrap();
+        let got = time::timeout(Duration::from_secs(5), reply)
+            .await
+            .expect("pipe reply timeout")
+            .unwrap();
+        let Err(err) = got else {
+            panic!("the scan finished before the cancel reached it");
+        };
+        assert!(err.cancelled, "{}", err.message);
+
+        drop(mpsc_tx);
+        time::timeout(Duration::from_secs(5), client)
+            .await
+            .expect("client did not exit after server closed")
+            .unwrap();
+        // the hash thread lets go of the file at its next block
+        for _ in 0..50 {
+            if std::fs::remove_dir_all(&dir).is_ok() {
+                break;
+            }
+            time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn test_pipe() -> (String, NamedPipeServer) {
+        let name = format!(r"\\.\pipe\Kachina-Elevate-{}", uuid::Uuid::new_v4());
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&name)
+            .unwrap();
+        (name, server)
+    }
+
+    fn raw(child: &std::process::Child) -> isize {
+        std::os::windows::io::AsRawHandle::as_raw_handle(child) as isize
+    }
+
+    /// 子进程没连上就退出时，启动进程报错结束等待，而不是一直等连接。
+    #[tokio::test]
+    async fn helper_exit_before_connecting_fails_the_wait() {
+        let (_name, mut server) = test_pipe();
+        let mut helper = std::process::Command::new("cmd.exe")
+            .args(["/c", "exit", "0"])
+            .spawn()
+            .unwrap();
+        let err = time::timeout(
+            Duration::from_secs(5),
+            accept_helper(&mut server, raw(&helper)),
         )
         .await
-        .expect("run timed out")
-        .unwrap();
-        assert!(matches!(res, IpcResult::Ping));
-        responder.await.unwrap();
-        // progress is best effort: some of the 1000 arrive, never all of them are required
-        assert!(seen.load(Ordering::Relaxed) <= 1000);
+        .expect("accept_helper kept waiting after the helper exited")
+        .unwrap_err();
+        assert!(err.to_string().contains("exited"), "{err:#}");
+        let _ = helper.wait();
+    }
+
+    /// 连上管道的不是本次拉起的子进程时拒绝。
+    #[tokio::test]
+    async fn connection_from_another_process_is_refused() {
+        let (name, mut server) = test_pipe();
+        let mut helper = std::process::Command::new("cmd.exe")
+            .args(["/c", "ping", "-n", "10", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let _intruder = ClientOptions::new().open(&name).unwrap();
+        let err = accept_helper(&mut server, raw(&helper)).await.unwrap_err();
+        assert!(err.to_string().contains("is not the helper"), "{err:#}");
+        let _ = helper.kill();
+        let _ = helper.wait();
+    }
+
+    /// 提权侧写来的进度帧按 id 交给该请求的回调，且先于结果的最终快照；
+    /// 未登记 id 的进度丢弃，不影响之后的帧。
+    #[tokio::test]
+    async fn progress_frames_reach_only_their_request() {
+        use super::super::Progress;
+
+        let (name, server) = test_pipe();
+        let mut helper = ClientOptions::new().open(&name).unwrap();
+        server.connect().await.unwrap();
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        // held so the writer half, and with it the pipe task, stays up
+        let (_requests, mpsc_rx) = tokio::sync::mpsc::channel(1);
+        handle_pipe(
+            server,
+            pending.clone(),
+            mpsc_rx,
+            tokio::sync::mpsc::unbounded_channel().0,
+        )
+        .await;
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let (tx, reply) = oneshot::channel();
+        pending.lock().unwrap().insert(
+            "op".into(),
+            (tx, progress_notify(move |p| log.lock().unwrap().push(p))),
+        );
+        let mine = Progress::BytesOf { done: 1, total: 2 };
+        for msg in [
+            PipeMsg::Progress("op".into(), mine.clone()),
+            PipeMsg::Progress("unknown".into(), Progress::CountOf { done: 3, total: 4 }),
+            PipeMsg::Ok("op".into(), IpcResult::Ping, Default::default()),
+        ] {
+            helper
+                .write_all(&encode_frame(&msg).unwrap())
+                .await
+                .unwrap();
+        }
+
+        let got = time::timeout(Duration::from_secs(5), reply)
+            .await
+            .expect("pipe reply timeout");
+        assert!(matches!(got, Ok(Ok(IpcResult::Ping))));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![mine, Progress::NetworkFinal(Default::default())]
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn wait_idle_waits_for_dropped_request_result() {
-        let (mgr, _requests, pending, _progress_tx) = ManagedElevate::detached();
+        let (mgr, _requests, pending) = ManagedElevate::detached();
         let receiver = register(&pending, "pending");
         drop(receiver);
         let mut wait = tokio::spawn(async move { mgr.wait_idle().await });

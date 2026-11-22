@@ -26,16 +26,26 @@ pub enum SourceField {
     List(Vec<SourceItem>),
 }
 
+/// The packed `\0CONFIG`. A field the package leaves out takes the value
+/// below, so a package that only sets some fields still starts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectConfig {
+    #[serde(default = "default_source")]
     pub source: SourceField,
+    #[serde(default = "default_app_name")]
     pub app_name: String,
+    #[serde(default = "default_publisher")]
     pub publisher: String,
+    #[serde(default = "default_app_name")]
     pub reg_name: String,
+    #[serde(default = "default_exe_name")]
     pub exe_name: String,
+    #[serde(default = "default_uninstall_name")]
     pub uninstall_name: String,
+    #[serde(default = "default_updater_name")]
     pub updater_name: String,
+    #[serde(default = "default_app_name")]
     pub program_files_path: String,
     #[serde(default)]
     pub user_data_path: Vec<String>,
@@ -64,8 +74,11 @@ pub struct ProjectConfig {
     /// 打包期内联的用户协议正文（`text` / `markdown` / `html`）。
     #[serde(default)]
     pub agreement: Option<AgreementConfig>,
+    #[serde(default = "default_title")]
     pub title: String,
+    #[serde(default = "default_description")]
     pub description: String,
+    #[serde(default = "default_window_title")]
     pub window_title: String,
     #[serde(default = "default_uac")]
     pub uac_strategy: String,
@@ -84,6 +97,42 @@ pub struct AgreementConfig {
     pub format: String,
     #[serde(default)]
     pub content: String,
+}
+
+fn default_source() -> SourceField {
+    SourceField::Single(String::new())
+}
+
+fn default_app_name() -> String {
+    "Kachina".to_string()
+}
+
+fn default_publisher() -> String {
+    "YuehaiTeam".to_string()
+}
+
+fn default_exe_name() -> String {
+    "inst.exe".to_string()
+}
+
+fn default_uninstall_name() -> String {
+    "uninst.exe".to_string()
+}
+
+fn default_updater_name() -> String {
+    "update.exe".to_string()
+}
+
+fn default_title() -> String {
+    "Title".to_string()
+}
+
+fn default_description() -> String {
+    "description".to_string()
+}
+
+fn default_window_title() -> String {
+    " ".to_string()
 }
 
 fn default_uac() -> String {
@@ -183,10 +232,13 @@ pub async fn settings_from_cli(
     config: &InstallerConfig,
     project: &ProjectConfig,
 ) -> anyhow::Result<Settings> {
+    // Normalize to the long (non-8.3) form so everything derived from it —
+    // registry records, shortcut working dirs, path comparisons — uses one
+    // consistent spelling regardless of the form `-D` was given in.
     let install_path = args
         .target
         .as_ref()
-        .map(|p| p.to_string_lossy().to_string())
+        .map(|p| crate::utils::path::long_path(&p.to_string_lossy()))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| config.install_path.clone());
     let source_uri = project.source_uri(args.source.as_deref())?;

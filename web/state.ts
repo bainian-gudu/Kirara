@@ -38,6 +38,13 @@ export type ProgressCounter = {
   total: number | null;
 };
 
+export type FileProgress = {
+  id: number;
+  name: string;
+  done: number;
+  total: number;
+};
+
 export type Progress = {
   step: number | null;
   stage: ProgressStage;
@@ -67,6 +74,7 @@ export type Phase =
 
 export type ProjectView = {
   window_title: string;
+  app_name: string;
   title: string;
   description: string;
   borderless: boolean;

@@ -1,12 +1,14 @@
 use anyhow::Context;
 use std::io;
 use std::path::{Path, PathBuf};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 
 use crate::fs::staging::{has_reparse_point, staging_root, Staging};
+use crate::fs::{staged_write_error, write_staged_verified};
 use crate::utils::code::{Coded, FILE_IO_FAILED};
 use crate::utils::error::TAResult;
 use crate::utils::process;
+use crate::verified_write::Algorithm;
 
 lazy_static::lazy_static!(
     /// Staging directory to remove after this process exits. It holds the
@@ -720,7 +722,14 @@ pub async fn run_uninstall(
     uninstall_name: String,
 ) -> TAResult<UninstallOutcome> {
     let exe_path = std::env::current_exe().context("GET_EXE_PATH_ERR")?;
-    let self_moved_to = if exe_path.starts_with(&source) {
+    // `source` may carry 8.3 short-name components while `exe_path` is in the
+    // launch form (or vice versa); compare in long form.
+    let exe_long = std::path::PathBuf::from(crate::utils::path::long_path(
+        &exe_path.to_string_lossy(),
+    ));
+    let source_long = crate::utils::path::long_path(&source);
+    let in_source = exe_long.starts_with(&source_long);
+    let self_moved_to = if in_source {
         Some(park_self(&exe_path, &source, &uninstall_name).await?)
     } else {
         None
@@ -775,9 +784,13 @@ pub async fn run_uninstall(
     let mut delete_list = files
         .iter()
         .map(|f| Path::new(source.as_str()).join(f))
-        .filter(|f| f.exists() && *f != exe_path)
+        .filter(|f| {
+            f.exists()
+                && crate::session::plan::normalize_existing(&f.to_string_lossy())
+                    != crate::session::plan::normalize_existing(&exe_path.to_string_lossy())
+        })
         .collect::<Vec<_>>();
-    if !exe_path.starts_with(&source) {
+    if !in_source {
         // external uninstaller
         delete_list.push(Path::new(source.as_str()).join(uninstall_name));
     }
@@ -983,6 +996,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// The installer's own image is staged without its layout header; a copied
+    /// file keeps every byte, layout header included.
+    #[test]
+    fn only_the_own_image_loses_its_layout_header() {
+        let dir =
+            crate::fs::staging::scratch_file(&format!("kachina-image-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut image: Vec<u8> = (0..8192u32).map(|i| (i % 249) as u8).collect();
+        image[0x4E..0x4E + 18].copy_from_slice(crate::pack_format::LAYOUT_MARKER);
+        image[0x4E + 18..0x4E + 38].fill(0x5A);
+        let mut cleared = image.clone();
+        crate::pack_format::clear_layout(&mut cleared);
+
+        let own = dir.join("uninstall.exe");
+        write_image(ImageSource::Own(image.clone()), &own, Algorithm::Md5).unwrap();
+        assert_eq!(std::fs::read(&own).unwrap(), cleared);
+
+        let source = dir.join("source.exe");
+        std::fs::write(&source, &image).unwrap();
+        let copy = dir.join("updater.exe");
+        write_image(ImageSource::File(source), &copy, Algorithm::Xxh).unwrap();
+        assert_eq!(std::fs::read(&copy).unwrap(), image);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn scheduled_task_names_must_belong_to_this_product() {
         assert!(is_safe_task_name("App", "App"));
@@ -1137,6 +1175,20 @@ pub struct StagedImage {
 pub async fn stage_self_image(args: StageSelfImageArgs) -> TAResult<Vec<StagedImage>> {
     let new_dir = Path::new(&args.new_dir);
     let install = Path::new(&args.install_dir);
+    let algorithm = Algorithm::from_name(&args.hash_algorithm)
+        .ok_or_else(|| anyhow::anyhow!("NO_HASH_ALGO_ERR"))?;
+    let own_image = match &args.copy_from {
+        Some(_) => None,
+        None => {
+            let mut image = crate::local::get_base_with_config().await?;
+            let mut bytes = Vec::new();
+            image
+                .read_to_end(&mut bytes)
+                .await
+                .context("CREATE_UNINSTALLER_ERR")?;
+            Some(bytes)
+        }
+    };
     let mut out = Vec::new();
     for name in &args.names {
         if !crate::fs::staging::is_safe_rel(name) {
@@ -1153,29 +1205,15 @@ pub async fn stage_self_image(args: StageSelfImageArgs) -> TAResult<Vec<StagedIm
         if has_reparse_point(&staged) {
             return Err(anyhow::Error::from(Coded::bare(FILE_IO_FAILED)).into());
         }
-        match &args.copy_from {
-            Some(src) => {
-                tokio::fs::copy(src, &staged)
-                    .await
-                    .context("CREATE_UPDATER_ERR")?;
-            }
-            None => {
-                let mut image = crate::local::get_base_with_config().await?;
-                let file = tokio::fs::File::create(&staged)
-                    .await
-                    .context("CREATE_UNINSTALLER_ERR")?;
-                let mut writer = tokio::io::BufWriter::new(file);
-                tokio::io::copy(&mut image, &mut writer)
-                    .await
-                    .context("CREATE_UNINSTALLER_ERR")?;
-                writer.flush().await.context("CREATE_UNINSTALLER_ERR")?;
-                drop(writer);
-                clear_index_mark(&staged).await?;
-            }
-        }
-        crate::fs::sync_staged_file(&staged).await?;
-        let hash =
-            crate::utils::hash::run_hash(&args.hash_algorithm, &staged.to_string_lossy()).await?;
+        let source = match (&args.copy_from, &own_image) {
+            (Some(src), _) => ImageSource::File(PathBuf::from(src)),
+            (None, Some(bytes)) => ImageSource::Own(bytes.clone()),
+            (None, None) => unreachable!("own image is read when nothing is copied"),
+        };
+        let target = staged.clone();
+        let hash = tokio::task::spawn_blocking(move || write_image(source, &target, algorithm))
+            .await
+            .context("STAGE_IMAGE_THREAD_ERR")??;
         let existing = crate::fs::staging::join_rel(install, name);
         let old = if existing.is_file() {
             crate::utils::hash::run_hash(&args.hash_algorithm, &existing.to_string_lossy())
@@ -1197,45 +1235,28 @@ pub async fn stage_self_image(args: StageSelfImageArgs) -> TAResult<Vec<StagedIm
     }
     Ok(out)
 }
-pub async fn clear_index_mark(path: &PathBuf) -> anyhow::Result<()> {
-    // open again with rw
-    let mut output_file = tokio::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .await
-        .context("SELF_UPDATE_ERR")?;
-    // read first 256 bytes to buffer
-    let mut buffer = [0u8; 256];
-    output_file
-        .read_exact(&mut buffer)
-        .await
-        .context("SELF_UPDATE_ERR")?;
 
-    // check ! and K
-    let mark_pos = buffer.windows(2).position(|w| w == b"!K".as_ref());
-    if let Some(mark_pos) = mark_pos {
-        // check if equals !KachinaInstaller!
-        let mark_str = "!KachinaInstaller!";
-        let mark_real = String::from_utf8_lossy(&buffer[mark_pos..mark_pos + mark_str.len()]);
-        if mark_real == mark_str {
-            let index_start = mark_pos + mark_str.len();
-            // PE header replaced with index. Remove it.
-            // write 5*4 bytes of 0 after index_start
-            output_file
-                .seek(tokio::io::SeekFrom::Start(index_start as u64))
-                .await
-                .context("SELF_UPDATE_ERR")?;
-            let zero = [0u8; 5 * 4];
-            output_file
-                .write_all(&zero)
-                .await
-                .context("SELF_UPDATE_ERR")?;
+/// Where a staged image comes from.
+enum ImageSource {
+    /// The running installer's `base + config`; its layout header is cleared
+    /// on the way out, since the image carries no packed data.
+    Own(Vec<u8>),
+    /// An existing file, duplicated byte for byte.
+    File(PathBuf),
+}
+
+/// Write one image to `staged` and return the hash of what the file holds
+/// (see [`write_staged_verified`]).
+fn write_image(source: ImageSource, staged: &Path, algorithm: Algorithm) -> anyhow::Result<String> {
+    let never = || false;
+    let written = match source {
+        ImageSource::Own(bytes) => {
+            write_staged_verified(&mut bytes.as_slice(), staged, algorithm, true, &never)
         }
-    }
-    // close file
-    output_file.flush().await.context("SELF_UPDATE_ERR")?;
-    output_file.sync_all().await.context("SELF_UPDATE_ERR")?;
-    drop(output_file);
-    Ok(())
+        ImageSource::File(path) => {
+            let mut file = std::fs::File::open(path).context("CREATE_UPDATER_ERR")?;
+            write_staged_verified(&mut file, staged, algorithm, false, &never)
+        }
+    };
+    written.map_err(|failure| staged_write_error(failure, staged))
 }

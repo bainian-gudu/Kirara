@@ -1,14 +1,9 @@
 use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
-use crate::{
-    cli::PackArgs,
-    local::{
-        check_index_name, check_tlv_name, get_reader_for_bundle, preferred_file_hash,
-        EmbeddedNameError,
-    },
-    utils::metadata::RepoMetadata,
-};
+use crate::pack_format::embedded_name::{check_index_name, check_tlv_name, EmbeddedNameError};
+use crate::pack_format::{get_header_size, preferred_file_hash, LAYOUT_MARKER, TLV_MAGIC};
+use crate::{cli::PackArgs, local::get_reader_for_bundle, utils::metadata::RepoMetadata};
 
 pub struct PackFile {
     pub name: String,
@@ -24,27 +19,24 @@ pub struct PackConfig {
     pub icon_path: Option<PathBuf>,
 }
 
-pub async fn pack_cli(args: PackArgs) {
+pub async fn pack_cli(args: PackArgs) -> Result<(), String> {
     let reader = get_reader_for_bundle().await;
     if reader.is_err() {
-        eprintln!("Failed to get reader: {:?}", reader.err());
-        std::process::exit(1);
+        return Err(format!("Failed to get reader: {:?}", reader.err()));
     }
     let reader = reader.unwrap();
     let config = tokio::fs::read(&args.config).await;
     if config.is_err() {
-        eprintln!(
+        return Err(format!(
             "Failed to read config {:?} : {:?}",
             args.config,
             config.err()
-        );
-        return;
+        ));
     }
     let config = config.unwrap();
     let config = serde_json::from_slice(&config);
     if config.is_err() {
-        eprintln!("Failed to parse config: {:?}", config.err());
-        return;
+        return Err(format!("Failed to parse config: {:?}", config.err()));
     }
     let mut config = config.unwrap();
     for key in unknown_config_keys(&config) {
@@ -59,25 +51,22 @@ pub async fn pack_cli(args: PackArgs) {
     // 点名了图标却找不到文件时直接失败：静默保留内置图标会让人以为配置已经生效。
     if let Some(icon) = &icon_path {
         if !icon.is_file() {
-            eprintln!("Icon file not found: {}", icon.display());
-            return;
+            return Err(format!("Icon file not found: {}", icon.display()));
         }
     }
     let metadata = if let Some(metadata) = args.metadata {
         let metadataf = tokio::fs::read(&metadata).await;
         if metadataf.is_err() {
-            eprintln!(
+            return Err(format!(
                 "Failed to read metadata {:?} : {:?}",
                 metadata,
                 metadataf.err()
-            );
-            return;
+            ));
         }
         let metadataf = metadataf.unwrap();
         let json = serde_json::from_slice::<RepoMetadata>(&metadataf);
         if json.is_err() {
-            eprintln!("Failed to parse metadata: {:?}", json.err());
-            return;
+            return Err(format!("Failed to parse metadata: {:?}", json.err()));
         }
         Some(json.unwrap())
     } else {
@@ -86,18 +75,12 @@ pub async fn pack_cli(args: PackArgs) {
     let image = if let Some(image) = image_path {
         let image_size = tokio::fs::metadata(&image).await;
         if image_size.is_err() {
-            eprintln!(
-                "Failed to read image {}: {:?}",
-                image.display(),
-                image_size.err()
-            );
-            return;
+            return Err(format!("Failed to get image size: {:?}", image_size.err()));
         }
         let image_size = image_size.unwrap().len() as u32;
         let imagef = tokio::fs::File::open(image).await;
         if imagef.is_err() {
-            eprintln!("Failed to open image: {:?}", imagef.err());
-            return;
+            return Err(format!("Failed to open image: {:?}", imagef.err()));
         }
         Some(PackFile {
             name: "\0IMAGE".to_string(),
@@ -114,8 +97,7 @@ pub async fn pack_cli(args: PackArgs) {
             if !metadata.hashed.is_empty() {
                 for file in metadata.hashed.iter() {
                     let Some(hash) = preferred_file_hash(&file.md5, &file.xxh) else {
-                        eprintln!("No hash found for file: {:?}", file.file_name);
-                        return;
+                        return Err(format!("No hash found for file: {:?}", file.file_name));
                     };
                     if files.iter().any(|x: &PackFile| x.name == *hash) {
                         continue;
@@ -124,8 +106,7 @@ pub async fn pack_cli(args: PackArgs) {
                     let size = tokio::fs::metadata(&path).await.unwrap().len() as usize;
                     let f = tokio::fs::File::open(path).await;
                     if f.is_err() {
-                        eprintln!("Failed to open file {}: {:?}", hash, f.err());
-                        return;
+                        return Err(format!("Failed to open file {}: {:?}", hash, f.err()));
                     }
                     let data = Box::new(f.unwrap()) as Box<dyn AsyncRead + Unpin + Send>;
                     files.push(PackFile {
@@ -139,12 +120,10 @@ pub async fn pack_cli(args: PackArgs) {
                 for patch in metadata.patches.iter() {
                     let Some(from_hash) = preferred_file_hash(&patch.from.md5, &patch.from.xxh)
                     else {
-                        eprintln!("No hash found for patch: {:?}", patch.file_name);
-                        return;
+                        return Err(format!("No hash found for patch: {:?}", patch.file_name));
                     };
                     let Some(to_hash) = preferred_file_hash(&patch.to.md5, &patch.to.xxh) else {
-                        eprintln!("No hash found for patch: {:?}", patch.file_name);
-                        return;
+                        return Err(format!("No hash found for patch: {:?}", patch.file_name));
                     };
                     let patch_fn = format!("{from_hash}_{to_hash}");
                     if files.iter().any(|x: &PackFile| x.name == *patch_fn) {
@@ -154,8 +133,7 @@ pub async fn pack_cli(args: PackArgs) {
                     let size = tokio::fs::metadata(&path).await.unwrap().len() as usize;
                     let f = tokio::fs::File::open(path).await;
                     if f.is_err() {
-                        eprintln!("Failed to open file {}: {:?}", patch_fn, f.err());
-                        return;
+                        return Err(format!("Failed to open file {}: {:?}", patch_fn, f.err()));
                     }
                     let data = Box::new(f.unwrap()) as Box<dyn AsyncRead + Unpin + Send>;
                     files.push(PackFile {
@@ -169,8 +147,7 @@ pub async fn pack_cli(args: PackArgs) {
             // if no metadata set, just pack all files without '_'
             let entries = tokio::fs::read_dir(data_dir).await;
             if entries.is_err() {
-                eprintln!("Failed to read data dir: {:?}", entries.err());
-                return;
+                return Err(format!("Failed to read data dir: {:?}", entries.err()));
             }
             let mut entries = entries.unwrap();
             while let Some(entry) = entries.next_entry().await.unwrap() {
@@ -183,8 +160,7 @@ pub async fn pack_cli(args: PackArgs) {
                 let size = tokio::fs::metadata(&path).await.unwrap().len() as usize;
                 let f = tokio::fs::File::open(path).await;
                 if f.is_err() {
-                    eprintln!("Failed to open file {}: {:?}", name, f.err());
-                    return;
+                    return Err(format!("Failed to open file {}: {:?}", name, f.err()));
                 }
                 let data = Box::new(f.unwrap()) as Box<dyn AsyncRead + Unpin + Send>;
                 files.push(PackFile { name, size, data });
@@ -198,18 +174,22 @@ pub async fn pack_cli(args: PackArgs) {
         files,
         icon_path,
     };
-    if let Err(err) = validate_pack_names(&config) {
-        eprintln!("{err}");
-        return;
-    }
-    let output = tokio::fs::File::create(args.output).await.unwrap();
+    validate_pack_names(&config).map_err(|err| err.to_string())?;
+    let output = tokio::fs::File::create(&args.output)
+        .await
+        .map_err(|err| format!("Failed to create output {:?}: {err}", args.output))?;
     println!(
         "Packing: metadata: {:?}, image: {:?}, files: {}",
         config.metadata.is_some(),
         config.image.is_some(),
         config.files.len()
     );
-    pack(reader, output, config).await;
+    let result = pack(reader, output, config).await;
+    if result.is_err() {
+        // a half-written installer must not be mistaken for a build output
+        let _ = tokio::fs::remove_file(&args.output).await;
+    }
+    result
 }
 
 /// 打包配置里 builder 自己消费、不写进包内配置的键。
@@ -318,10 +298,9 @@ pub async fn pack(
     mut base: impl AsyncRead + std::marker::Unpin,
     mut output: impl AsyncWrite + std::marker::Unpin,
     mut config: PackConfig,
-) {
+) -> Result<(), String> {
     if let Err(err) = validate_pack_names(&config) {
-        eprintln!("{err}");
-        return;
+        return Err(format!("{err}"));
     }
     println!("Generating exe with version info...");
     let tmppath = std::env::temp_dir().join(format!(
@@ -445,8 +424,7 @@ pub async fn pack(
     let index_len = match index_to_bin(&index) {
         Ok(bytes) => bytes.len() + get_header_size("\0INDEX"),
         Err(err) => {
-            eprintln!("{err}");
-            return;
+            return Err(format!("{err}"));
         }
     };
     // add index_len to offset
@@ -483,8 +461,7 @@ pub async fn pack(
     // check if pe_str is really 'This program cannot be run in DOS mode'
     let pe_string = std::str::from_utf8_mut(pe_str).unwrap();
     if pe_string != "This program cannot be run in DOS mode" {
-        eprintln!("Failed to find pe string: {pe_string:?}");
-        return;
+        return Err(format!("Failed to find pe string: {pe_string:?}"));
     }
     pe_str.copy_from_slice(&index_pre);
     // copy base to output, not closing output file
@@ -495,21 +472,18 @@ pub async fn pack(
     let config_bytes = config_bytes.as_bytes();
     let res = write_header(&mut output, "\0CONFIG", config_bytes.len() as u32).await;
     if res.is_err() {
-        eprintln!("Failed to write header: {:?}", res.err());
-        return;
+        return Err(format!("Failed to write header: {:?}", res.err()));
     }
     let res = output.write_all(config_bytes).await;
     if res.is_err() {
-        eprintln!("Failed to write config: {:?}", res.err());
-        return;
+        return Err(format!("Failed to write config: {:?}", res.err()));
     }
     // if theme exists, write theme
     if let Some(image) = config.image.as_mut() {
         println!("Writing image...");
         let res = write_file(&mut output, image).await;
         if res.is_err() {
-            eprintln!("Failed to write image: {:?}", res.err());
-            return;
+            return Err(format!("Failed to write image: {:?}", res.err()));
         }
     }
     if !files.is_empty() {
@@ -518,8 +492,7 @@ pub async fn pack(
         let index_bytes = match index_to_bin(&index) {
             Ok(bytes) => bytes,
             Err(err) => {
-                eprintln!("{err}");
-                return;
+                return Err(format!("{err}"));
             }
         };
         write_header(&mut output, "\0INDEX", index_bytes.len() as u32)
@@ -532,13 +505,11 @@ pub async fn pack(
     if let Some(metadata_bytes) = metadata_bytes {
         let res = write_header(&mut output, "\0META", metadata_bytes.len() as u32).await;
         if res.is_err() {
-            eprintln!("Failed to write header: {:?}", res.err());
-            return;
+            return Err(format!("Failed to write header: {:?}", res.err()));
         }
         let res = output.write_all(&metadata_bytes).await;
         if res.is_err() {
-            eprintln!("Failed to write metadata: {:?}", res.err());
-            return;
+            return Err(format!("Failed to write metadata: {:?}", res.err()));
         }
     }
     // write files
@@ -546,18 +517,21 @@ pub async fn pack(
         println!("Writing file: {}", file.name);
         let res = write_file(&mut output, file).await;
         if res.is_err() {
-            eprintln!("Failed to write file {}: {:?}", file.name, res.err());
-            return;
+            return Err(format!(
+                "Failed to write file {}: {:?}",
+                file.name,
+                res.err()
+            ));
         }
     }
     // flush
     println!("Finalizing...");
     let res = output.flush().await;
     if res.is_err() {
-        eprintln!("Failed to flush: {:?}", res.err());
-        return;
+        return Err(format!("Failed to flush: {:?}", res.err()));
     }
     println!("Done");
+    Ok(())
 }
 
 fn validate_pack_names(config: &PackConfig) -> Result<(), EmbeddedNameError> {
@@ -580,8 +554,6 @@ pub async fn write_header(
     check_tlv_name(name).map_err(|err| {
         tokio::io::Error::new(tokio::io::ErrorKind::InvalidInput, err.to_string())
     })?;
-    let header = "!in\0".to_ascii_uppercase();
-    let header = header.as_bytes();
     let name = name.as_bytes();
     let namelen = u16::try_from(name.len()).map_err(|_| {
         tokio::io::Error::new(
@@ -594,15 +566,11 @@ pub async fn write_header(
         )
     })?;
     let size = size.to_be_bytes();
-    output.write_all(header).await?;
+    output.write_all(TLV_MAGIC).await?;
     output.write_all(&namelen.to_be_bytes()).await?;
     output.write_all(name).await?;
     output.write_all(&size).await?;
     Ok(())
-}
-
-pub fn get_header_size(name: &str) -> usize {
-    "!in\0".len() + 2 + name.len() + 4
 }
 
 pub fn index_to_bin(index: &[(String, u32, u32)]) -> Result<Vec<u8>, EmbeddedNameError> {
@@ -626,7 +594,7 @@ pub fn gen_index_header(
     index_end: u32,
     manifest_end: u32,
 ) -> Vec<u8> {
-    let mut data = "!KachinaInstaller!".as_bytes().to_vec();
+    let mut data = LAYOUT_MARKER.to_vec();
     data.extend_from_slice(&base_end.to_be_bytes());
     data.extend_from_slice(&config_end.to_be_bytes());
     data.extend_from_slice(&theme_end.to_be_bytes());
@@ -639,7 +607,14 @@ pub async fn write_file(
     output: &mut (impl AsyncWrite + std::marker::Unpin),
     file: &mut PackFile,
 ) -> Result<(), tokio::io::Error> {
-    write_header(output, &file.name, file.size as u32).await?;
+    // the TLV length field is 4 bytes
+    let size = u32::try_from(file.size).map_err(|_| {
+        tokio::io::Error::other(format!(
+            "{} is {} bytes, over the 4 GiB an entry can hold",
+            file.name, file.size
+        ))
+    })?;
+    write_header(output, &file.name, size).await?;
     tokio::io::copy(&mut file.data, output).await?;
     Ok(())
 }
@@ -671,12 +646,8 @@ fn get_file_pack_priority(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        embed_metadata_bytes, index_to_bin, resolve_agreement, unknown_config_keys, write_header,
-    };
-    use crate::local::{get_embedded, INDEX_NAME_MAX};
-    use crate::utils::metadata::{FileMeta, InstallerInfo, PatchInfo, PatchSide, RepoMetadata};
-    use serde::Serialize;
+    use super::{index_to_bin, resolve_agreement, unknown_config_keys, write_header};
+    use crate::pack_format::{embedded_name::INDEX_NAME_MAX, scan_embedded};
     use tokio::io::AsyncWriteExt;
 
     #[test]
@@ -767,184 +738,29 @@ mod tests {
         write_header(&mut bytes, &name, 3).await.unwrap();
         bytes.write_all(b"abc").await.unwrap();
 
-        let path = std::env::temp_dir().join(format!("kachina-tlv-{}.bin", uuid::Uuid::new_v4()));
-        tokio::fs::write(&path, &bytes).await.unwrap();
-        let file = fmmap::tokio::AsyncMmapFile::open(&path).await.unwrap();
-        let entries = get_embedded(&file).await.unwrap();
-        drop(file);
-        let _ = tokio::fs::remove_file(&path).await;
-
+        let entries = scan_embedded(&bytes);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, name);
         assert_eq!(entries[0].size, 3);
         assert_eq!(&bytes[entries[0].offset..], b"abc");
     }
 
-    /// 合并前写出镜像的 serde 属性（`Option` 字段、`assets`），对照嵌入 JSON 字节。
-    #[derive(Serialize)]
-    struct LegacyFile {
-        file_name: String,
-        size: u64,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        md5: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        xxh: Option<String>,
-    }
-
-    #[derive(Serialize)]
-    struct LegacyPatchSide {
-        size: u64,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        md5: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        xxh: Option<String>,
-    }
-
-    #[derive(Serialize)]
-    struct LegacyPatch {
-        file_name: String,
-        size: u64,
-        from: LegacyPatchSide,
-        to: LegacyPatchSide,
-    }
-
-    #[derive(Serialize)]
-    struct LegacyInstaller {
-        size: u64,
-        md5: Option<String>,
-        xxh: Option<String>,
-    }
-
-    #[derive(Serialize)]
-    struct LegacyRepo {
-        repo_name: String,
-        tag_name: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        assets: Option<Vec<LegacyFile>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        hashed: Option<Vec<LegacyFile>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        patches: Option<Vec<LegacyPatch>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        installer: Option<LegacyInstaller>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        deletes: Option<Vec<String>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        packing_info: Option<Vec<Vec<String>>>,
-    }
-
-    fn legacy_embed(mut metadata: LegacyRepo) -> Vec<u8> {
-        metadata.packing_info = None;
-        let mut metadata = serde_json::json!(metadata);
-        metadata.sort_all_objects();
-        serde_json::to_string(&metadata).unwrap().into_bytes()
-    }
-
-    fn file(name: &str, size: u64, xxh: &str) -> (FileMeta, LegacyFile) {
-        (
-            FileMeta {
-                file_name: name.into(),
-                size,
-                md5: None,
-                xxh: Some(xxh.into()),
-                installer: None,
-            },
-            LegacyFile {
-                file_name: name.into(),
-                size,
-                md5: None,
-                xxh: Some(xxh.into()),
+    /// An entry whose length does not fit the 4-byte field fails before a
+    /// byte is written, instead of a header with the length cut off.
+    #[tokio::test]
+    async fn entry_over_4_gib_is_refused() {
+        let mut bytes = Vec::new();
+        let err = super::write_file(
+            &mut bytes,
+            &mut super::PackFile {
+                name: "big.bin".into(),
+                size: u32::MAX as usize + 1,
+                data: Box::new(tokio::io::empty()),
             },
         )
-    }
-
-    #[test]
-    fn pack_embed_matches_legacy_after_strip() {
-        let (hashed, legacy_hashed) = file("app.exe", 12, "abcd");
-        let new_bytes = embed_metadata_bytes(RepoMetadata {
-            tag_name: "v1.0.0".into(),
-            hashed: vec![hashed],
-            patches: Vec::new(),
-            installer: None,
-            deletes: Vec::new(),
-            repo_name: "demo".into(),
-            packing_info: vec![vec!["abcd".into()], vec![], vec![], vec![], vec![]],
-        });
-        let old_bytes = legacy_embed(LegacyRepo {
-            repo_name: "demo".into(),
-            tag_name: "v1.0.0".into(),
-            assets: None,
-            hashed: Some(vec![legacy_hashed]),
-            patches: None,
-            installer: None,
-            deletes: None,
-            packing_info: Some(vec![vec!["abcd".into()], vec![], vec![], vec![], vec![]]),
-        });
-        assert_eq!(
-            String::from_utf8_lossy(&new_bytes),
-            String::from_utf8_lossy(&old_bytes)
-        );
-    }
-
-    #[test]
-    fn pack_embed_matches_legacy_with_patches_and_installer() {
-        let (hashed, legacy_hashed) = file("app.exe", 12, "abcd");
-        let new_bytes = embed_metadata_bytes(RepoMetadata {
-            tag_name: "v2".into(),
-            hashed: vec![hashed],
-            patches: vec![PatchInfo {
-                file_name: "app.exe".into(),
-                size: 4,
-                from: PatchSide {
-                    size: 10,
-                    md5: None,
-                    xxh: Some("from".into()),
-                },
-                to: PatchSide {
-                    size: 12,
-                    md5: None,
-                    xxh: Some("abcd".into()),
-                },
-            }],
-            installer: Some(InstallerInfo {
-                size: 8,
-                md5: None,
-                xxh: Some("upd".into()),
-            }),
-            deletes: vec!["old.txt".into()],
-            repo_name: "demo".into(),
-            packing_info: vec![vec![], vec![], vec![], vec!["p".into()], vec![]],
-        });
-        let old_bytes = legacy_embed(LegacyRepo {
-            repo_name: "demo".into(),
-            tag_name: "v2".into(),
-            assets: None,
-            hashed: Some(vec![legacy_hashed]),
-            patches: Some(vec![LegacyPatch {
-                file_name: "app.exe".into(),
-                size: 4,
-                from: LegacyPatchSide {
-                    size: 10,
-                    md5: None,
-                    xxh: Some("from".into()),
-                },
-                to: LegacyPatchSide {
-                    size: 12,
-                    md5: None,
-                    xxh: Some("abcd".into()),
-                },
-            }]),
-            installer: Some(LegacyInstaller {
-                size: 8,
-                md5: None,
-                xxh: Some("upd".into()),
-            }),
-            deletes: Some(vec!["old.txt".into()]),
-            packing_info: Some(vec![vec![], vec![], vec![], vec!["p".into()], vec![]]),
-        });
-        assert_eq!(
-            String::from_utf8_lossy(&new_bytes),
-            String::from_utf8_lossy(&old_bytes)
-        );
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("4 GiB"), "{err}");
+        assert!(bytes.is_empty());
     }
 }

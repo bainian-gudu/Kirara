@@ -24,21 +24,23 @@ use crate::ipc::install_file::{
 use crate::ipc::manager::ManagedElevate;
 use crate::ipc::operation::IpcOperation;
 use crate::ipc::{progress_noop, progress_notify, IpcResult, Progress, ProgressNotify};
-use crate::local::Embedded;
+use crate::pack_format::Embedded;
 use crate::session::commands::SessionState;
 use crate::session::dump::session_dump;
-use crate::session::merge::{dfs2_ranges, file_mode, plan_tasks, FileMode, FilePos, InstallTask};
+use crate::session::merge::{
+    dfs2_ranges, diff_name, plan_tasks, FilePlan, FilePos, FileSource, InstallTask,
+};
 use crate::session::plan::{
-    build_plan, collect_skip_hash, files_to_probe_writable, find_local, is_under, join_install,
-    mark_unwritable, normalize_rel, strip_install_prefix, HashKey, InstallPlan, LocalFile,
-    PlanAction, PlanInput, SkipReason,
+    build_plan, collect_skip_hash, files_to_probe_writable, is_under, join_install,
+    mark_unwritable, normalize_existing, normalize_rel, strip_install_prefix, DiskFiles,
+    HashKey, InstallPlan, LocalFile, PlanAction, PlanInput, SkipReason,
 };
 use crate::session::source::{
     cleanup_dfs2, ensure_dfs2_session, fetch_metadata, hash_of_item, needs_js_plugin, parse_source,
     resolve_file_location, resolve_range_urls, FileLocation, ParsedSource, SourceCtx,
 };
 use crate::session::state::{
-    CancelState, FileAction, Phase, Progress as UiProgress,
+    CancelState, FileProgress, Phase, Progress as UiProgress,
     ProgressCounter, ProgressStage, ProgressUnit, Prompt, UiState,
 };
 use crate::session::types::{version_gt, ProjectConfig, SessionResult, Settings};
@@ -54,7 +56,7 @@ use crate::utils::code::{
     WEBVIEW2_REQUIRED,
 };
 use crate::utils::error::IntoAnyhow;
-use crate::utils::metadata::{FileMeta, RepoMetadata};
+use crate::utils::metadata::{FileMeta, PatchInfo, RepoMetadata};
 use tokio_util::sync::CancellationToken;
 
 pub async fn run_op(
@@ -64,6 +66,20 @@ pub async fn run_op(
     on_progress: ProgressNotify,
 ) -> anyhow::Result<IpcResult> {
     mgr.run(op, elevate, on_progress).await.into_anyhow()
+}
+
+/// [`run_op`] for the operations that stop on the user's cancel (the hash
+/// scan, the Mirror酱 extraction); others ignore `cancel`.
+async fn run_op_cancellable(
+    mgr: &ManagedElevate,
+    elevate: bool,
+    op: IpcOperation,
+    on_progress: ProgressNotify,
+    cancel: &CancellationToken,
+) -> anyhow::Result<IpcResult> {
+    mgr.run_cancellable(op, elevate, on_progress, cancel)
+        .await
+        .into_anyhow()
 }
 
 struct OperationProgress {
@@ -184,13 +200,14 @@ async fn run_op_with_ui(
         None
     };
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Progress>();
-    let mut op_fut = Box::pin(run_op(
+    let mut op_fut = Box::pin(run_op_cancellable(
         mgr,
         elevate,
         op,
         progress_notify(move |p| {
             let _ = tx.send(p);
         }),
+        &ui.cancel,
     ));
     let mut cancelled = false;
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
@@ -302,21 +319,9 @@ fn mode_from_op(op: &IpcOperation) -> Option<&'static str> {
     }
 }
 
-fn merged_mode(
-    files: &[FilePos],
-    local: &[Embedded],
-    patches: &[crate::utils::metadata::PatchInfo],
-    hash_key: HashKey,
-) -> &'static str {
-    let mut direct = false;
-    let mut patch = false;
-    for file in files {
-        match file_mode(&file.item, hash_key, local, patches, false) {
-            FileMode::Patch => patch = true,
-            FileMode::Direct => direct = true,
-            _ => {}
-        }
-    }
+fn merged_mode(files: &[FilePos]) -> &'static str {
+    let patch = files.iter().any(|f| f.patch.is_some());
+    let direct = files.iter().any(|f| f.patch.is_none());
     match (direct, patch) {
         (true, true) => "merged-direct-patch",
         (false, true) => "merged-patch",
@@ -414,6 +419,13 @@ async fn open_staging(
     let IpcResult::OpenStaging(opened) = raw else {
         bail!("IPC_SHAPE_ERR");
     };
+    // The e2e tests find the staging root by this line and parse both quoted
+    // paths.
+    tracing::info!(
+        "staging opened for {:?} at {:?}",
+        settings.install_path,
+        opened.root
+    );
     Ok((
         SessionStaging {
             staging: Staging::at(opened.root),
@@ -548,22 +560,26 @@ fn build_units(
     plan: &InstallPlan,
     hashed: &[crate::utils::metadata::FileMeta],
     hash_key: HashKey,
-    local: &[LocalFile],
+    local: &DiskFiles,
     scan: &LocalScan,
 ) -> Vec<Unit> {
-    let dirty: std::collections::HashSet<&str> =
-        scan.dirty_dirs.iter().map(String::as_str).collect();
-    let installing: std::collections::HashMap<String, FileEntry> = plan
+    use std::collections::{BTreeMap, HashMap, HashSet};
+    let dirty: HashSet<&str> = scan.dirty_dirs.iter().map(String::as_str).collect();
+    // managed files by normalized path; of entries with the same path, the first
+    let mut managed: HashMap<String, &crate::utils::metadata::FileMeta> =
+        HashMap::with_capacity(hashed.len());
+    for h in hashed {
+        managed.entry(normalize_rel(&h.file_name)).or_insert(h);
+    }
+    let installing: HashMap<String, FileEntry> = plan
         .files
         .iter()
         .filter(|f| f.action == PlanAction::Install)
         .filter_map(|f| {
-            let meta = hashed
-                .iter()
-                .find(|h| normalize_rel(&h.file_name) == normalize_rel(&f.file_name))?;
-            let new = hash_of_item(meta, hash_key)?;
+            let rel = normalize_rel(&f.file_name);
+            let new = hash_of_item(managed.get(&rel)?, hash_key)?;
             Some((
-                normalize_rel(&f.file_name),
+                rel,
                 FileEntry {
                     rel: rel_of(&f.file_name),
                     old: f.old_hash.clone(),
@@ -578,36 +594,24 @@ fn build_units(
             .any(|d| rel_lower.starts_with(&format!("{d}/")))
     };
 
-    // candidate directories: every managed file under them is being written
-    let mut all_dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for h in hashed {
-        let rel = normalize_rel(&h.file_name);
-        let mut d = dir_of(&rel);
+    // every directory holding a managed file, and whether every managed file
+    // under it is being written outside a reparse point
+    let mut all_written: BTreeMap<String, bool> = BTreeMap::new();
+    for rel in managed.keys() {
+        let written = installing.contains_key(rel) && !is_copy(rel);
+        let mut d = dir_of(rel);
         loop {
-            all_dirs.insert(d.clone());
+            *all_written.entry(d.clone()).or_insert(true) &= written;
             if d.is_empty() {
                 break;
             }
             d = dir_of(&d);
         }
     }
-    let mut candidates: Vec<String> = all_dirs
+    let mut candidates: Vec<String> = all_written
         .into_iter()
-        .filter(|d| !dirty.contains(d.as_str()))
-        .filter(|d| {
-            let mut any = false;
-            for h in hashed {
-                let rel = normalize_rel(&h.file_name);
-                if !under_dir(&rel, d) {
-                    continue;
-                }
-                any = true;
-                if !installing.contains_key(&rel) || is_copy(&rel) {
-                    return false;
-                }
-            }
-            any
-        })
+        .filter(|(d, written)| *written && !dirty.contains(d.as_str()))
+        .map(|(d, _)| d)
         .collect();
     // topmost wins
     candidates.sort_by_key(|d| d.matches('/').count() + usize::from(!d.is_empty()));
@@ -617,28 +621,41 @@ fn build_units(
             chosen.push(d);
         }
     }
+    // no chosen directory lies under another, so a path has at most one
+    let chosen_index: HashMap<&str, usize> = chosen
+        .iter()
+        .enumerate()
+        .map(|(i, d)| (d.as_str(), i))
+        .collect();
+    let chosen_dir_of = |rel: &str| {
+        let mut d = dir_of(rel);
+        loop {
+            if let Some(&i) = chosen_index.get(d.as_str()) {
+                return Some(i);
+            }
+            if d.is_empty() {
+                return None;
+            }
+            d = dir_of(&d);
+        }
+    };
 
+    let mut dir_files: Vec<Vec<FileEntry>> = vec![Vec::new(); chosen.len()];
+    let mut rest: Vec<(&String, &FileEntry)> = Vec::new();
+    for (rel, entry) in &installing {
+        match chosen_dir_of(rel) {
+            Some(i) => dir_files[i].push(entry.clone()),
+            None => rest.push((rel, entry)),
+        }
+    }
     let mut units = Vec::new();
-    let mut covered: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for dir in &chosen {
-        let mut files: Vec<FileEntry> = installing
-            .iter()
-            .filter(|(rel, _)| under_dir(rel, dir))
-            .map(|(rel, e)| {
-                covered.insert(rel.clone());
-                e.clone()
-            })
-            .collect();
+    for (dir, mut files) in chosen.iter().zip(dir_files) {
         files.sort_by(|a, b| a.rel.cmp(&b.rel));
         units.push(Unit::Dir {
             rel: dir.clone(),
             files,
         });
     }
-    let mut rest: Vec<(&String, &FileEntry)> = installing
-        .iter()
-        .filter(|(rel, _)| !covered.contains(*rel))
-        .collect();
     rest.sort_by(|a, b| a.0.cmp(b.0));
     for (rel, entry) in rest {
         if is_copy(rel) {
@@ -648,13 +665,12 @@ fn build_units(
         }
     }
     for del in &plan.deletes {
-        let rel = normalize_rel(del);
-        if chosen.iter().any(|c| under_dir(&rel, c)) {
+        if chosen_dir_of(&normalize_rel(del)).is_some() {
             continue;
         }
         units.push(Unit::Del {
             rel: rel_of(del),
-            old: find_local(local, del).map(|l| l.hash.clone()),
+            old: local.find(del).map(|l| l.hash.clone()),
         });
     }
     units
@@ -827,7 +843,8 @@ async fn commit_staged(
                 progress(
                     ui,
                     2,
-                    95.0 + (*done as f64 / total.max(1) as f64) * 3.0,
+                    // 95–97; runtimes follow at 97, shortcuts 98, registry 99
+                    95.0 + (*done as f64 / total.max(1) as f64) * 2.0,
                     ProgressStage::Commit,
                     None,
                     Some(*done),
@@ -841,6 +858,15 @@ async fn commit_staged(
         bail!("IPC_SHAPE_ERR");
     };
     Ok(outcome.self_replaced)
+}
+
+/// A failed commit that could not roll every file back (`ROLLBACK_INCOMPLETE`)
+/// leaves the staging directory and its journal for the next session's
+/// recovery; the session must not discard it.
+fn keeps_staging_for_recovery<T>(result: &anyhow::Result<T>) -> bool {
+    result.as_ref().err().is_some_and(|err| {
+        matches!(extract(err), Extracted::Coded(c) if c.code == crate::utils::code::ROLLBACK_INCOMPLETE)
+    })
 }
 
 /// End-of-session staging cleanup: the directory outlives the process only
@@ -1069,6 +1095,29 @@ fn log_task_plan(tasks: &[InstallTask], ranges: &[String]) {
     }
 }
 
+/// How long an offline package waits for the online metadata before it
+/// installs what it carries. A packed source fetches the package's header
+/// segment, 0.3 to 1 MB in production packages.
+const UPDATE_CHECK_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether the session asks its source for metadata. An offline package run
+/// unattended (`-S` / `-I`) installs the version it carries whatever the
+/// source has (see `pick_metadata`), so it does not ask; `-O` always asks.
+fn asks_source(offline: bool, settings: &Settings) -> bool {
+    !offline || settings.online || !settings.auto_answer
+}
+
+/// Whether the package embeds a block for every file its metadata lists.
+fn carries_every_file(meta: &RepoMetadata, embedded: &[Embedded]) -> bool {
+    let Ok(key) = meta.hash_key() else {
+        return false;
+    };
+    let names: std::collections::HashSet<&str> = embedded.iter().map(|e| e.name.as_str()).collect();
+    meta.hashed
+        .iter()
+        .all(|item| hash_of_item(item, key).is_some_and(|hash| names.contains(hash.as_str())))
+}
+
 pub async fn run_install(
     settings: &Settings,
     config: &InstallerConfig,
@@ -1125,28 +1174,51 @@ async fn run_dfs_install(
         })
     );
 
-    let embedded_meta = config.enbedded_metadata.clone();
-    let mut source_ctx = SourceCtx::from_embedded(config.embedded_files.as_deref().unwrap_or(&[]));
+    let embedded_files = config.embedded_files.as_deref().unwrap_or(&[]);
+    // an offline package carries every file its metadata lists; one that
+    // embeds only some is an online installer that reuses those blocks
+    let offline_meta = config
+        .enbedded_metadata
+        .clone()
+        .filter(|meta| carries_every_file(meta, embedded_files));
+    let offline = offline_meta.is_some();
+    if config.enbedded_metadata.is_some() && !offline {
+        tracing::info!("package metadata lists files it does not embed, installing online");
+    }
+    let mut source_ctx = SourceCtx::from_embedded(embedded_files);
     source_ctx.attach_plugin(ui.plugin_host());
     // span 只包网络部分；pick_metadata 可能弹版本选择框，用户等待不计入
     let mut online_err = None;
-    let online_meta = match fetch_metadata(
-        &settings.source_uri,
-        settings.dfs_extras.as_deref(),
-        &mut source_ctx,
-    )
-    .await
-    {
-        Ok(meta) => Some(meta),
-        Err(err) => {
-            tracing::warn!("online metadata failed: {err:#}");
-            online_err = Some(attach_metadata(err));
-            None
+    // an offline package only checks for a newer version; past the limit it
+    // installs what it carries, as on any other failure of the check
+    let limit = (offline && !settings.online).then_some(UPDATE_CHECK_LIMIT);
+    let online_meta = if asks_source(offline, settings) {
+        let fetch = fetch_metadata(&settings.source_uri, &mut source_ctx);
+        let fetched = match limit {
+            Some(limit) => tokio::time::timeout(limit, fetch)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(anyhow::anyhow!(
+                        "update check gave no answer within {limit:?}"
+                    ))
+                }),
+            None => fetch.await,
+        };
+        match fetched {
+            Ok(meta) => Some(meta),
+            Err(err) => {
+                tracing::warn!("online metadata failed: {err:#}");
+                online_err = Some(attach_metadata(err));
+                None
+            }
         }
+    } else {
+        tracing::info!("unattended offline install, source not asked");
+        None
     };
 
     let (mut latest, used_online) =
-        pick_metadata(settings, config, ui, embedded_meta, online_meta, online_err).await?;
+        pick_metadata(settings, config, ui, offline_meta, online_meta, online_err).await?;
     if !used_online {
         source_ctx.restore_local_package(
             config.embedded_index.as_deref(),
@@ -1156,7 +1228,7 @@ async fn run_dfs_install(
 
     if settings.is_update
         && latest.installer.is_some()
-        && config.enbedded_metadata.is_none()
+        && !offline
         && !latest
             .hashed
             .iter()
@@ -1173,7 +1245,8 @@ async fn run_dfs_install(
     }
 
     if settings.elevate {
-        let _ = run_op(mgr, true, IpcOperation::Ping, progress_noop()).await;
+        // starts the helper; a declined UAC prompt ends the session here
+        run_op(mgr, true, IpcOperation::Ping, progress_noop()).await?;
     }
     prepare_process(settings, project, mgr).await?;
     ui.check_cancel()?;
@@ -1218,12 +1291,19 @@ async fn run_dfs_install(
     )
     .await;
     let self_replaced = recovered_self || matches!(result, Ok((_, true)));
-    finish_staging(&staged, self_replaced, mgr).await;
+    if !keeps_staging_for_recovery(&result) {
+        finish_staging(&staged, self_replaced, mgr).await;
+    }
     result.map(|(r, _)| r)
 }
 
-fn has_runtimes(runtimes: Option<&[String]>) -> bool {
-    runtimes.is_some_and(|r| !r.is_empty())
+/// A configured runtime is not installed yet (or cannot be checked): the
+/// session goes on to the runtime step instead of reporting "already latest".
+fn runtimes_missing(runtimes: Option<&[String]>) -> bool {
+    runtimes.is_some_and(|tags| {
+        tags.iter()
+            .any(|tag| crate::installer::runtimes::runtime_installed(tag) != Some(true))
+    })
 }
 
 /// Everything between "target known" and "files swapped in", with the staging
@@ -1310,7 +1390,7 @@ async fn dfs_staged(
             "hashed": latest.hashed,
             "patches": latest.patches,
             "deletes": latest.deletes,
-            "local": local,
+            "local": &local[..],
             "embedded_names": config.embedded_files.as_ref().map(|f| f.iter().map(|e| e.name.clone()).collect::<Vec<_>>()).unwrap_or_default(),
             "ignore_nonempty": ignore_nonempty,
         })
@@ -1346,7 +1426,7 @@ async fn dfs_staged(
 
     if to_install.is_empty()
         && plan.deletes.is_empty()
-        && !has_runtimes(project.runtimes.as_deref())
+        && !runtimes_missing(project.runtimes.as_deref())
     {
         session_dump!(
             settings.dump_dir.as_deref(),
@@ -1366,6 +1446,11 @@ async fn dfs_staged(
         )
         .await?;
         let self_replaced = if units.is_empty() {
+            // finishing writes the registry and shortcuts; a cancel accepted
+            // before this point stops it, a later one is refused
+            if !ui.inner.begin_commit() {
+                return Err(Cancelled.into());
+            }
             false
         } else {
             commit_staged(
@@ -1422,14 +1507,15 @@ async fn dfs_staged(
         }
         ui.check_cancel()?;
 
+        let mut by_name: std::collections::HashMap<&str, &FileMeta> =
+            std::collections::HashMap::with_capacity(latest.hashed.len());
+        for h in &latest.hashed {
+            by_name.entry(h.file_name.as_str()).or_insert(h);
+        }
         let install_items: Vec<InstallItem> = to_install
             .iter()
             .filter_map(|file| {
-                let item = latest
-                    .hashed
-                    .iter()
-                    .find(|h| h.file_name == file.file_name)?
-                    .clone();
+                let item = (*by_name.get(file.file_name.as_str())?).clone();
                 Some(InstallItem { item })
             })
             .collect();
@@ -1448,14 +1534,7 @@ async fn dfs_staged(
             source_ctx,
             &local,
         );
-        let ranges = dfs2_ranges(
-            &tasks,
-            source_ctx,
-            hash_key,
-            config.embedded_files.as_deref().unwrap_or(&[]),
-            &latest.patches,
-            &local,
-        );
+        let ranges = dfs2_ranges(&tasks, source_ctx, hash_key);
         progress(
             ui,
             2,
@@ -1491,11 +1570,8 @@ async fn dfs_staged(
         );
         let ops = install_files(
             settings,
-            config,
-            latest,
             hash_key,
             &tasks,
-            &local,
             source_ctx,
             &staged.staging,
             ui,
@@ -1605,10 +1681,10 @@ async fn pick_metadata(
                     .as_ref()
                     .map(|i| i.is_empty())
                     .unwrap_or(true);
-                let take_online = if settings.auto_answer {
-                    settings.is_update && no_index
-                } else {
-                    (settings.is_update && no_index)
+                // `-S` / `-I` install the version packed in this installer:
+                // unattended deployments pin it
+                let take_online = !settings.auto_answer
+                    && ((settings.is_update && no_index)
                         || ui
                             .confirm(Prompt {
                                 id: String::new(),
@@ -1616,8 +1692,7 @@ async fn pick_metadata(
                                 items: Vec::new(),
                                 params: std::collections::BTreeMap::new(),
                             })
-                            .await
-                };
+                            .await);
                 if take_online {
                     tracing::info!("use online meta, tag={}", online.tag_name);
                     return Ok((online, true));
@@ -1656,13 +1731,13 @@ async fn prepare_process(
         let IpcResult::FindProcessByName(procs) = found else {
             bail!("IPC_SHAPE_ERR");
         };
-        let target = join_install(&settings.install_path, name)
-            .replace('\\', "/")
-            .to_lowercase();
+        // 安装目录可能来自 8.3 短名（%TEMP% / RUNNER~1 之类），进程路径却是长名；
+        // 统一按 long form 比较，否则「正在运行的 app.exe」会被判成不匹配而漏杀。
+        let target = normalize_existing(&join_install(&settings.install_path, name));
         running.extend(
             procs
                 .into_iter()
-                .filter(|(_, path)| path.replace('\\', "/").to_lowercase() == target),
+                .filter(|(_, path)| !path.is_empty() && normalize_existing(path) == target),
         );
     }
     if running.is_empty() {
@@ -1721,12 +1796,14 @@ async fn scan_local(
     ignore_nonempty: &[String],
     ui: &LiveUi<'_>,
     mgr: &ManagedElevate,
-) -> anyhow::Result<(Vec<LocalFile>, LocalScan)> {
+) -> anyhow::Result<(DiskFiles, LocalScan)> {
     let algo = match hash_key {
         HashKey::Md5 => "md5",
         HashKey::Xxh => "xxh",
     };
     let files: Vec<String> = latest.hashed.iter().map(|e| e.file_name.clone()).collect();
+    // 待删文件的旧 hash 写进 journal 的 Unit::Del，崩溃恢复据此判断它是否被外部改过
+    let delete_list = latest.deletes.clone();
     let skip_hash = collect_skip_hash(
         &latest.hashed,
         &settings.install_path,
@@ -1735,7 +1812,7 @@ async fn scan_local(
         ignore_nonempty,
     );
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Progress>();
-    let mut op_fut = Box::pin(run_op(
+    let mut op_fut = Box::pin(run_op_cancellable(
         mgr,
         settings.elevate,
         IpcOperation::CheckLocalFiles {
@@ -1743,10 +1820,12 @@ async fn scan_local(
             hash_algorithm: algo.to_string(),
             file_list: files,
             skip_hash,
+            delete_list,
         },
         progress_notify(move |p| {
             let _ = tx.send(p);
         }),
+        &ui.cancel,
     ));
     let raw = loop {
         tokio::select! {
@@ -1778,7 +1857,7 @@ async fn scan_local(
         })
         .collect();
     Ok((
-        files,
+        DiskFiles::new(files),
         LocalScan {
             files: Vec::new(),
             ..scan
@@ -1792,7 +1871,6 @@ struct FileProg {
     downloaded: u64,
     running: bool,
     network_pending: bool,
-    action: FileAction,
 }
 
 struct DownloadProg {
@@ -1804,15 +1882,10 @@ struct DownloadProg {
 }
 
 impl DownloadProg {
-    fn from_tasks(
-        tasks: &[InstallTask],
-        local: &[Embedded],
-        patches: &[crate::utils::metadata::PatchInfo],
-        hash_key: HashKey,
-    ) -> Self {
+    fn from_tasks(tasks: &[InstallTask]) -> Self {
         let mut files = Vec::new();
         for task in tasks {
-            let network = !is_local_task(task, local, patches, hash_key);
+            let network = !is_local_task(task);
             let mut push = |item: &FileMeta, size| {
                 files.push(FileProg {
                     name: item.file_name.clone(),
@@ -1820,11 +1893,10 @@ impl DownloadProg {
                     downloaded: 0,
                     running: false,
                     network_pending: network,
-                    action: FileAction::Download,
                 })
             };
             match task {
-                InstallTask::Single(item) => push(item, item.size),
+                InstallTask::Single(plan) => push(&plan.item, plan.item.size),
                 InstallTask::Merged { files, .. } => {
                     for file in files {
                         push(
@@ -1870,6 +1942,18 @@ impl DownloadProg {
         } else {
             None
         };
+        progress.files = self
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.running)
+            .map(|(id, f)| FileProgress {
+                id: id as u32,
+                name: f.name.clone(),
+                done: f.downloaded,
+                total: f.size,
+            })
+            .collect();
         progress
     }
 }
@@ -1898,7 +1982,6 @@ impl ProgressHandle {
                 file.size = total;
                 file.downloaded = 0;
                 file.network_pending = !source.is_local();
-                file.action = FileAction::Retry;
             }
         }
     }
@@ -1943,32 +2026,19 @@ impl ProgressHandle {
                     g.processed += file.processed.saturating_sub(state.processed[index]);
                     state.processed[index] = file.processed;
                     let target = &mut g.files[id];
-                    let previous_action = target.action;
                     let was_running = target.running;
                     target.running = !file.finished;
                     target.size = file.work_total;
                     target.downloaded = file.completed;
-                    target.action = file.action;
-                    // 逐文件明细不进界面，落日志：动作切换与完成各记一行。
-                    if previous_action != file.action {
-                        tracing::info!(
-                            "[{}] {}{}",
-                            target.name,
-                            file.action.as_str(),
-                            byte_suffix(file.done, file.total),
-                        );
-                    }
+                    // 逐文件明细不进界面，落日志：完成时记一行，字节数取这一段已完成的量。
                     if was_running && file.finished {
                         tracing::info!(
-                            "[{}] {} done{}",
+                            "[{}] done{}",
                             target.name,
-                            file.action.as_str(),
-                            byte_suffix(file.done, file.total),
+                            byte_suffix(Some(file.completed), Some(file.work_total)),
                         );
                     }
-                    if file.finished
-                        || matches!(file.action, FileAction::Verify | FileAction::Flush)
-                    {
+                    if file.finished {
                         target.network_pending = false;
                     }
                 }
@@ -2000,23 +2070,13 @@ fn download_progress(ui: &LiveUi<'_>, prog: &Arc<Mutex<DownloadProg>>) {
 
 fn task_bytes(task: &InstallTask) -> u64 {
     match task {
-        InstallTask::Single(item) => item.size,
+        InstallTask::Single(plan) => plan.item.size,
         InstallTask::Merged { files, .. } => files.iter().map(|f| f.item.size).sum(),
     }
 }
 
-fn is_local_task(
-    task: &InstallTask,
-    local_files: &[Embedded],
-    patches: &[crate::utils::metadata::PatchInfo],
-    hash_key: HashKey,
-) -> bool {
-    match task {
-        InstallTask::Single(item) => {
-            file_mode(item, hash_key, local_files, patches, false) == FileMode::Local
-        }
-        InstallTask::Merged { .. } => false,
-    }
+fn is_local_task(task: &InstallTask) -> bool {
+    matches!(task, InstallTask::Single(plan) if matches!(plan.source, FileSource::Embedded(_)))
 }
 
 fn size_threshold(sizes: &[u64]) -> u64 {
@@ -2077,7 +2137,7 @@ const RESOLVE_WINDOW: std::time::Duration = std::time::Duration::from_millis(50)
 /// reset by each new request, are resolved together so DFS2 pays for one batch
 /// request. Every waiting request holds a request slot, so the window closes
 /// once all slots are waiting. Never returns.
-async fn resolve_in_windows(mgr: &ManagedElevate, ctx: &SourceCtx, extras: Option<&str>) {
+async fn resolve_in_windows(mgr: &ManagedElevate, ctx: &SourceCtx) {
     let mut window = Vec::new();
     let mut inflight = futures::stream::FuturesUnordered::new();
     let timer = tokio::time::sleep(RESOLVE_WINDOW);
@@ -2092,7 +2152,7 @@ async fn resolve_in_windows(mgr: &ManagedElevate, ctx: &SourceCtx, extras: Optio
                 let queries: Vec<(crate::ipc::download::Resolve, bool)> = std::mem::take(&mut window);
                 inflight.push(async move {
                     let ranges: Vec<_> = queries.iter().map(|(q, _)| (q.offset, q.len)).collect();
-                    let urls = resolve_range_urls(ctx, extras, &ranges).await;
+                    let urls = resolve_range_urls(ctx, &ranges).await;
                     for ((query, remote), url) in queries.into_iter().zip(urls) {
                         mgr.resolve_reply(crate::ipc::download::Reply { id: query.id, url }, remote)
                             .await;
@@ -2105,27 +2165,16 @@ async fn resolve_in_windows(mgr: &ManagedElevate, ctx: &SourceCtx, extras: Optio
     }
 }
 
-#[allow(clippy::too_many_arguments)] // independent session values; a context struct would not change the call
 async fn install_files(
     settings: &Settings,
-    config: &InstallerConfig,
-    latest: &RepoMetadata,
     hash_key: HashKey,
     tasks: &[InstallTask],
-    disk_files: &[LocalFile],
     source_ctx: &SourceCtx,
     staging: &Staging,
     ui: &LiveUi<'_>,
     mgr: &ManagedElevate,
 ) -> anyhow::Result<Vec<IpcOperation>> {
-    let local_files = Arc::new(config.embedded_files.clone().unwrap_or_default());
-    let disk_files = Arc::new(disk_files.to_vec());
-    let prog = Arc::new(Mutex::new(DownloadProg::from_tasks(
-        tasks,
-        local_files.as_slice(),
-        &latest.patches,
-        hash_key,
-    )));
+    let prog = Arc::new(Mutex::new(DownloadProg::from_tasks(tasks)));
     let has_error = Arc::new(AtomicBool::new(false));
     let cancel = ui.cancel.clone();
     let sizes: Vec<u64> = tasks.iter().map(task_bytes).collect();
@@ -2160,11 +2209,7 @@ async fn install_files(
     let local_sem = Arc::new(Semaphore::new(16));
     let large_sem = Arc::new(Semaphore::new(large_limit));
     let small_sem = Arc::new(Semaphore::new(small_limit));
-    let mut resolving = Box::pin(resolve_in_windows(
-        mgr,
-        source_ctx,
-        settings.dfs_extras.as_deref(),
-    ));
+    let mut resolving = Box::pin(resolve_in_windows(mgr, source_ctx));
     let mut file_cursor = 0usize;
     let mut futs = Vec::new();
     for task in tasks {
@@ -2188,7 +2233,7 @@ async fn install_files(
             },
             ids,
         };
-        let sem = if is_local_task(task, local_files.as_ref(), &latest.patches, hash_key) {
+        let sem = if is_local_task(task) {
             local_sem.clone()
         } else if task_bytes(task) >= threshold {
             large_sem.clone()
@@ -2196,25 +2241,18 @@ async fn install_files(
             small_sem.clone()
         };
         let has_error = has_error.clone();
-        let local_files = local_files.clone();
-        let disk_files = disk_files.clone();
         let cancel = cancel.clone();
         futs.push(async move {
             let _permit = sem.acquire().await;
             if has_error.load(Ordering::Relaxed) || cancel.is_cancelled() {
                 return None;
             }
-            let local_ref = local_files.as_slice();
-            let disk_ref = disk_files.as_slice();
             let res = match task {
-                InstallTask::Single(item) => {
+                InstallTask::Single(plan) => {
                     install_one(
                         settings,
-                        local_ref,
-                        disk_ref,
-                        latest,
+                        plan,
                         hash_key,
-                        item,
                         source_ctx,
                         staging,
                         mgr,
@@ -2231,9 +2269,6 @@ async fn install_files(
                 } => {
                     match install_merged(
                         settings,
-                        local_ref,
-                        latest,
-                        hash_key,
                         files,
                         range,
                         *download_size,
@@ -2252,9 +2287,6 @@ async fn install_files(
                             );
                             fallback_merged_files(
                                 settings,
-                                local_ref,
-                                disk_ref,
-                                latest,
                                 hash_key,
                                 files,
                                 &merged.failed,
@@ -2266,13 +2298,12 @@ async fn install_files(
                             )
                             .await
                         }
+                        // 取消时既不重试合并请求，也不退回逐个下载
+                        Err(err) if is_cancelled(&err) => Err(err),
                         Err(err) => {
                             tracing::warn!("merged download failed, retry: {err:#}");
                             match install_merged(
                                 settings,
-                                local_ref,
-                                latest,
-                                hash_key,
                                 files,
                                 range,
                                 *download_size,
@@ -2287,9 +2318,6 @@ async fn install_files(
                                 Ok(merged) => {
                                     fallback_merged_files(
                                         settings,
-                                        local_ref,
-                                        disk_ref,
-                                        latest,
                                         hash_key,
                                         files,
                                         &merged.failed,
@@ -2301,12 +2329,13 @@ async fn install_files(
                                     )
                                     .await
                                 }
+                                Err(err) if is_cancelled(&err) => Err(err),
                                 Err(err) => {
                                     tracing::warn!("merged download failed, fallback: {err:#}");
                                     let all: Vec<usize> = (0..files.len()).collect();
                                     fallback_merged_files(
-                                        settings, local_ref, disk_ref, latest, hash_key, files,
-                                        &all, source_ctx, staging, mgr, &handle, &has_error,
+                                        settings, hash_key, files, &all, source_ctx, staging, mgr,
+                                        &handle, &has_error,
                                     )
                                     .await
                                 }
@@ -2379,9 +2408,6 @@ fn collect_ops<T>(results: impl IntoIterator<Item = anyhow::Result<T>>) -> anyho
 #[allow(clippy::too_many_arguments)] // independent session values; a context struct would not change the call
 async fn fallback_merged_files(
     settings: &Settings,
-    local_files: &[Embedded],
-    disk_files: &[LocalFile],
-    latest: &RepoMetadata,
     hash_key: HashKey,
     files: &[FilePos],
     failed: &[usize],
@@ -2399,14 +2425,16 @@ async fn fallback_merged_files(
         let Some(file) = files.get(i) else {
             continue;
         };
+        // dfs2_ranges declares only a member's whole file
+        let plan = FilePlan {
+            item: file.item.clone(),
+            source: FileSource::Whole,
+        };
         last = Some(
             install_one(
                 settings,
-                local_files,
-                disk_files,
-                latest,
+                &plan,
                 hash_key,
-                &file.item,
                 source_ctx,
                 staging,
                 mgr,
@@ -2422,35 +2450,33 @@ async fn fallback_merged_files(
 #[allow(clippy::too_many_arguments)] // independent session values; a context struct would not change the call
 async fn install_one(
     settings: &Settings,
-    local_files: &[Embedded],
-    disk_files: &[LocalFile],
-    latest: &RepoMetadata,
+    plan: &FilePlan,
     hash_key: HashKey,
-    item: &FileMeta,
     source_ctx: &SourceCtx,
     staging: &Staging,
     mgr: &ManagedElevate,
     skip_patch_first: bool,
     handle: Option<ProgressHandle>,
 ) -> anyhow::Result<IpcOperation> {
+    let item = &plan.item;
     let file_name = item.file_name.clone();
     let mut last_err = None;
     let mut first_op = None;
     let mut last_insight = None;
     for attempt in 1..=if skip_patch_first { 2 } else { 3 } {
         let skip_patch = skip_patch_first || attempt > 1;
-        let ipc = build_install_op(
-            settings,
-            local_files,
-            disk_files,
-            latest,
-            hash_key,
-            item,
-            source_ctx,
-            staging,
-            skip_patch,
-        )
-        .await?;
+        // resolving a node is part of the attempt: a failed resolution is
+        // retried, and from the second attempt on the patch is skipped
+        let ipc = match build_install_op(settings, plan, hash_key, source_ctx, staging, skip_patch)
+            .await
+        {
+            Ok(ipc) => ipc,
+            Err(err) if is_cancelled(&err) => return Err(err),
+            Err(err) => {
+                last_err = Some(err);
+                continue;
+            }
+        };
         if first_op.is_none() {
             first_op = Some(ipc.clone());
         }
@@ -2521,9 +2547,6 @@ struct MergedResult {
 #[allow(clippy::too_many_arguments)] // independent session values; a context struct would not change the call
 async fn install_merged(
     settings: &Settings,
-    local_files: &[Embedded],
-    latest: &RepoMetadata,
-    hash_key: HashKey,
     files: &[FilePos],
     range: &str,
     download_size: usize,
@@ -2564,7 +2587,7 @@ async fn install_merged(
         range: range.to_string(),
         chunks,
     });
-    let mode = merged_mode(files, local_files, &latest.patches, hash_key);
+    let mode = merged_mode(files);
     let (value, insight) = run_download_op(
         mgr,
         settings.elevate,
@@ -2577,12 +2600,7 @@ async fn install_merged(
     let IpcResult::InstallMultichunkStream(multi) = value else {
         bail!("IPC_SHAPE_ERR");
     };
-    let mut failed = Vec::new();
-    for (i, res) in multi.results.iter().enumerate() {
-        if res.is_err() {
-            failed.push(i);
-        }
-    }
+    let failed = failed_chunks(&multi.results)?;
     let names = files
         .iter()
         .map(|f| f.item.file_name.as_str())
@@ -2610,34 +2628,47 @@ async fn install_merged(
     Ok(MergedResult { op: ipc, failed })
 }
 
-#[allow(clippy::too_many_arguments)] // independent session values; a context struct would not change the call
+/// 合并流里失败分块的下标。任一分块是取消就整体按取消返回：取消不是单个文件失败，
+/// 不能落到逐个重试。
+fn failed_chunks(results: &[Result<usize, crate::ipc::IpcError>]) -> anyhow::Result<Vec<usize>> {
+    let mut failed = Vec::new();
+    for (i, res) in results.iter().enumerate() {
+        match res {
+            Err(err) if err.cancelled => return Err(Cancelled.into()),
+            Err(_) => failed.push(i),
+            Ok(_) => {}
+        }
+    }
+    Ok(failed)
+}
+
+/// The operation for `plan`'s source; with `skip_patch`, and when the planned
+/// diff cannot be resolved, the whole file is fetched instead. An embedded
+/// file is read from the package on every attempt when the session installs
+/// the local package, or when the source has no URL for its range.
 async fn build_install_op(
     settings: &Settings,
-    local_files: &[Embedded],
-    disk_files: &[LocalFile],
-    latest: &RepoMetadata,
+    plan: &FilePlan,
     hash_key: HashKey,
-    item: &FileMeta,
     source_ctx: &SourceCtx,
     staging: &Staging,
     skip_patch: bool,
 ) -> anyhow::Result<IpcOperation> {
+    let item = &plan.item;
     let target = staged_target(staging, &item.file_name);
-    // the file currently on disk, if any: the base for a patch
-    let old = find_local(disk_files, &item.file_name)
-        .map(|_| join_install(&settings.install_path, &item.file_name));
     let hash = hash_of_item(item, hash_key)
         .ok_or_else(|| anyhow::Error::from(Coded::bare(HASH_ALGORITHM_UNSUPPORTED)))?;
+    let old = join_install(&settings.install_path, &item.file_name);
     // the packed installer image carries an index mark that must be cleared
     // once it lands as the app's updater; a self-update is the same case
-    let installer = item.installer.unwrap_or(false)
-        || is_current_exe(&join_install(&settings.install_path, &item.file_name));
-    if !skip_patch {
-        if let Some(local) = local_files.iter().find(|l| l.name == hash) {
+    let installer = item.installer.unwrap_or(false) || is_current_exe(&old);
+    let diff = |patch| resolve_diff(source_ctx, patch, &hash, hash_key);
+    if let FileSource::Embedded(block) = &plan.source {
+        if !skip_patch || source_ctx.local_package() || !source_ctx.serves_ranges() {
             return Ok(IpcOperation::InstallFile(InstallFileArgs {
                 mode: InstallFileMode::Direct(InstallFileSource::Local {
-                    offset: local.offset,
-                    size: local.size,
+                    offset: block.offset,
+                    size: block.size,
                     skip_decompress: false,
                 }),
                 target,
@@ -2648,25 +2679,13 @@ async fn build_install_op(
                 clear_installer_index_mark: Some(installer),
             }));
         }
-
-        let lpatch = latest.patches.iter().find(|p| {
-            side_hash(&p.to, hash_key) == Some(hash.as_str())
-                && side_hash(&p.from, hash_key)
-                    .is_some_and(|from| local_files.iter().any(|l| l.name == from))
-        });
-        if let Some(patch) = lpatch {
-            if let Some(from) = side_hash(&patch.from, hash_key) {
-                if let Some(local) = local_files.iter().find(|l| l.name == from) {
-                    let loc = resolve_install_source(
-                        source_ctx,
-                        &format!("{from}_{hash}"),
-                        settings.dfs_extras.as_deref(),
-                        false,
-                        true,
-                    )
-                    .await?;
+    }
+    if !skip_patch {
+        match &plan.source {
+            FileSource::Hybrid { base, patch } => {
+                if let Some(loc) = diff(patch).await {
                     return Ok(hybrid_op(
-                        local,
+                        base,
                         loc,
                         &target,
                         item,
@@ -2675,41 +2694,25 @@ async fn build_install_op(
                     ));
                 }
             }
-        }
-
-        let disk_hash = find_local(disk_files, &item.file_name).map(|l| l.hash.as_str());
-        let patch = latest.patches.iter().find(|p| {
-            side_hash(&p.to, hash_key) == Some(hash.as_str())
-                && side_hash(&p.from, hash_key) == disk_hash
-        });
-        if let Some(patch) = patch {
-            if let Some(from) = side_hash(&patch.from, hash_key) {
-                if let Ok(loc) = resolve_install_source(
-                    source_ctx,
-                    &format!("{from}_{hash}"),
-                    settings.dfs_extras.as_deref(),
-                    false,
-                    true,
-                )
-                .await
-                {
+            FileSource::Patch(patch) => {
+                if let Some(loc) = diff(patch).await {
                     return Ok(url_op(
                         loc,
                         &target,
-                        old,
+                        Some(old),
                         item,
                         Some(patch.size as usize),
                         installer,
                     ));
                 }
             }
+            FileSource::Embedded(_) | FileSource::Whole => {}
         }
     }
 
     let loc = resolve_install_source(
         source_ctx,
         &hash,
-        settings.dfs_extras.as_deref(),
         installer,
         !skip_patch,
     )
@@ -2717,10 +2720,21 @@ async fn build_install_op(
     Ok(url_op(loc, &target, None, item, None, installer))
 }
 
+/// The diff from `patch`'s old file to `hash`, or `None` when it cannot be
+/// resolved.
+async fn resolve_diff(
+    ctx: &SourceCtx,
+    patch: &PatchInfo,
+    hash: &str,
+    key: HashKey,
+) -> Option<InstallFileSource> {
+    let name = diff_name(patch, hash, key)?;
+    resolve_install_source(ctx, &name, false, true).await.ok()
+}
+
 async fn resolve_install_source(
     ctx: &SourceCtx,
     hash: &str,
-    extras: Option<&str>,
     installer: bool,
     slice: bool,
 ) -> anyhow::Result<InstallFileSource> {
@@ -2746,15 +2760,8 @@ async fn resolve_install_source(
         });
     }
     Ok(file_source(
-        resolve_file_location(ctx, hash, extras, installer).await?,
+        resolve_file_location(ctx, hash, installer).await?,
     ))
-}
-
-fn side_hash(side: &crate::utils::metadata::PatchSide, key: HashKey) -> Option<&str> {
-    match key {
-        HashKey::Md5 => side.md5.as_deref(),
-        HashKey::Xxh => side.xxh.as_deref(),
-    }
 }
 
 /// Staged output path for a managed file (`new\<rel>` under the staging root).
@@ -2764,8 +2771,8 @@ fn staged_target(staging: &Staging, file_name: &str) -> String {
 
 fn is_current_exe(path: &str) -> bool {
     std::env::current_exe().is_ok_and(|exe| {
-        crate::session::plan::normalize_full(&exe.to_string_lossy())
-            == crate::session::plan::normalize_full(path)
+        crate::session::plan::normalize_existing(&exe.to_string_lossy())
+            == crate::session::plan::normalize_existing(path)
     })
 }
 
@@ -2862,7 +2869,7 @@ async fn install_runtimes(
         progress(
             ui,
             3,
-            96.0,
+            97.0,
             ProgressStage::InstallRuntime,
             Some(name),
             None,
@@ -2873,7 +2880,7 @@ async fn install_runtimes(
             progress(
                 ui,
                 3,
-                96.0,
+                97.0,
                 ProgressStage::DownloadRuntime,
                 Some(name),
                 None,
@@ -2893,7 +2900,7 @@ async fn install_runtimes(
                     Progress::BytesOf { done, total } => progress(
                         ui,
                         3,
-                        96.0,
+                        97.0,
                         ProgressStage::DownloadRuntime,
                         Some(name),
                         Some(*done),
@@ -2902,7 +2909,7 @@ async fn install_runtimes(
                     Progress::Stage(ProgressStage::InstallRuntime) => progress(
                         ui,
                         3,
-                        96.0,
+                        97.0,
                         ProgressStage::InstallRuntime,
                         Some(name),
                         None,
@@ -3214,6 +3221,9 @@ async fn run_mirrorc(
     if version_name == current_version {
         tracing::info!("already latest, tag={version_name}");
         finish_staging(&staged, recovered_self, mgr).await;
+        if !ui.inner.begin_commit() {
+            return Err(Cancelled.into());
+        }
         finish_install(
             settings,
             project,
@@ -3252,7 +3262,9 @@ async fn run_mirrorc(
     )
     .await;
     let self_replaced = recovered_self || matches!(result, Ok((_, true)));
-    finish_staging(&staged, self_replaced, mgr).await;
+    if !keeps_staging_for_recovery(&result) {
+        finish_staging(&staged, self_replaced, mgr).await;
+    }
     result.map(|(r, _)| r)
 }
 
@@ -3563,7 +3575,8 @@ async fn run_uninstall_inner(
         extra.extend(user_shortcuts.iter().cloned());
     }
     if settings.elevate {
-        let _ = run_op(mgr, true, IpcOperation::Ping, progress_noop()).await;
+        // starts the helper; a declined UAC prompt ends the session here
+        run_op(mgr, true, IpcOperation::Ping, progress_noop()).await?;
     }
     progress(
         ui,
@@ -3651,6 +3664,10 @@ pub async fn silent_main(args: crate::cli::arg::InstallArgs) -> anyhow::Result<(
             return Err(anyhow::Error::from(Coded::bare(PKG_BROKEN)));
         }
     };
+    if !config.index_matches_blocks() {
+        tracing::error!("embedded index does not match packed files");
+        return Err(anyhow::Error::from(Coded::bare(PKG_BROKEN)));
+    }
     let mut settings = crate::session::types::settings_from_cli(&args, &config, &project).await?;
     if config.is_uninstall || args.uninstall {
         let ui = crate::session::ui::SilentUi;
@@ -3753,9 +3770,53 @@ mod tests {
             ],
             deletes: vec!["old.txt".into()],
         };
-        let units = build_units(&plan, &hashed, HashKey::Md5, &[], &LocalScan::default());
+        let units = build_units(
+            &plan,
+            &hashed,
+            HashKey::Md5,
+            &DiskFiles::new(vec![]),
+            &LocalScan::default(),
+        );
         // the whole install is one root unit; a delete under it is moot
         assert_eq!(rels(&units), vec!["dir:[2]".to_string()]);
+    }
+
+    #[test]
+    fn units_sibling_dirs_each_get_their_own_files() {
+        let hashed = vec![
+            meta("keep.txt", "k"),
+            meta("a/x.dll", "x"),
+            meta("a/y.dll", "y"),
+            meta("b/z.dll", "z"),
+        ];
+        let plan = InstallPlan {
+            files: vec![
+                plan_file("keep.txt", PlanAction::Skip, Some("k")),
+                plan_file("a/x.dll", PlanAction::Install, None),
+                plan_file("a/y.dll", PlanAction::Install, None),
+                plan_file("b/z.dll", PlanAction::Install, None),
+            ],
+            deletes: vec!["b/old.dll".into(), "c/old.dll".into()],
+        };
+        let units = build_units(
+            &plan,
+            &hashed,
+            HashKey::Md5,
+            &DiskFiles::new(vec![]),
+            &LocalScan::default(),
+        );
+        assert_eq!(
+            rels(&units),
+            vec![
+                "dir:a[2]".to_string(),
+                "dir:b[1]".to_string(),
+                "del:c/old.dll".to_string(),
+            ]
+        );
+        let Unit::Dir { files, .. } = &units[1] else {
+            panic!()
+        };
+        assert_eq!(files[0].rel, "b/z.dll");
     }
 
     #[test]
@@ -3765,7 +3826,13 @@ mod tests {
             files: vec![plan_file("app.exe", PlanAction::Skip, Some("a"))],
             deletes: vec!["old.txt".into()],
         };
-        let units = build_units(&plan, &hashed, HashKey::Md5, &[], &LocalScan::default());
+        let units = build_units(
+            &plan,
+            &hashed,
+            HashKey::Md5,
+            &DiskFiles::new(vec![]),
+            &LocalScan::default(),
+        );
         assert_eq!(rels(&units), vec!["del:old.txt".to_string()]);
     }
 
@@ -3782,6 +3849,26 @@ mod tests {
 
         let only_cancel: Vec<anyhow::Result<u8>> = vec![Ok(1), Err(Cancelled.into())];
         assert!(is_cancelled(&collect_ops(only_cancel).unwrap_err()));
+    }
+
+    #[test]
+    fn cancelled_chunk_cancels_the_merged_request() {
+        let chunk_err = |cancelled| crate::ipc::IpcError {
+            message: String::new(),
+            code: None,
+            subject: None,
+            sid: None,
+            cancelled,
+            insight: None,
+            network: None,
+            local_io: None,
+        };
+        assert_eq!(
+            failed_chunks(&[Ok(1), Err(chunk_err(false)), Ok(2)]).unwrap(),
+            vec![1]
+        );
+        let err = failed_chunks(&[Err(chunk_err(false)), Err(chunk_err(true))]).unwrap_err();
+        assert!(is_cancelled(&err));
     }
 
     #[test]
@@ -3820,12 +3907,12 @@ mod tests {
             meta("lib/y.dll", "y"),
             meta("plugins/p.dll", "p"),
         ];
-        let local = vec![LocalFile {
+        let local = DiskFiles::new(vec![LocalFile {
             file_name: "app.exe".into(),
             hash: "a".into(),
             size: 1,
             unwritable: false,
-        }];
+        }]);
         let plan = InstallPlan {
             files: vec![
                 plan_file("app.exe", PlanAction::Skip, Some("a")),
@@ -4034,7 +4121,7 @@ mod tests {
             dirty_dirs: vec![String::new()],
             reparse_dirs: vec!["link".into()],
         };
-        let units = build_units(&plan, &hashed, HashKey::Md5, &[], &scan);
+        let units = build_units(&plan, &hashed, HashKey::Md5, &DiskFiles::new(vec![]), &scan);
         assert_eq!(
             rels(&units),
             vec!["file:app.exe".to_string(), "copy:link/f.dll".to_string()]
@@ -4042,13 +4129,11 @@ mod tests {
     }
     #[test]
     fn file_progress_keeps_attempt_work_and_ignores_late_snapshots() {
-        let tasks = vec![InstallTask::Single(meta("app.exe", "h"))];
-        let prog = Arc::new(Mutex::new(DownloadProg::from_tasks(
-            &tasks,
-            &[],
-            &[],
-            HashKey::Md5,
-        )));
+        let tasks = vec![InstallTask::Single(Box::new(FilePlan {
+            item: meta("app.exe", "h"),
+            source: FileSource::Whole,
+        }))];
+        let prog = Arc::new(Mutex::new(DownloadProg::from_tasks(&tasks)));
         let handle = ProgressHandle {
             inner: prog.clone(),
             ids: vec![0],
@@ -4059,7 +4144,7 @@ mod tests {
         };
         let first = handle.callback();
         let reporter = crate::ipc::file_progress::Reporter::new(20, first.clone());
-        reporter.action(FileAction::Patch, Some(20));
+        reporter.segment();
         reporter.bytes(10);
         first(Progress::Network(crate::ipc::network::Snapshot {
             bytes: u32::MAX as u64 + 5,
@@ -4076,27 +4161,261 @@ mod tests {
         }));
         let second = handle.callback();
         let reporter = crate::ipc::file_progress::Reporter::new(100, second.clone());
-        reporter.action(FileAction::Extract, Some(80));
+        reporter.segment();
         reporter.bytes(80);
-        reporter.action(FileAction::Patch, Some(20));
+        reporter.segment();
         reporter.bytes(20);
-        reporter.action(FileAction::Verify, None);
+        // the writer reports its final count once more when it finishes
+        reporter.bytes(20);
         {
             let mut prog = prog.lock().unwrap();
             assert_eq!(prog.processed, 110);
             assert_eq!(prog.network_bytes, u32::MAX as u64 + 8);
             let view = prog.render();
+            assert_eq!((view.files[0].done, view.files[0].total), (100, 100));
             assert_eq!(view.summary.unwrap().done, 100);
-            // 动作只留在执行侧（界面不再有逐文件明细），日志按它决定行内容。
-            assert_eq!(prog.files[0].action, FileAction::Verify);
             assert_eq!(byte_suffix(Some(20), Some(20)), " 20B / 20B");
             assert_eq!(byte_suffix(None, None), "");
         }
-        reporter.action(FileAction::Flush, None);
         reporter.finish();
         let mut prog = prog.lock().unwrap();
         assert!(prog.render().summary.is_some());
         assert!(!prog.files[0].running);
         assert_eq!(prog.processed, 110);
+    }
+
+    /// Every range the executor asks for, on the first try and on the retries
+    /// that fetch the whole file, is one `dfs2_ranges` declared.
+    #[tokio::test]
+    async fn executor_requests_only_declared_ranges() {
+        use crate::session::download_plan::Range;
+        use crate::utils::metadata::PatchSide;
+        const MIB: usize = 1 << 20;
+        let block = |name: &str, offset, size| Embedded {
+            name: name.into(),
+            offset,
+            raw_offset: 0,
+            size,
+        };
+        let mut next = 1000;
+        let mut entry = |name: &str, size| {
+            next += size;
+            block(name, next - size, size)
+        };
+        let index = [
+            entry("h1", 120 * MIB),
+            entry("h2", 60 * MIB),
+            entry("d2_h2", 60 * MIB),
+            entry("h3", 60 * MIB),
+            entry("e3_h3", 60 * MIB),
+            entry("h4", 1000),
+            entry("h5", 1000),
+        ];
+        let ctx = SourceCtx::from_embedded(&index);
+        let side = |hash: &str| PatchSide {
+            size: 1,
+            md5: Some(hash.into()),
+            xxh: None,
+        };
+        let patch = |from, to| PatchInfo {
+            file_name: String::new(),
+            size: 60 * MIB as u64,
+            from: side(from),
+            to: side(to),
+        };
+        let large = |name, hash| FileMeta {
+            size: 2 * MIB as u64,
+            ..meta(name, hash)
+        };
+        let disk = DiskFiles::new(vec![LocalFile {
+            file_name: "b.dll".into(),
+            hash: "d2".into(),
+            size: 1,
+            unwritable: false,
+        }]);
+        let tasks = plan_tasks(
+            &[
+                large("a.dll", "h1"),
+                large("b.dll", "h2"),
+                large("c.dll", "h3"),
+                meta("d.dll", "h4"),
+                meta("e.dll", "h5"),
+            ],
+            HashKey::Md5,
+            &[block("e3", 0, 10)],
+            &[patch("d2", "h2"), patch("e3", "h3")],
+            &ctx,
+            &disk,
+        );
+        let declared = dfs2_ranges(&tasks, &ctx, HashKey::Md5);
+
+        // each file with the plan it is fetched by; a merged member falls
+        // back to the whole file
+        let mut plans = Vec::new();
+        let mut kinds = Vec::new();
+        for task in &tasks {
+            match task {
+                InstallTask::Single(plan) => {
+                    kinds.push(match plan.source {
+                        FileSource::Embedded(_) => "embedded",
+                        FileSource::Hybrid { .. } => "hybrid",
+                        FileSource::Patch(_) => "patch",
+                        FileSource::Whole => "whole",
+                    });
+                    plans.push((**plan).clone());
+                }
+                InstallTask::Merged { files, range, .. } => {
+                    kinds.push("merged");
+                    assert!(declared.contains(range));
+                    plans.extend(files.iter().map(|f| FilePlan {
+                        item: f.item.clone(),
+                        source: FileSource::Whole,
+                    }));
+                }
+            }
+        }
+        kinds.sort();
+        assert_eq!(kinds, ["hybrid", "merged", "patch", "whole"]);
+
+        let base =
+            crate::fs::staging::scratch_file(&format!("kachina-ranges-{}", uuid::Uuid::new_v4()));
+        let settings = test_settings(&base.join("app"), true);
+        let staging = Staging::at(base.join("staged"));
+        let mut most_parts = 0;
+        for plan in &plans {
+            for skip_patch in [false, true] {
+                let op =
+                    build_install_op(&settings, plan, HashKey::Md5, &ctx, &staging, skip_patch)
+                        .await
+                        .unwrap();
+                let IpcOperation::InstallFile(args) = &op else {
+                    panic!("expected a file install, got {op:?}")
+                };
+                let sources = match &args.mode {
+                    InstallFileMode::Direct(source) | InstallFileMode::Patch { source, .. } => {
+                        vec![source]
+                    }
+                    InstallFileMode::HybridPatch { diff, source, .. } => vec![diff, source],
+                };
+                for source in sources {
+                    let InstallFileSource::Sliced { parts, .. } = source else {
+                        continue;
+                    };
+                    most_parts = most_parts.max(parts.len());
+                    for &(start, len) in parts {
+                        let key = Range { start, len }.key();
+                        assert!(
+                            declared.contains(&key),
+                            "{} (skip_patch {skip_patch}) asks for undeclared {key}",
+                            plan.item.file_name
+                        );
+                    }
+                }
+            }
+        }
+        // the large files are fetched in slices
+        assert!(most_parts > 1);
+    }
+
+    #[test]
+    fn only_an_unattended_offline_install_skips_its_source() {
+        let unattended = test_settings(std::path::Path::new("x"), false);
+        let attended = Settings {
+            auto_answer: false,
+            ..test_settings(std::path::Path::new("x"), false)
+        };
+        let forced_online = Settings {
+            online: true,
+            ..test_settings(std::path::Path::new("x"), false)
+        };
+        assert!(!asks_source(true, &unattended));
+        assert!(asks_source(true, &attended));
+        assert!(asks_source(true, &forced_online));
+        // an online installer has nothing to install without its source
+        assert!(asks_source(false, &unattended));
+    }
+
+    #[test]
+    fn offline_package_embeds_every_listed_file() {
+        let block = |name: &str| Embedded {
+            name: name.into(),
+            offset: 0,
+            raw_offset: 0,
+            size: 1,
+        };
+        let meta = RepoMetadata {
+            hashed: vec![meta("a.dll", "h1"), meta("b.dll", "h2")],
+            ..serde_json::from_value(json!({"tag_name": "1", "hashed": []})).unwrap()
+        };
+        assert!(carries_every_file(&meta, &[block("h1"), block("h2")]));
+        assert!(!carries_every_file(&meta, &[block("h1")]));
+    }
+
+    /// After a failed read of an embedded block, the local package reads the
+    /// block again and declares nothing for it; an online session fetches the
+    /// whole file, in a range it declared, unless its DFS2 source has no
+    /// session to give that range a URL.
+    #[tokio::test]
+    async fn embedded_retry_leaves_the_package_only_online() {
+        let entry = |name: &str, offset| Embedded {
+            name: name.into(),
+            offset,
+            raw_offset: 0,
+            size: 100,
+        };
+        let index = [entry("h1", 1000), entry("h2", 2000)];
+        let items = [meta("a.dll", "h1"), meta("b.dll", "h2")];
+        let embedded = [entry("h1", 50)];
+        let disk = DiskFiles::new(vec![]);
+        let base =
+            crate::fs::staging::scratch_file(&format!("kachina-retry-{}", uuid::Uuid::new_v4()));
+        let settings = test_settings(&base.join("app"), false);
+        let staging = Staging::at(base.join("staged"));
+
+        for (local, dfs2) in [(false, false), (true, false), (false, true)] {
+            let mut ctx = SourceCtx::from_embedded(&index);
+            if local {
+                ctx.restore_local_package(Some(&index), None);
+            }
+            if dfs2 {
+                ctx.parsed = Some(parse_source("dfs2+packed+http://localhost/api/a.exe").unwrap());
+            }
+            let tasks = plan_tasks(&items, HashKey::Md5, &embedded, &[], &ctx, &disk);
+            let declared = dfs2_ranges(&tasks, &ctx, HashKey::Md5);
+            let plan = tasks
+                .iter()
+                .find_map(|t| match t {
+                    InstallTask::Single(p) if matches!(p.source, FileSource::Embedded(_)) => {
+                        Some(p)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let retry = build_install_op(&settings, plan, HashKey::Md5, &ctx, &staging, true)
+                .await
+                .unwrap();
+            let IpcOperation::InstallFile(args) = retry else {
+                panic!("expected a file install")
+            };
+            match (local, dfs2, &args.mode) {
+                (true, _, InstallFileMode::Direct(InstallFileSource::Local { offset: 50, .. })) => {
+                    assert!(!declared.contains(&"1000-1099".to_string()), "{declared:?}");
+                }
+                (
+                    false,
+                    true,
+                    InstallFileMode::Direct(InstallFileSource::Local { offset: 50, .. }),
+                ) => {}
+                (
+                    false,
+                    false,
+                    InstallFileMode::Direct(InstallFileSource::Sliced { parts, .. }),
+                ) => {
+                    assert_eq!(parts, &vec![(1000, 100)]);
+                    assert!(declared.contains(&"1000-1099".to_string()), "{declared:?}");
+                }
+                (local, dfs2, mode) => panic!("local package {local}, dfs2 {dfs2}: {mode:?}"),
+            }
+        }
     }
 }
